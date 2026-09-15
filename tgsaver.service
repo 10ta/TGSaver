@@ -1,0 +1,39 @@
+[Unit]
+Description=TgSaver - Telegram message archiver bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 【需修改】改成你实际的用户名和路径
+User=tgsaver
+Group=tgsaver
+WorkingDirectory=/opt/tgsaver
+ExecStart=/opt/tgsaver/venv/bin/python /opt/tgsaver/bot.py
+
+Restart=always
+RestartSec=5
+# 反复崩溃时别把系统拖垮
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tgsaver
+
+# 加固：这些不影响功能，但能显著缩小被入侵后的破坏面
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tgsaver /tmp/tgsaver
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,305 @@
+"""双通道任务调度。
+
+  快通道  可直接 forward 的消息。服务端引用，毫秒级，并发 4，永不积压。
+  慢通道  受保护内容，需要搬字节。并发 2，其中落盘路径再受磁盘信号量限制。
+
+任务先统一进快通道做一次轻量探测（定位消息 + 判断是否受保护）。
+不受保护的当场完成；受保护的改写 lane 后移交慢通道。这样一条大文件
+永远不会堵住后面的纯文字请求。
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from telethon.errors import FloodWaitError
+
+import acl
+import db
+import fetcher
+import sender
+import streamer
+from config import CFG
+from parser import MsgRef, ParseError, parse_link
+from session_pool import POOL, NoSession
+
+log = logging.getLogger("queue")
+
+# 这些错误是确定性的，重试没有意义
+FATAL = (fetcher.FetchError, ParseError, NoSession, streamer.TransferError)
+
+
+@dataclass
+class Job:
+    task_id: int
+    owner_id: int
+    link: str
+    request_chat_id: int
+    request_msg_id: int
+    status_msg_id: Optional[int] = None
+    attempts: int = 0
+    # 探测阶段的成果，在进程内从快通道传给慢通道
+    entity: Any = None
+    msg: Any = None
+    last_edit: float = field(default=0.0)
+    last_text: str = ""
+
+
+class Runner:
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+        self.fast: asyncio.Queue[Job] = asyncio.Queue()
+        self.slow: asyncio.Queue[Job] = asyncio.Queue()
+        self.disk_sem = asyncio.Semaphore(CFG.disk_concurrency)
+        self._tasks: list[asyncio.Task] = []
+        self._started = time.time()
+
+    # ------------------------------------------------------------ 生命周期
+
+    async def start(self) -> None:
+        for i in range(CFG.fast_concurrency):
+            self._tasks.append(asyncio.create_task(self._worker(self.fast, "fast", i)))
+        for i in range(CFG.slow_concurrency):
+            self._tasks.append(asyncio.create_task(self._worker(self.slow, "slow", i)))
+        await self._restore()
+
+    async def stop(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _restore(self) -> None:
+        """进程重启后捡回上次没跑完的任务。"""
+        rows = await db.pending_tasks()
+        for r in rows:
+            job = Job(
+                task_id=r["id"], owner_id=r["owner_id"], link=r["link"],
+                request_chat_id=r["request_chat_id"],
+                request_msg_id=r["request_msg_id"],
+                status_msg_id=r["status_msg_id"], attempts=r["attempts"],
+            )
+            (self.slow if r["lane"] == "slow" else self.fast).put_nowait(job)
+        if rows:
+            log.info("恢复 %d 个未完成任务", len(rows))
+
+    # ------------------------------------------------------------ 提交
+
+    async def submit(self, owner_id: int, link: str, chat_id: int,
+                     msg_id: int) -> int:
+        task_id = await db.add_task(owner_id, link, chat_id, msg_id)
+        job = Job(task_id, owner_id, link, chat_id, msg_id)
+        depth = self.fast.qsize() + self.slow.qsize()
+        job.status_msg_id = await self._say(
+            job, "已排队" + (f"（前面 {depth} 个）" if depth else "，正在处理…")
+        )
+        await db.update_task(task_id, status_msg_id=job.status_msg_id)
+        await self.fast.put(job)
+        return task_id
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "fast": self.fast.qsize(),
+            "slow": self.slow.qsize(),
+            "uptime": int(time.time() - self._started),
+        }
+
+    # ------------------------------------------------------------ worker
+
+    async def _worker(self, q: asyncio.Queue, lane: str, idx: int) -> None:
+        while True:
+            try:
+                job = await q.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._run(job, lane)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("worker 未捕获异常 task=%s", job.task_id)
+            finally:
+                q.task_done()
+
+    async def _run(self, job: Job, lane: str) -> None:
+        await db.update_task(job.task_id, state="running", lane=lane)
+        try:
+            if lane == "fast":
+                await self._run_fast(job)
+            else:
+                await self._run_slow(job)
+        except FloodWaitError as e:
+            await self._flood(job, lane, e.seconds)
+        except TelegramRetryAfter as e:
+            await self._flood(job, lane, int(e.retry_after))
+        except FATAL as e:
+            await self._fail(job, str(e))
+        except Exception as e:  # noqa: BLE001
+            log.exception("task=%s 失败", job.task_id)
+            await self._retry_or_fail(job, lane, e)
+
+    # ------------------------------------------------------------ 快通道
+
+    async def _run_fast(self, job: Job) -> None:
+        ref = parse_link(job.link)
+        client = await POOL.acquire(job.owner_id)
+        async with POOL.lock_for(job.owner_id):
+            entity, msg, protected = await fetcher.probe(client, ref)
+
+            if protected:
+                job.entity, job.msg = entity, msg
+                await db.update_task(job.task_id, lane="slow", state="pending")
+                size = fetcher.media_size(msg)
+                hint = f"（{streamer.human_size(size)}）" if size else ""
+                await self._say(job, f"该内容禁止转存，转为搬运模式{hint}…")
+                await self.slow.put(job)
+                return
+
+            relay_ch = await acl.relay_channel_for(job.owner_id)
+            res = await fetcher.relay(
+                client, ref, relay_ch, entity=entity, msg=msg
+            )
+        await self._finish(job, res)
+
+    # ------------------------------------------------------------ 慢通道
+
+    async def _run_slow(self, job: Job) -> None:
+        ref = parse_link(job.link)
+        client = await POOL.acquire(job.owner_id)
+
+        entity, msg = job.entity, job.msg
+        if msg is None:
+            async with POOL.lock_for(job.owner_id):
+                entity, msg, _ = await fetcher.probe(client, ref)
+
+        size = fetcher.media_size(msg)
+        need_disk = CFG.stream_max_size > 0 and size > CFG.stream_max_size
+
+        async def register_tmp(path: Optional[str]) -> None:
+            await db.update_task(job.task_id, tmp_path=path)
+
+        async def body() -> None:
+            relay_ch = await acl.relay_channel_for(job.owner_id)
+            async with POOL.lock_for(job.owner_id):
+                res = await fetcher.relay(
+                    client, ref, relay_ch,
+                    on_progress=lambda *a: self._progress(job, *a),
+                    task_id=job.task_id, register_tmp=register_tmp,
+                    entity=entity, msg=msg,
+                )
+            await self._finish(job, res)
+
+        if need_disk:
+            if self.disk_sem.locked():
+                await self._say(job, "等待磁盘空闲…")
+            async with self.disk_sem:
+                await body()
+        else:
+            await body()
+
+    # ------------------------------------------------------------ 收尾
+
+    async def _finish(self, job: Job, res: fetcher.Relayed) -> None:
+        relay_ch = await acl.relay_channel_for(job.owner_id)
+        await sender.deliver(
+            self.bot, relay_ch, res.message_ids,
+            job.request_chat_id, job.request_msg_id, res.is_album,
+        )
+        await db.update_task(job.task_id, state="done", tmp_path=None,
+                             bytes_moved=res.bytes_moved, error=None)
+        await db.bump_usage(job.owner_id, res.bytes_moved)
+
+        if res.note:
+            await self._say(job, "⚠️ " + res.note)
+        else:
+            await self._drop_status(job)
+
+    async def _fail(self, job: Job, reason: str) -> None:
+        await db.update_task(job.task_id, state="failed", error=reason[:500])
+        await self._say(job, f"❌ {reason}")
+
+    async def _retry_or_fail(self, job: Job, lane: str, err: Exception) -> None:
+        job.attempts += 1
+        await db.update_task(job.task_id, attempts=job.attempts)
+        if job.attempts >= CFG.max_retries:
+            await self._fail(job, f"重试 {job.attempts} 次仍失败：{err}")
+            return
+        delay = min(2 ** job.attempts, 30)
+        await self._say(job, f"出错，{delay}s 后第 {job.attempts + 1} 次重试…")
+        await asyncio.sleep(delay)
+        await db.update_task(job.task_id, state="pending")
+        await (self.slow if lane == "slow" else self.fast).put(job)
+
+    async def _flood(self, job: Job, lane: str, seconds: int) -> None:
+        """Telegram 明确告诉了等多久，就精确等多久，不做盲目退避。"""
+        log.warning("FloodWait %ss task=%s", seconds, job.task_id)
+        await self._say(job, f"触发 Telegram 限流，等待 {seconds}s 后继续…")
+        await asyncio.sleep(seconds + 1)
+        await db.update_task(job.task_id, state="pending")
+        await (self.slow if lane == "slow" else self.fast).put(job)
+
+    # ------------------------------------------------------------ 状态消息
+
+    async def _say(self, job: Job, text: str) -> Optional[int]:
+        """创建或原地更新状态消息。内容没变就不发请求。"""
+        if text == job.last_text:
+            return job.status_msg_id
+        job.last_text = text
+        try:
+            if job.status_msg_id is None:
+                from aiogram.types import ReplyParameters
+                m = await self.bot.send_message(
+                    job.request_chat_id, text,
+                    reply_parameters=ReplyParameters(
+                        message_id=job.request_msg_id),
+                )
+                job.status_msg_id = m.message_id
+            else:
+                await self.bot.edit_message_text(
+                    text, chat_id=job.request_chat_id,
+                    message_id=job.status_msg_id)
+        except TelegramBadRequest:
+            pass          # 消息被用户删了，或内容未变，忽略
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:  # noqa: BLE001
+            log.debug("状态消息更新失败: %s", e)
+        return job.status_msg_id
+
+    async def _drop_status(self, job: Job) -> None:
+        if job.status_msg_id is None:
+            return
+        try:
+            await self.bot.delete_message(job.request_chat_id, job.status_msg_id)
+        except Exception:  # noqa: BLE001
+            pass
+        job.status_msg_id = None
+
+    def _progress(self, job: Job, phase: str, done: int, total: int,
+                  elapsed: float, idx: int = 1, n: int = 1) -> None:
+        """由传输层同步调用，这里节流后异步发出去。"""
+        now = time.monotonic()
+        if now - job.last_edit < CFG.progress_interval and done < total:
+            return
+        job.last_edit = now
+        pct = (done / total * 100) if total else 0
+        speed = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / speed if speed > 0 else 0
+        head = f"[{idx}/{n}] " if n > 1 else ""
+        text = (f"{head}{phase} {pct:.0f}% · "
+                f"{streamer.human_size(done)}/{streamer.human_size(total)} · "
+                f"{streamer.human_size(int(speed))}/s · 剩余 {_dur(eta)}")
+        asyncio.create_task(self._say(job, text))
+
+
+def _dur(sec: float) -> str:
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
