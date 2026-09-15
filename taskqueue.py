@@ -10,13 +10,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+)
 from telethon.errors import FloodWaitError
 
 import acl
@@ -33,6 +39,32 @@ log = logging.getLogger("queue")
 # 这些错误是确定性的，重试没有意义
 FATAL = (fetcher.FetchError, ParseError, NoSession, streamer.TransferError)
 
+# 投递阶段的确定性错误：bot 不在频道里、被踢、频道不存在等。
+# 这类错误重试 3 次只会把已经搬完的大文件重传 3 遍，必须当场判死。
+DELIVER_FATAL = (TelegramBadRequest, TelegramForbiddenError, TelegramNotFound)
+
+
+def _explain_deliver(err: Exception, relay_chat: int) -> str:
+    """把 Telegram 的英文报错翻成能直接照做的说明。
+
+    判断顺序要点：具体原因必须排在泛化原因前面。
+    "Forbidden: bot was kicked" 同时含有 forbidden 和 kicked，
+    先匹配 forbidden 就会给出误导性的「权限不足」。
+    """
+    msg = str(err).lower()
+    if "chat not found" in msg:
+        return (f"bot 找不到中转频道 {relay_chat}。\n"
+                f"常见原因：换过 BOT_TOKEN 但新 bot 没被加进该频道，"
+                f"或 RELAY_CHANNEL_ID 填错了。\n"
+                f"请把 bot 加为该频道管理员（Post Messages + Delete Messages）。")
+    if "message to copy not found" in msg or "message not found" in msg:
+        return "中转频道里的源消息已被删除，无法复制。"
+    if "kicked" in msg or "not a member" in msg:
+        return f"bot 已被移出中转频道 {relay_chat}，请重新加入并设为管理员。"
+    if "not enough rights" in msg or "forbidden" in msg:
+        return f"bot 在中转频道 {relay_chat} 里权限不足，请给它管理员权限。"
+    return f"投递失败：{err}"
+
 
 @dataclass
 class Job:
@@ -46,8 +78,17 @@ class Job:
     # 探测阶段的成果，在进程内从快通道传给慢通道
     entity: Any = None
     msg: Any = None
+    # 已搬进中转频道的结果。有值就说明字节已经过去了，
+    # 后续失败只需重投递，绝不重传。
+    relay_chat_id: Optional[int] = None
+    relay_ids: Optional[list[int]] = None
+    relay_is_album: bool = False
     last_edit: float = field(default=0.0)
     last_text: str = ""
+
+    @property
+    def relayed(self) -> bool:
+        return bool(self.relay_ids)
 
 
 class Runner:
@@ -57,21 +98,26 @@ class Runner:
         self.slow: asyncio.Queue[Job] = asyncio.Queue()
         self.disk_sem = asyncio.Semaphore(CFG.disk_concurrency)
         self._tasks: list[asyncio.Task] = []
+        self._active: dict[int, Job] = {}      # task_id -> Job，正在跑的
         self._started = time.time()
 
     # ------------------------------------------------------------ 生命周期
 
-    async def start(self) -> None:
+    def _spawn(self) -> None:
         for i in range(CFG.fast_concurrency):
             self._tasks.append(asyncio.create_task(self._worker(self.fast, "fast", i)))
         for i in range(CFG.slow_concurrency):
             self._tasks.append(asyncio.create_task(self._worker(self.slow, "slow", i)))
+
+    async def start(self) -> None:
+        self._spawn()
         await self._restore()
 
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
 
     async def _restore(self) -> None:
         """进程重启后捡回上次没跑完的任务。"""
@@ -82,10 +128,51 @@ class Runner:
                 request_chat_id=r["request_chat_id"],
                 request_msg_id=r["request_msg_id"],
                 status_msg_id=r["status_msg_id"], attempts=r["attempts"],
+                relay_chat_id=r["relay_chat_id"],
+                relay_ids=json.loads(r["relay_ids"]) if r["relay_ids"] else None,
+                relay_is_album=bool(r["relay_is_album"]),
             )
             (self.slow if r["lane"] == "slow" else self.fast).put_nowait(job)
         if rows:
-            log.info("恢复 %d 个未完成任务", len(rows))
+            n_relayed = sum(1 for r in rows if r["state"] == "relayed")
+            log.info("恢复 %d 个未完成任务（其中 %d 个已搬运完，只需重投递）",
+                     len(rows), n_relayed)
+
+    # ------------------------------------------------------------ 终止全部
+
+    async def killall(self, owner_id: Optional[int] = None) -> dict[str, int]:
+        """终止所有进行中的任务并清空队列。
+
+        做法：先把队列抽干，再取消所有 worker（会中断正在进行的下载/上传），
+        标记数据库，清理临时文件，最后重新拉起 worker。
+        """
+        queued = 0
+        for q in (self.fast, self.slow):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    q.task_done()
+                    queued += 1
+                except asyncio.QueueEmpty:
+                    break
+
+        running = len(self._active)
+        active_jobs = list(self._active.values())
+
+        await self.stop()
+        self._active.clear()
+
+        n, tmps = await db.cancel_all(owner_id)
+        freed = streamer.cleanup_orphans(tmps)
+
+        for job in active_jobs:
+            await self._say(job, "⛔ 已被 /killall 终止")
+
+        self._spawn()
+        log.warning("killall：终止 %d 个进行中、%d 个排队中，清理临时文件 %d 个",
+                    running, queued, freed)
+        return {"running": running, "queued": queued,
+                "marked": n, "files": freed}
 
     # ------------------------------------------------------------ 提交
 
@@ -105,6 +192,7 @@ class Runner:
         return {
             "fast": self.fast.qsize(),
             "slow": self.slow.qsize(),
+            "active": len(self._active),
             "uptime": int(time.time() - self._started),
         }
 
@@ -116,18 +204,26 @@ class Runner:
                 job = await q.get()
             except asyncio.CancelledError:
                 return
+            self._active[job.task_id] = job
             try:
                 await self._run(job, lane)
             except asyncio.CancelledError:
+                log.info("task=%s 被取消", job.task_id)
                 raise
             except Exception:  # noqa: BLE001
                 log.exception("worker 未捕获异常 task=%s", job.task_id)
             finally:
+                self._active.pop(job.task_id, None)
                 q.task_done()
 
     async def _run(self, job: Job, lane: str) -> None:
         await db.update_task(job.task_id, state="running", lane=lane)
         try:
+            # 已经搬完了（上次投递失败或进程重启），直接重投递，不重传。
+            if job.relayed:
+                log.info("task=%s 已搬运，跳过传输直接投递", job.task_id)
+                await self._deliver(job)
+                return
             if lane == "fast":
                 await self._run_fast(job)
             else:
@@ -136,6 +232,10 @@ class Runner:
             await self._flood(job, lane, e.seconds)
         except TelegramRetryAfter as e:
             await self._flood(job, lane, int(e.retry_after))
+        except DELIVER_FATAL as e:
+            # 投递侧的确定性错误。字节可能已经搬完了，不重试，
+            # 但保留 relay_ids —— 用户修好配置后重发链接即可秒完成。
+            await self._fail(job, _explain_deliver(e, job.relay_chat_id or 0))
         except FATAL as e:
             await self._fail(job, str(e))
         except Exception as e:  # noqa: BLE001
@@ -204,17 +304,38 @@ class Runner:
     # ------------------------------------------------------------ 收尾
 
     async def _finish(self, job: Job, res: fetcher.Relayed) -> None:
-        relay_ch = await acl.relay_channel_for(job.owner_id)
-        await sender.deliver(
-            self.bot, relay_ch, res.message_ids,
-            job.request_chat_id, job.request_msg_id, res.is_album,
-        )
-        await db.update_task(job.task_id, state="done", tmp_path=None,
-                             bytes_moved=res.bytes_moved, error=None)
-        await db.bump_usage(job.owner_id, res.bytes_moved)
+        """搬运完成。先把结果落库，再投递。
 
-        if res.note:
-            await self._say(job, "⚠️ " + res.note)
+        两步分开的意义：投递失败时 relay_ids 已经存下来了，重试不会
+        把几百 MB 重新下载上传一遍。
+        """
+        relay_ch = await acl.relay_channel_for(job.owner_id)
+        job.relay_chat_id = relay_ch
+        job.relay_ids = res.message_ids
+        job.relay_is_album = res.is_album
+
+        await db.update_task(
+            job.task_id, state="relayed", tmp_path=None,
+            bytes_moved=res.bytes_moved, error=None,
+            relay_chat_id=relay_ch,
+            relay_ids=json.dumps(res.message_ids),
+            relay_is_album=1 if res.is_album else 0,
+        )
+        await self._deliver(job, note=res.note)
+
+    async def _deliver(self, job: Job, note: str = "") -> None:
+        """把中转频道里的结果复制给用户。可独立重跑。"""
+        await sender.deliver(
+            self.bot, job.relay_chat_id, job.relay_ids,
+            job.request_chat_id, job.request_msg_id, job.relay_is_album,
+        )
+        row = await db.get_task(job.task_id)
+        moved = row["bytes_moved"] if row else 0
+        await db.update_task(job.task_id, state="done", error=None)
+        await db.bump_usage(job.owner_id, moved)
+
+        if note:
+            await self._say(job, "⚠️ " + note)
         else:
             await self._drop_status(job)
 

@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     owner_id        INTEGER NOT NULL,
     link            TEXT    NOT NULL,
     lane            TEXT    NOT NULL DEFAULT 'fast',     -- fast|slow
-    state           TEXT    NOT NULL DEFAULT 'pending',  -- pending|running|done|failed
+    state           TEXT    NOT NULL DEFAULT 'pending',  -- pending|running|relayed|done|failed|cancelled
     attempts        INTEGER NOT NULL DEFAULT 0,
     error           TEXT,
     tmp_path        TEXT,
@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     request_msg_id  INTEGER NOT NULL,
     status_msg_id   INTEGER,
     bytes_moved     INTEGER NOT NULL DEFAULT 0,
+    -- 已搬进中转频道的结果。投递失败重试时凭它跳过传输，
+    -- 不再把几百 MB 重下重传一遍。
+    relay_chat_id   INTEGER,
+    relay_ids       TEXT,
+    relay_is_album  INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -67,9 +72,25 @@ async def init() -> None:
     _db = await aiosqlite.connect(CFG.db_path)
     _db.row_factory = aiosqlite.Row
     await _db.executescript(SCHEMA)
+    await _migrate()
     await _db.commit()
     await ensure_owner()
     await recover_stuck()
+
+
+async def _migrate() -> None:
+    """给早于当前版本的数据库补列。CREATE TABLE IF NOT EXISTS 不会改已有表。"""
+    cur = await _db.execute("PRAGMA table_info(tasks)")
+    have = {r["name"] for r in await cur.fetchall()}
+    additions = {
+        "relay_chat_id": "INTEGER",
+        "relay_ids": "TEXT",
+        "relay_is_album": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for col, decl in additions.items():
+        if col not in have:
+            await _db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+    await _db.commit()
 
 
 async def close() -> None:
@@ -86,16 +107,30 @@ def conn() -> aiosqlite.Connection:
 # ------------------------------------------------------------------ users
 
 async def ensure_owner() -> None:
-    """owner 永远存在、永远 active。中转频道默认取 .env 里配置的那个。"""
+    """owner 永远存在、永远 active。
+
+    中转频道以 .env 为准：改了 RELAY_CHANNEL_ID 重启就该生效。
+    这里曾经用 COALESCE 保留库中旧值，导致改配置不起作用，且新 bot
+    因为不在旧频道里而投递失败 —— 已修正。
+    多用户的 relay_channel_id 由各自登录流程写入，不走这个函数。
+    """
+    old = await get_user(CFG.owner_id)
     await conn().execute(
         """INSERT INTO users (user_id, role, status, relay_channel_id, added_at)
            VALUES (?, 'owner', 'active', ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET
                role='owner', status='active',
-               relay_channel_id=COALESCE(users.relay_channel_id, excluded.relay_channel_id)""",
+               relay_channel_id=excluded.relay_channel_id""",
         (CFG.owner_id, CFG.relay_channel_id, now()),
     )
     await conn().commit()
+    if old and old["relay_channel_id"] and \
+            int(old["relay_channel_id"]) != CFG.relay_channel_id:
+        import logging
+        logging.getLogger("db").warning(
+            "中转频道已更新：%s -> %s（以 .env 为准）",
+            old["relay_channel_id"], CFG.relay_channel_id,
+        )
 
 
 async def get_user(user_id: int) -> Optional[aiosqlite.Row]:
@@ -194,20 +229,46 @@ async def get_task(task_id: int) -> Optional[aiosqlite.Row]:
 
 
 async def pending_tasks() -> list[aiosqlite.Row]:
-    """进程启动时捡回未完成的任务。"""
+    """进程启动时捡回未完成的任务。relayed 也算，它只差投递一步。"""
     cur = await conn().execute(
-        "SELECT * FROM tasks WHERE state IN ('pending','running') ORDER BY id"
+        "SELECT * FROM tasks WHERE state IN ('pending','running','relayed') ORDER BY id"
     )
     return list(await cur.fetchall())
 
 
 async def recover_stuck() -> None:
-    """上次崩溃时标为 running 的任务，重置回 pending 以便重跑。"""
+    """上次崩溃时标为 running 的任务，重置回 pending 以便重跑。
+
+    relayed 不动 —— 那些已经搬完了，重启后只需重投递。
+    """
     await conn().execute(
         "UPDATE tasks SET state='pending', updated_at=? WHERE state='running'",
         (now(),),
     )
     await conn().commit()
+
+
+async def cancel_all(owner_id: Optional[int] = None) -> tuple[int, list[str]]:
+    """终止所有未完成任务，返回 (条数, 需要清理的临时文件)。"""
+    where = "state IN ('pending','running','relayed')"
+    args: tuple = ()
+    if owner_id is not None:
+        where += " AND owner_id=?"
+        args = (owner_id,)
+
+    cur = await conn().execute(
+        f"SELECT id, tmp_path FROM tasks WHERE {where}", args)
+    rows = list(await cur.fetchall())
+    tmps = [r["tmp_path"] for r in rows if r["tmp_path"]]
+
+    await conn().execute(
+        f"""UPDATE tasks SET state='cancelled', error='用户终止',
+                             tmp_path=NULL, updated_at=?
+            WHERE {where}""",
+        (now(), *args),
+    )
+    await conn().commit()
+    return len(rows), tmps
 
 
 async def orphan_tmp_files() -> list[str]:
@@ -221,21 +282,53 @@ async def orphan_tmp_files() -> list[str]:
 async def queue_stats() -> dict[str, int]:
     cur = await conn().execute(
         """SELECT lane, state, COUNT(*) c FROM tasks
-           WHERE state IN ('pending','running') GROUP BY lane, state"""
+           WHERE state IN ('pending','running','relayed') GROUP BY lane, state"""
     )
-    out = {"fast_pending": 0, "fast_running": 0, "slow_pending": 0, "slow_running": 0}
+    out = {"fast_pending": 0, "fast_running": 0, "fast_relayed": 0,
+           "slow_pending": 0, "slow_running": 0, "slow_relayed": 0}
     for r in await cur.fetchall():
-        out[f"{r['lane']}_{r['state']}"] = r["c"]
+        key = f"{r['lane']}_{r['state']}"
+        if key in out:
+            out[key] = r["c"]
     return out
 
 
-async def totals() -> dict[str, int]:
+async def totals(owner_id: Optional[int] = None) -> dict[str, int]:
+    """完成/失败/取消数、搬运字节、投递消息条数。
+
+    relay_ids 存的就是 JSON 数组，用 json_array_length 数条数，
+    比拿逗号做字符串计数可靠（空数组、单元素都不会算错）。
+    """
+    where, args = ("WHERE owner_id=?", (owner_id,)) if owner_id is not None else ("", ())
     cur = await conn().execute(
-        """SELECT
-             SUM(state='done')   done,
-             SUM(state='failed') failed,
-             COALESCE(SUM(bytes_moved),0) bytes
-           FROM tasks"""
+        f"""SELECT
+              COUNT(*)                     total,
+              SUM(state='done')            done,
+              SUM(state='failed')          failed,
+              SUM(state='cancelled')       cancelled,
+              COALESCE(SUM(bytes_moved),0) bytes,
+              COALESCE(SUM(CASE
+                  WHEN state='done' AND relay_ids IS NOT NULL
+                  THEN json_array_length(relay_ids)
+                  WHEN state='done' THEN 1
+                  ELSE 0 END), 0)          messages
+            FROM tasks {where}""",
+        args,
     )
     r = await cur.fetchone()
-    return {"done": r["done"] or 0, "failed": r["failed"] or 0, "bytes": r["bytes"] or 0}
+    return {k: (r[k] or 0) for k in
+            ("total", "done", "failed", "cancelled", "bytes", "messages")}
+
+
+async def traffic_by_path() -> dict[str, int]:
+    """零流量（服务端直转）与实际搬运的字节数对比。"""
+    cur = await conn().execute(
+        """SELECT
+             SUM(CASE WHEN bytes_moved=0 THEN 1 ELSE 0 END) direct,
+             SUM(CASE WHEN bytes_moved>0 THEN 1 ELSE 0 END) moved,
+             COALESCE(SUM(bytes_moved),0) bytes
+           FROM tasks WHERE state='done'"""
+    )
+    r = await cur.fetchone()
+    return {"direct": r["direct"] or 0, "moved": r["moved"] or 0,
+            "bytes": r["bytes"] or 0}

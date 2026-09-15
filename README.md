@@ -100,38 +100,51 @@ TgSaver 用一个私有中转频道把这三道坎一次绕开：
 
 启动时会自动验证这个频道，配错直接报错退出，不会等到跑任务才发现。
 
-### 3. 部署
+### 3. 一键部署
 
 ```bash
 git clone https://github.com/<你的用户名>/tgsaver.git /opt/tgsaver
 cd /opt/tgsaver
-
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
-
-cp .env.example .env
-./venv/bin/python genkey.py        # 输出粘进 .env 的 SECRET_KEY
-nano .env                          # 填完 5 个必填项
-chmod 600 .env
-
-./venv/bin/python login.py         # 交互登录，生成加密凭据
-chmod 600 tgsaver.db
+./init.sh
 ```
 
-> **验证码请从其它设备的 Telegram 上读。**
-> Telegram 有反钓鱼机制，验证码一旦被发进任何 Telegram 聊天窗口会立即作废。
+`init.sh` 以 root 运行，会自动完成：装系统依赖、建专用用户、建 venv、
+生成 `SECRET_KEY`、校正权限属主、安装 systemd 单元、引导登录、启动服务。
 
-### 4. 常驻运行
+**可重复执行。** 配置没填完它会停下来告诉你缺什么，填完再跑一次即可；
+服务出问题时也可以再跑一遍，它会把目录、属主、权限全部校正。
+
+如果想手动来：
 
 ```bash
-sudo cp tgsaver.service /etc/systemd/system/
-sudo nano /etc/systemd/system/tgsaver.service   # 改 User / 路径，文件里标了「需修改」
-sudo systemctl daemon-reload
-sudo systemctl enable --now tgsaver
+apt install python3-venv python3-full build-essential python3-dev
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+cp .env.example .env && ./venv/bin/python genkey.py   # 粘进 SECRET_KEY
+nano .env && chmod 600 .env
+adduser --system --group --home /opt/tgsaver tgsaver
+mkdir -p /tmp/tgsaver && chown tgsaver:tgsaver /tmp/tgsaver
+chown -R tgsaver:tgsaver /opt/tgsaver
+sudo -u tgsaver ./venv/bin/python login.py    # 必须用 tgsaver 身份
+```
+
+登录时有两个坑：
+
+> **这里填手机号，不是 bot token。** Telethon 的提示文案把两种都列了，
+> 但 TgSaver 取消息必须用你的个人账号——bot 账号读不到任意消息链接。
+>
+> **验证码请从其它设备的 Telegram 上读，用眼睛看、手敲进终端。**
+> 一旦粘贴进任何 Telegram 聊天窗口（包括转发给自己、存收藏夹），
+> Telegram 会判定为钓鱼并立即作废。
+
+### 4. 验证
+
+```bash
+systemctl status tgsaver
 journalctl -u tgsaver -f
 ```
 
-跑起来后先发一条公开频道链接验证路径 A，再找个禁止转存的频道验证路径 B。
+先发一条公开频道链接验证路径 A（例如 `https://t.me/durov/1`），
+再找个禁止转存的频道验证路径 B。
 
 ---
 
@@ -187,10 +200,17 @@ GIF、文件、语音、圆形视频、贴纸、位置、联系人、caption、s
 ## 命令
 
 ```
-/help     说明
-/status   登录状态、队列深度、中转频道
-/logout   从 Telegram 服务端撤销 session 并清除本地记录
+/help      说明
+/status    登录状态、流量与消息统计、队列深度
+/killall   终止所有进行中的任务并清空队列
+/logout    从 Telegram 服务端撤销 session 并清除本地记录
 ```
+
+`/status` 会显示累计完成数、已投递消息条数、搬运字节（含双向流量估算），
+以及零流量直转与需要搬运的次数对比。
+
+`/killall` 会中断正在进行的下载上传、清空两条队列、清理临时文件，
+然后重新拉起 worker。服务本身不重启。
 
 管理命令（`/users` `/queue` `/stats` 已可用，其余需开启多用户）：
 
@@ -220,6 +240,7 @@ login.py          首次交互登录
 genkey.py         生成加密密钥
 tests/            34 项测试
 
+init.sh           一键部署 / 修复（幂等，可反复跑）
 git-init.sh       首次推送到 GitHub
 git-push.sh       日常更新推送
 git-guard.sh      隐私检查（被上面两个引用）
@@ -273,11 +294,13 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-34 项，覆盖：
+42 项，覆盖：
 
 - **链接解析**的全部形态，含论坛话题三段式（中间那个数字是话题 id 不是消息 id，
   这是最容易写错的地方）、`?single`、`tg://` 协议、各类非法输入
 - **有界管道**的字节完整性、分块精确性、内存上界、下载错误传播、进度单调性
+- **回归用例**：改中转频道后是否生效、投递错误是否被正确判死、
+  已搬运的任务重试时是否跳过传输、老数据库能否平滑升级
 
 改代码后先跑这个。
 

@@ -43,9 +43,10 @@ HELP = """把 Telegram 消息链接发给我，我原样取回来给你。
 支持公开 / 私有 / 论坛话题链接，相册自动整组，
 禁止转存的内容也能搬，大文件不受 50MB 限制。
 
-/status  查看登录状态与队列
-/logout  注销登录凭据
-/help    本说明"""
+/status   登录状态、流量与消息统计
+/killall  终止所有进行中的任务并清空队列
+/logout   注销登录凭据
+/help     本说明"""
 
 
 @router.message(CommandStart())
@@ -63,14 +64,52 @@ async def cmd_status(m: Message) -> None:
     row = await db.get_user(m.from_user.id)
     sess = {"ok": "已登录", "invalid": "已失效，请重新运行 login.py",
             "none": "未登录，请运行 login.py"}
-    s = RUNNER.stats() if RUNNER else {"fast": 0, "slow": 0, "uptime": 0}
-    up = s["uptime"]
-    await m.reply(
-        f"凭据：{sess.get(row['session_status'] if row else 'none', '未知')}\n"
-        f"队列：快 {s['fast']} · 慢 {s['slow']}\n"
-        f"中转频道：<code>{await acl.relay_channel_for(m.from_user.id)}</code>\n"
-        f"运行：{up // 3600}h{(up % 3600) // 60}m"
-    )
+    q = RUNNER.stats() if RUNNER else {"fast": 0, "slow": 0, "uptime": 0}
+    t = await db.totals(m.from_user.id)
+    p = await db.traffic_by_path()
+    up = q["uptime"]
+
+    pending = q["fast"] + q["slow"]
+    lines = [
+        f"<b>凭据</b>　{sess.get(row['session_status'] if row else 'none', '未知')}",
+        f"<b>运行</b>　{up // 3600}h{(up % 3600) // 60}m",
+        f"<b>中转</b>　<code>{await acl.relay_channel_for(m.from_user.id)}</code>",
+        "",
+        f"<b>任务</b>　完成 {t['done']} · 失败 {t['failed']}"
+        + (f" · 取消 {t['cancelled']}" if t["cancelled"] else ""),
+        f"<b>消息</b>　已投递 {t['messages']} 条",
+        f"<b>流量</b>　搬运 {streamer.human_size(t['bytes'])}"
+        f"（下载+上传约 {streamer.human_size(t['bytes'] * 2)}）",
+        f"<b>直转</b>　{p['direct']} 次零流量 · {p['moved']} 次需搬运",
+    ]
+    if pending:
+        lines += ["", f"<b>队列</b>　快 {q['fast']} · 慢 {q['slow']}"]
+    await m.reply("\n".join(lines))
+
+
+@router.message(Command("killall"))
+async def cmd_killall(m: Message) -> None:
+    """终止所有进行中的任务并清空队列。"""
+    if not await _allowed(m):
+        return
+    if RUNNER is None:
+        await m.reply("调度器尚未就绪。")
+        return
+
+    q = RUNNER.stats()
+    if q["fast"] + q["slow"] + q["active"] == 0:
+        await m.reply("当前没有进行中或排队中的任务。")
+        return
+
+    # 管理员可以终止全部；普通用户只能终止自己的
+    scope = None if await acl.is_admin(m.from_user.id) else m.from_user.id
+    r = await RUNNER.killall(scope)
+
+    parts = [f"已终止 {r['running']} 个进行中、{r['queued']} 个排队中的任务"]
+    if r["files"]:
+        parts.append(f"清理临时文件 {r['files']} 个")
+    parts.append("队列已清空，服务继续运行。")
+    await m.reply("⛔ " + "\n".join(parts))
 
 
 @router.message(Command("logout"))
