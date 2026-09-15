@@ -262,6 +262,14 @@ chmod +x git-*.sh
 ./git-push.sh "fix: 修正相册分组"
 ```
 
+脚本用了 bash 语法，但开头有自举，用 `sh` / `dash` 调用或可执行位丢失
+都能正常工作，不会报 `Syntax error: "(" unexpected`。
+
+部署后目录属主是 `tgsaver`，而 git 通常用 root 跑，会触发 git 的
+`dubious ownership` 拒绝。脚本会自动加 `safe.directory` 例外，并在
+退出时（包括推送失败、检查中止、Ctrl-C）把属主还原给服务用户，
+保证 `.env` 和数据库始终是 `tgsaver` 所有、权限 600。
+
 `git-push.sh` 会先跑 `pytest`，测试不过不推。可选参数：
 
 | 参数 | 作用 |

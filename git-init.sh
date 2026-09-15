@@ -13,6 +13,9 @@
 #  在 GitHub 上先建好空仓库（不要勾 Add README / .gitignore /
 #  License，否则首次推送会冲突），再跑这个。
 # ============================================================
+# 这些脚本用到数组、$'...' 等 bash 语法。无论被 sh / dash 调用，
+# 还是可执行位丢失导致 shebang 未生效，都切回 bash 重新执行。
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=git-guard.sh
@@ -38,6 +41,9 @@ printf "\n%s═══ TgSaver 首次推送 ═══%s\n" "$GRN" "$RST"
 printf "  远程：%s\n  分支：%s\n" "$REMOTE" "$BRANCH"
 
 # ------------------------------------------------------------
+step "仓库属主"
+guard_ownership
+
 step "初始化仓库"
 if [ -d .git ]; then
   warn "已存在 .git，跳过 init（若要重来请先 rm -rf .git）"

@@ -7,12 +7,59 @@
 #  因为 .gitignore 已经挡掉的文件不需要再管。
 # ============================================================
 
+# 被 source 时会继承调用方的 shell。这里挡一道，避免在 dash 下
+# 报出难以理解的语法错误。
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "git-guard.sh 需要 bash。请用 ./git-push.sh 或 bash git-push.sh 运行。" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; RST=$'\033[0m'
 
 ok()   { printf "  %s✓%s %s\n" "$GRN" "$RST" "$1"; }
 warn() { printf "  %s!%s %s\n" "$YEL" "$RST" "$1"; }
 die()  { printf "\n%s✗ %s%s\n\n" "$RED" "$1" "$RST"; exit 1; }
 step() { printf "\n%s>%s %s\n" "$GRN" "$RST" "$1"; }
+
+# ------------------------------------------------------------
+# 0. 仓库属主
+#    部署后目录属主是 tgsaver，但通常用 root 跑 git。
+#    git >= 2.35.2 会拒绝操作属主不同的仓库（dubious ownership）。
+# ------------------------------------------------------------
+guard_ownership() {
+  local dir owner me
+  dir=$(pwd)
+  owner=$(stat -c '%U' "$dir" 2>/dev/null || echo "")
+  me=$(id -un)
+
+  if [ -n "$owner" ] && [ "$owner" != "$me" ]; then
+    if ! git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$dir"; then
+      git config --global --add safe.directory "$dir"
+      warn "目录属主是 $owner，当前用户是 $me"
+      warn "已为 $dir 添加 git safe.directory 例外"
+    else
+      ok "safe.directory 例外已存在（属主 $owner）"
+    fi
+    REPO_OWNER="$owner"
+    # 用 trap 而不是在脚本末尾调用：推送失败、检查中止、Ctrl-C
+    # 都会跳过末尾语句，属主停留在 root 会让服务读不到 .env。
+    trap restore_ownership EXIT INT TERM
+  else
+    ok "仓库属主正常（$me）"
+    REPO_OWNER=""
+  fi
+}
+
+# 收尾：把 git 操作中变成 root 所有的文件还给服务用户，
+# 否则 systemd 以 tgsaver 身份启动时可能读不到 .env / 数据库。
+restore_ownership() {
+  [ -n "${REPO_OWNER:-}" ] || return 0
+  chown -R "$REPO_OWNER:$REPO_OWNER" . 2>/dev/null || true
+  [ -f .env ] && chmod 600 .env 2>/dev/null || true
+  [ -f tgsaver.db ] && chmod 600 tgsaver.db 2>/dev/null || true
+  printf "  %s·%s 属主已还原为 %s\n" "$DIM" "$RST" "$REPO_OWNER"
+  REPO_OWNER=""
+}
 
 # ------------------------------------------------------------
 # 1. .gitignore 必须存在且覆盖关键条目

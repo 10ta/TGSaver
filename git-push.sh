@@ -13,6 +13,9 @@
 #
 #  每次都会跑一遍隐私检查和测试，通不过不推。
 # ============================================================
+# 这些脚本用到数组、$'...' 等 bash 语法。无论被 sh / dash 调用，
+# 还是可执行位丢失导致 shebang 未生效，都切回 bash 重新执行。
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=git-guard.sh
@@ -35,6 +38,11 @@ done
 export ASSUME_YES
 
 [ -d .git ] || die "这里还不是 git 仓库。首次推送请用 ./git-init.sh"
+
+# 必须抢在第一条 git 命令之前：部署后目录属主是服务用户，
+# 而 git 通常用 root 跑，不先加例外会直接 dubious ownership 失败。
+step "仓库属主"
+guard_ownership
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 printf "\n%s═══ TgSaver 推送更新 ═══%s\n  分支：%s\n" "$GRN" "$RST" "$BRANCH"
