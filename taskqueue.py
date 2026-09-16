@@ -83,6 +83,7 @@ class Job:
     relay_chat_id: Optional[int] = None
     relay_ids: Optional[list[int]] = None
     relay_is_album: bool = False
+    lane: str = "fast"          # 当前所在通道，killall 重新排队时要用
     last_edit: float = field(default=0.0)
     last_text: str = ""
 
@@ -132,7 +133,8 @@ class Runner:
                 relay_ids=json.loads(r["relay_ids"]) if r["relay_ids"] else None,
                 relay_is_album=bool(r["relay_is_album"]),
             )
-            (self.slow if r["lane"] == "slow" else self.fast).put_nowait(job)
+            job.lane = r["lane"] or "fast"
+            (self.slow if job.lane == "slow" else self.fast).put_nowait(job)
         if rows:
             n_relayed = sum(1 for r in rows if r["state"] == "relayed")
             log.info("恢复 %d 个未完成任务（其中 %d 个已搬运完，只需重投递）",
@@ -141,38 +143,63 @@ class Runner:
     # ------------------------------------------------------------ 终止全部
 
     async def killall(self, owner_id: Optional[int] = None) -> dict[str, int]:
-        """终止所有进行中的任务并清空队列。
+        """终止进行中的任务并清空队列。
 
-        做法：先把队列抽干，再取消所有 worker（会中断正在进行的下载/上传），
-        标记数据库，清理临时文件，最后重新拉起 worker。
+        owner_id 为 None 表示全部，否则只终止该用户的。
+
+        这里必须小心：worker 是通用的，没法只取消"某个人的"那一个。
+        做法是把 worker 全部停掉（会中断正在进行的下载上传），然后把
+        不在终止范围内的任务原样放回队列继续跑。早先的版本只在数据库
+        侧按 scope 过滤，队列和 worker 却是一刀切 —— 普通用户一条
+        /killall 会打断所有人的任务，而别人的任务在库里仍标着 running，
+        直到进程重启才会被 recover_stuck 捡回来。
         """
+        def mine(j: Job) -> bool:
+            return owner_id is None or j.owner_id == owner_id
+
+        # 1. 抽干队列，把别人的挑出来留着
         queued = 0
+        spared: list[Job] = []
         for q in (self.fast, self.slow):
             while not q.empty():
                 try:
-                    q.get_nowait()
-                    q.task_done()
-                    queued += 1
+                    j = q.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                q.task_done()
+                if mine(j):
+                    queued += 1
+                else:
+                    spared.append(j)
 
-        running = len(self._active)
-        active_jobs = list(self._active.values())
-
+        # 2. 停掉所有 worker，中断进行中的传输
+        active = list(self._active.values())
+        killed = [j for j in active if mine(j)]
+        survivors = [j for j in active if not mine(j)]
         await self.stop()
         self._active.clear()
 
+        # 3. 落库 + 清理临时文件
         n, tmps = await db.cancel_all(owner_id)
         freed = streamer.cleanup_orphans(tmps)
 
-        for job in active_jobs:
+        for job in killed:
             await self._say(job, "⛔ 已被 /killall 终止")
 
+        # 4. 重新拉起 worker，把幸免的任务放回原来的通道
         self._spawn()
+        for job in survivors + spared:
+            await db.update_task(job.task_id, state="pending")
+            await (self.slow if job.lane == "slow" else self.fast).put(job)
+
+        if survivors or spared:
+            log.info("killall：%d 个他人任务已放回队列继续", 
+                     len(survivors) + len(spared))
         log.warning("killall：终止 %d 个进行中、%d 个排队中，清理临时文件 %d 个",
-                    running, queued, freed)
-        return {"running": running, "queued": queued,
-                "marked": n, "files": freed}
+                    len(killed), queued, freed)
+        return {"running": len(killed), "queued": queued,
+                "marked": n, "files": freed,
+                "spared": len(survivors) + len(spared)}
 
     # ------------------------------------------------------------ 提交
 
@@ -217,6 +244,7 @@ class Runner:
                 q.task_done()
 
     async def _run(self, job: Job, lane: str) -> None:
+        job.lane = lane
         await db.update_task(job.task_id, state="running", lane=lane)
         try:
             # 已经搬完了（上次投递失败或进程重启），直接重投递，不重传。
@@ -246,8 +274,8 @@ class Runner:
 
     async def _run_fast(self, job: Job) -> None:
         ref = parse_link(job.link)
-        client = await POOL.acquire(job.owner_id)
-        async with POOL.lock_for(job.owner_id):
+        client = await POOL.acquire(acl.session_user(job.owner_id))
+        async with POOL.lock_for(acl.session_user(job.owner_id)):
             entity, msg, protected = await fetcher.probe(client, ref)
 
             if protected:
@@ -273,11 +301,11 @@ class Runner:
 
     async def _run_slow(self, job: Job) -> None:
         ref = parse_link(job.link)
-        client = await POOL.acquire(job.owner_id)
+        client = await POOL.acquire(acl.session_user(job.owner_id))
 
         entity, msg = job.entity, job.msg
         if msg is None:
-            async with POOL.lock_for(job.owner_id):
+            async with POOL.lock_for(acl.session_user(job.owner_id)):
                 entity, msg, _ = await fetcher.probe(client, ref)
 
         size = fetcher.media_size(msg)
@@ -288,7 +316,7 @@ class Runner:
 
         async def body() -> None:
             relay_ch = await acl.relay_channel_for(job.owner_id)
-            async with POOL.lock_for(job.owner_id):
+            async with POOL.lock_for(acl.session_user(job.owner_id)):
                 res = await fetcher.relay(
                     client, ref, relay_ch,
                     on_progress=lambda *a: self._progress(job, *a),

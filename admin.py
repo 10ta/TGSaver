@@ -1,22 +1,17 @@
-"""管理命令与审批流程。
+"""管理命令。只有机主能用。
 
-代码全部写好了，但受 acl.MULTI_USER 控制：
-  - False（当前）：只有 owner 能用 bot，管理命令会提示多用户未开启
-  - True：申请审批、加人、封禁全部生效，无需改动其它模块
+身份只有两种：机主和授权用户，没有中间层。
+机主主动增删，被加的人无感知 —— 没有申请、没有审批、没有通知。
+加进来就能用，移出去就不能用。
 """
 from __future__ import annotations
 
 import logging
 import time
 
-from aiogram import Bot, F, Router
+from aiogram import Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import Message
 
 import acl
 import db
@@ -27,233 +22,203 @@ from session_pool import POOL
 log = logging.getLogger("admin")
 router = Router(name="admin")
 
+_BOOT = time.time()
 
-def _need_multi() -> str:
-    return ("多用户模式当前未开启。\n"
-            "要开启：编辑 acl.py，把 MULTI_USER 改成 True 后重启服务。")
+ADMIN_HELP = """<b>管理命令</b>（仅机主可用）
+
+/users — 列出所有授权用户
+/adduser <code>id [id...]</code> — 添加，可一次多个
+/deluser <code>id [id...]</code> — 移除
+/ban <code>id</code> — 封禁（保留用量记录）
+/unban <code>id</code> — 解封
+/queue — 队列状态
+/stats — 全局统计
+
+被加的人不会收到任何通知，直接就能用。
+让对方找 @userinfobot 拿自己的数字 id。
+
+授权用户与你的区别只有三点：用不了上面这些命令、
+/killall 只能终止自己的任务、/status 只看自己的用量。
+
+<b>注意</b>：授权用户是用你的账号去取消息的。
+他们能读你账号能读到的一切，包括你的私有频道和私聊记录。
+只加你自己的其他号，或完全信任的人。"""
 
 
 async def _guard(m: Message) -> bool:
-    if not await acl.is_admin(m.from_user.id):
-        return False
-    if not acl.MULTI_USER:
-        await m.reply(_need_multi())
-        return False
-    return True
+    """管理命令一律只有机主能用。
+
+    拒绝方式分两种，是故意的：
+      授权用户 —— 明确告诉他这是机主命令，否则他会以为 bot 卡住了
+      未授权的人 —— 一声不吭，免得把命令的存在暴露出去
+
+    这些处理函数挂在 admin 路由上，比主路由先匹配。一旦匹配就不再
+    往下传，所以这里不回复就等于彻底没有反应。
+    """
+    if acl.is_owner(m.from_user.id):
+        return True
+    if await acl.check(m.from_user.id) is acl.Access.OK:
+        await m.reply("这是机主命令，你没有权限。")
+    return False
+
+
+def _ids(args: str | None) -> list[int]:
+    """从参数里取出所有数字 id，忽略无关内容。"""
+    out = []
+    for tok in (args or "").replace(",", " ").split():
+        tok = tok.strip().lstrip("@")
+        try:
+            out.append(int(tok))
+        except ValueError:
+            continue
+    return out
 
 
 # ------------------------------------------------------------------ 查询
 
+@router.message(Command("admin"))
+async def cmd_admin(m: Message) -> None:
+    if not await _guard(m):
+        return
+    await m.reply(ADMIN_HELP)
+
+
 @router.message(Command("users"))
 async def cmd_users(m: Message) -> None:
-    if not await acl.is_admin(m.from_user.id):
+    if not await _guard(m):
         return
     rows = await db.list_users()
-    if not rows:
-        await m.reply("暂无用户记录。")
-        return
-    icon = {"active": "✅", "pending": "⏳", "banned": "🚫"}
-    sess = {"ok": "已登录", "invalid": "已失效", "none": "未登录"}
-    lines = []
+    icon = {"active": "✅", "banned": "🚫"}
+    lines = ["<b>授权用户</b>", ""]
     for r in rows:
-        name = f"@{r['username']}" if r["username"] else str(r["user_id"])
+        if r["status"] not in ("active", "banned"):
+            continue
+        tag = "机主" if r["role"] == "owner" else "用户"
+        name = f"@{r['username']}" if r["username"] else ""
+        used = (f" · {r['task_count']} 次 · "
+                f"{streamer.human_size(r['bytes_total'])}"
+                if r["task_count"] else "")
         lines.append(
-            f"{icon.get(r['status'], '?')} {name} · {r['role']} · "
-            f"{sess.get(r['session_status'], '?')} · "
-            f"{r['task_count']} 次 · {streamer.human_size(r['bytes_total'])}"
-        )
-    tail = "" if acl.MULTI_USER else f"\n\n（{_need_multi()}）"
-    await m.reply("\n".join(lines) + tail)
+            f"{icon.get(r['status'], '?')} <code>{r['user_id']}</code> "
+            f"{name} [{tag}]{used}")
+    if len(lines) == 2:
+        lines.append("（只有你自己）")
+    await m.reply("\n".join(lines))
 
 
 @router.message(Command("queue"))
-async def cmd_queue(m: Message, runner=None) -> None:
-    if not await acl.is_admin(m.from_user.id):
+async def cmd_queue(m: Message) -> None:
+    if not await _guard(m):
         return
     s = await db.queue_stats()
     await m.reply(
-        f"快通道 等待 {s['fast_pending']} / 执行 {s['fast_running']}\n"
-        f"慢通道 等待 {s['slow_pending']} / 执行 {s['slow_running']}"
+        f"快通道　等待 {s['fast_pending']} · 执行 {s['fast_running']}\n"
+        f"慢通道　等待 {s['slow_pending']} · 执行 {s['slow_running']}\n"
+        f"待投递　{s['fast_relayed'] + s['slow_relayed']}"
     )
 
 
 @router.message(Command("stats"))
 async def cmd_stats(m: Message) -> None:
-    if not await acl.is_admin(m.from_user.id):
+    if not await _guard(m):
         return
     t = await db.totals()
-    me = await db.get_user(m.from_user.id)
+    p = await db.traffic_by_path()
+    sess = await db.get_user(CFG.owner_id)
     up = int(time.time() - _BOOT)
+    n_users = len([r for r in await db.list_users() if r["status"] == "active"])
     await m.reply(
-        f"运行时长 {up // 3600}h{(up % 3600) // 60}m\n"
-        f"累计完成 {t['done']} · 失败 {t['failed']}\n"
-        f"搬运流量 {streamer.human_size(t['bytes'])}\n"
-        f"登录状态 {me['session_status'] if me else 'none'}\n"
-        f"多用户 {'开启' if acl.MULTI_USER else '关闭'}"
+        f"<b>全局统计</b>\n\n"
+        f"运行　{up // 3600}h{(up % 3600) // 60}m\n"
+        f"用户　{n_users} 个\n"
+        f"凭据　{sess['session_status'] if sess else 'none'}\n\n"
+        f"任务　完成 {t['done']} · 失败 {t['failed']} · 取消 {t['cancelled']}\n"
+        f"消息　已投递 {t['messages']} 条\n"
+        f"流量　搬运 {streamer.human_size(t['bytes'])}\n"
+        f"直转　{p['direct']} 次零流量 · {p['moved']} 次需搬运"
     )
 
 
-# ------------------------------------------------------------------ 增删改
+# ------------------------------------------------------------------ 增删
 
 @router.message(Command("adduser"))
 async def cmd_adduser(m: Message, command: CommandObject) -> None:
     if not await _guard(m):
         return
-    uid = _parse_uid(command.args)
-    if uid is None:
-        await m.reply("用法：/adduser <数字id>")
+    ids = _ids(command.args)
+    if not ids:
+        await m.reply(
+            "用法：<code>/adduser 123456789</code>\n"
+            "可一次加多个：<code>/adduser 111 222 333</code>\n\n"
+            "对方找 @userinfobot 发一句话就能拿到自己的数字 id。")
         return
-    await db.upsert_user(uid, status="active", role="user",
-                         added_by=m.from_user.id)
-    await m.reply(f"已添加 {uid}")
-    await _notify(m.bot, uid, "管理员已通过你的申请，发送 /login 开始登录。")
+
+    done, skip = [], []
+    for uid in ids:
+        if uid == CFG.owner_id:
+            skip.append(f"{uid}（机主本人）")
+            continue
+        await db.upsert_user(uid, status="active", role="user",
+                             added_by=m.from_user.id)
+        done.append(uid)
+
+    parts = []
+    if done:
+        parts.append("已添加：" + " ".join(f"<code>{u}</code>" for u in done))
+        parts.append("对方不会收到通知，直接就能用。")
+    if skip:
+        parts.append("已跳过：" + "、".join(skip))
+    await m.reply("\n".join(parts))
 
 
 @router.message(Command("deluser"))
 async def cmd_deluser(m: Message, command: CommandObject) -> None:
     if not await _guard(m):
         return
-    uid = _parse_uid(command.args)
-    if uid is None or uid == CFG.owner_id:
-        await m.reply("用法：/deluser <数字id>（不能删除机主）")
+    ids = _ids(command.args)
+    if not ids:
+        await m.reply("用法：<code>/deluser 123456789</code>")
         return
-    await POOL.invalidate(uid)
-    await db.conn().execute("DELETE FROM users WHERE user_id=?", (uid,))
+
+    done, skip = [], []
+    for uid in ids:
+        if uid == CFG.owner_id:
+            skip.append(str(uid))
+            continue
+        await db.conn().execute("DELETE FROM users WHERE user_id=?", (uid,))
+        done.append(uid)
     await db.conn().commit()
-    await m.reply(f"已移除 {uid}")
+
+    parts = []
+    if done:
+        parts.append("已移除：" + " ".join(f"<code>{u}</code>" for u in done))
+    if skip:
+        parts.append(f"机主不能移除自己（{'、'.join(skip)}）。")
+    await m.reply("\n".join(parts))
 
 
 @router.message(Command("ban"))
 async def cmd_ban(m: Message, command: CommandObject) -> None:
     if not await _guard(m):
         return
-    uid = _parse_uid(command.args)
-    if uid is None or uid == CFG.owner_id:
-        await m.reply("用法：/ban <数字id>")
+    ids = [u for u in _ids(command.args) if u != CFG.owner_id]
+    if not ids:
+        await m.reply("用法：<code>/ban 123456789</code>（不能封禁机主）")
         return
-    await db.upsert_user(uid, status="banned")
-    await POOL.invalidate(uid)
-    await m.reply(f"已封禁 {uid}")
+    for uid in ids:
+        await db.upsert_user(uid, status="banned")
+    await m.reply("已封禁：" + " ".join(f"<code>{u}</code>" for u in ids)
+                  + "\n用量记录保留，/unban 可恢复。")
 
 
 @router.message(Command("unban"))
 async def cmd_unban(m: Message, command: CommandObject) -> None:
     if not await _guard(m):
         return
-    uid = _parse_uid(command.args)
-    if uid is None:
-        await m.reply("用法：/unban <数字id>")
+    ids = _ids(command.args)
+    if not ids:
+        await m.reply("用法：<code>/unban 123456789</code>")
         return
-    await db.upsert_user(uid, status="active")
-    await m.reply(f"已解封 {uid}")
-
-
-@router.message(Command("promote"))
-async def cmd_promote(m: Message, command: CommandObject) -> None:
-    if not acl.is_owner(m.from_user.id) or not await _guard(m):
-        return
-    uid = _parse_uid(command.args)
-    if uid is None:
-        await m.reply("用法：/promote <数字id>")
-        return
-    await db.upsert_user(uid, role="admin", status="active")
-    await m.reply(f"{uid} 已提升为管理员")
-
-
-@router.message(Command("demote"))
-async def cmd_demote(m: Message, command: CommandObject) -> None:
-    if not acl.is_owner(m.from_user.id) or not await _guard(m):
-        return
-    uid = _parse_uid(command.args)
-    if uid is None or uid == CFG.owner_id:
-        await m.reply("用法：/demote <数字id>")
-        return
-    await db.upsert_user(uid, role="user")
-    await m.reply(f"{uid} 已降为普通用户")
-
-
-@router.message(Command("revoke"))
-async def cmd_revoke(m: Message, command: CommandObject) -> None:
-    """强制作废某用户的 session，不动其账号权限。"""
-    if not await _guard(m):
-        return
-    uid = _parse_uid(command.args)
-    if uid is None:
-        await m.reply("用法：/revoke <数字id>")
-        return
-    await POOL.invalidate(uid)
-    await db.clear_session(uid)
-    await m.reply(f"已作废 {uid} 的 session")
-
-
-# ------------------------------------------------------------------ 审批
-
-async def request_access(bot: Bot, user) -> None:
-    """陌生人首次接触 bot 时调用：落一条 pending 记录并通知 owner。"""
-    if not acl.MULTI_USER:
-        return
-    existing = await db.get_user(user.id)
-    if existing and existing["status"] in ("active", "banned"):
-        return
-    if not existing:
-        await db.upsert_user(user.id, username=user.username, status="pending")
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ 通过", callback_data=f"ap:ok:{user.id}"),
-        InlineKeyboardButton(text="❌ 拒绝", callback_data=f"ap:no:{user.id}"),
-        InlineKeyboardButton(text="🚫 封禁", callback_data=f"ap:ban:{user.id}"),
-    ]])
-    name = f"@{user.username}" if user.username else user.full_name
-    await bot.send_message(
-        CFG.owner_id,
-        f"新的使用申请\n{name}\nid: <code>{user.id}</code>",
-        reply_markup=kb, parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data.startswith("ap:"))
-async def on_approval(cb: CallbackQuery) -> None:
-    if not await acl.is_admin(cb.from_user.id):
-        await cb.answer("无权限", show_alert=True)
-        return
-    _, action, uid_s = cb.data.split(":")
-    uid = int(uid_s)
-
-    if action == "ok":
-        await db.upsert_user(uid, status="active", role="user",
-                             added_by=cb.from_user.id)
-        verdict = "已通过"
-        await _notify(cb.bot, uid, "申请已通过，发送 /login 开始登录。")
-    elif action == "no":
-        await db.conn().execute("DELETE FROM users WHERE user_id=?", (uid,))
-        await db.conn().commit()
-        verdict = "已拒绝"
-        await _notify(cb.bot, uid, "你的申请未被通过。")
-    else:
-        await db.upsert_user(uid, status="banned")
-        await POOL.invalidate(uid)
-        verdict = "已封禁"
-
-    await cb.message.edit_text(f"{cb.message.text}\n\n→ {verdict}")
-    await cb.answer(verdict)
-
-
-# ------------------------------------------------------------------ 工具
-
-def _parse_uid(args: str | None) -> int | None:
-    if not args:
-        return None
-    try:
-        return int(args.strip().split()[0])
-    except (ValueError, IndexError):
-        return None
-
-
-async def _notify(bot: Bot, uid: int, text: str) -> None:
-    try:
-        await bot.send_message(uid, text)
-    except Exception as e:  # noqa: BLE001
-        log.debug("通知 %s 失败: %s", uid, e)
-
-
-_BOOT = time.time()
+    for uid in ids:
+        await db.upsert_user(uid, status="active")
+    await m.reply("已解封：" + " ".join(f"<code>{u}</code>" for u in ids))

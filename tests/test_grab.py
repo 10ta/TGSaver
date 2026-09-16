@@ -27,16 +27,51 @@ from bot import GRAB_MAX, parse_grab_target as P  # noqa: E402
 # ------------------------------------------------- 应该识别
 
 @pytest.mark.parametrize("text,want", [
-    ("@some_bot",        ("some_bot", 1)),
-    ("@some_bot 5",      ("some_bot", 5)),
-    ("@some_bot   5",    ("some_bot", 5)),
-    ("  @some_bot 5  ",  ("some_bot", 5)),
-    ("123456789",        ("123456789", 1)),
-    ("123456789 3",      ("123456789", 3)),
-    ("-1001234567890 2", ("-1001234567890", 2)),
+    # 链接形式（主推：不会触发 Telegram 的 inline 查询拦截）
+    ("t.me/some_bot",              ("some_bot", 1)),
+    ("t.me/some_bot 5",            ("some_bot", 5)),
+    ("https://t.me/some_bot 3",    ("some_bot", 3)),
+    ("http://t.me/some_bot",       ("some_bot", 1)),
+    ("https://www.t.me/some_bot",  ("some_bot", 1)),
+    ("t.me/some_bot/ 2",           ("some_bot", 2)),
+    ("  t.me/some_bot 5  ",        ("some_bot", 5)),
+    # 私有频道：t.me/c/ 里的数字要补回 -100 前缀
+    ("t.me/c/1234567890 2",        ("-1001234567890", 2)),
+    ("t.me/c/1234567890",          ("-1001234567890", 1)),
+    # 点号简写
+    (".some_bot",                  ("some_bot", 1)),
+    (".some_bot 5",                ("some_bot", 5)),
+    (">some_bot 5",                ("some_bot", 5)),
+    (".@some_bot 5",               ("some_bot", 5)),
+    # @ 形式仍保留（bot 不支持 inline 时可用）
+    ("@some_bot",                  ("some_bot", 1)),
+    ("@some_bot 5",                ("some_bot", 5)),
+    ("  @some_bot 5  ",            ("some_bot", 5)),
+    # 数字 id
+    ("123456789",                  ("123456789", 1)),
+    ("123456789 3",                ("123456789", 3)),
+    ("-1001234567890 2",           ("-1001234567890", 2)),
 ])
 def test_recognized(text, want):
     assert P(text) == want
+
+
+# --------------------------------- 绝不能吞掉真正的消息链接
+
+@pytest.mark.parametrize("text", [
+    "https://t.me/durov/1",
+    "t.me/durov/1",
+    "t.me/durov/1 nosp",
+    "https://t.me/c/1234567890/123",
+    "https://t.me/c/1234567890/45/123",
+    "https://t.me/chan/181?comment=4832",
+    "https://t.me/b/botname/77",
+    "https://t.me/joinchat/AAAA",
+    "https://t.me/durov/1 https://t.me/durov/2",
+])
+def test_message_links_not_swallowed(text):
+    """带消息 id 的链接必须交给正常流程，不能被当成抓取目标。"""
+    assert P(text) is None, f"{text!r} 是消息链接，不该走抓取"
 
 
 def test_count_clamped_to_max():
@@ -60,7 +95,7 @@ def test_count_clamped_to_max():
     "@some_bot@other",
     "帮我看看 @some_bot",          # 夹在句子里
     "@some_bot 你好",
-    "https://t.me/a/1",           # 链接由 find_links 处理
+    ".ab",                        # 点号后用户名太短
     "",
     "   ",
     "/start",
@@ -71,10 +106,12 @@ def test_not_recognized(text):
     assert P(text) is None, f"{text!r} 不该被当成抓取目标"
 
 
-def test_username_requires_at_sign():
-    """不带 @ 的裸用户名一律不认，否则任何普通词都会触发抓取。"""
+def test_bare_word_requires_marker():
+    """裸用户名一律不认，必须带 t.me/ 、@ 或点号，否则普通词会误触发。"""
     assert P("some_bot") is None
     assert P("@some_bot") == ("some_bot", 1)
+    assert P(".some_bot") == ("some_bot", 1)
+    assert P("t.me/some_bot") == ("some_bot", 1)
 
 
 def test_numeric_needs_six_digits():

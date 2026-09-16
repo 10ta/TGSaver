@@ -23,6 +23,7 @@ from telethon.tl.types import MessageService
 import acl
 import admin
 import db
+import menu
 import streamer
 from config import CFG
 from parser import (
@@ -46,19 +47,49 @@ RUNNER: Runner | None = None
 GRAB_MAX = 20      # 单次最多抓几条，再多容易触发 FloodWait
 GRAB_SCAN = 200    # 往回翻多少条消息去找媒体
 
-HELP = """把 Telegram 消息链接发给我，我原样取回来给你。
+HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 
-支持公开 / 私有 / 论坛话题 / 评论区链接，相册自动整组，
-禁止转存的内容也能搬，大文件不受 50MB 限制。
+<b>① 保存消息</b>
+直接发消息链接，一条消息里可以贴多个：
 
-链接后面加 <code>nosp</code> 可去掉剧透遮罩（会重新上传，慢一些）。
-受保护的内容本来就是重传，遮罩一律自动去掉。
+<code>t.me/频道名/123</code>
+<code>t.me/c/1234567890/123</code>  私有频道
+<code>t.me/频道名/45/123</code>  论坛话题
+<code>t.me/频道名/181?comment=4832</code>  评论区
 
-@对话名    抓取私聊内容，如 @some_bot 5（无法转发、没有链接的用这个）
-/status   登录状态、流量与消息统计
-/killall  终止所有进行中的任务并清空队列
-/logout   注销登录凭据
-/help     本说明"""
+相册自动整组，禁止转存的内容也能搬，大文件不受 50MB 限制。
+
+<b>② 去掉剧透遮罩</b>
+链接后面加 <code>nosp</code>：
+
+<code>t.me/频道名/123 nosp</code>
+
+会重新下载上传，比直转慢。受保护的内容本来就是重传，遮罩一律自动去掉，不用加。
+
+<b>③ 抓私聊内容</b>
+私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），
+所以改发<b>对话地址</b>，后面跟要抓几条：
+
+<code>t.me/some_bot 5</code>  抓最近 5 条媒体
+<code>t.me/some_bot</code>  不写数字就抓 1 条
+<code>https://t.me/some_bot 3</code>  完整 URL 也行
+<code>t.me/c/1234567890 3</code>  私有频道，自动补 -100 前缀
+<code>.some_bot 5</code>  点号简写，手机上打字更快
+<code>123456789 3</code>  数字 id
+
+<code>@some_bot 5</code> 这种写法代码里也认，但<b>不推荐</b>——
+Telegram 客户端看到消息以 @某bot 开头，会拦成对那个 bot 的 inline 查询，
+消息根本发不出来。
+
+单次最多 20 条，会往回翻 200 条消息找媒体。
+
+<b>命令</b>
+/status — 登录状态、流量与消息统计
+/killall — 终止所有进行中的任务并清空队列
+/logout — 注销登录凭据
+/help — 本说明
+
+机主另有 /admin 查看管理命令。"""
 
 
 @router.message(CommandStart())
@@ -66,6 +97,9 @@ HELP = """把 Telegram 消息链接发给我，我原样取回来给你。
 async def cmd_start(m: Message) -> None:
     if not await _allowed(m):
         return
+    if acl.is_owner(m.from_user.id):
+        # 启动时机主若还没和 bot 建立会话，管理菜单会注册失败，这里补一次
+        await menu.ensure_owner_menu(m.bot)
     await m.reply(HELP)
 
 
@@ -73,9 +107,9 @@ async def cmd_start(m: Message) -> None:
 async def cmd_status(m: Message) -> None:
     if not await _allowed(m):
         return
-    row = await db.get_user(m.from_user.id)
-    sess = {"ok": "已登录", "invalid": "已失效，请重新运行 login.py",
-            "none": "未登录，请运行 login.py"}
+    row = await db.get_user(acl.session_user(m.from_user.id))
+    sess = {"ok": "正常", "invalid": "已失效，需机主重新登录",
+            "none": "未登录，需机主先登录"}
     q = RUNNER.stats() if RUNNER else {"fast": 0, "slow": 0, "uptime": 0}
     t = await db.totals(m.from_user.id)
     p = await db.traffic_by_path()
@@ -99,6 +133,18 @@ async def cmd_status(m: Message) -> None:
     await m.reply("\n".join(lines))
 
 
+# 抓取目标的几种写法。
+#
+# 为什么不能只用 @name：Telegram 客户端看到消息以 "@botname " 开头
+# 会拦截成对该 bot 的 inline 查询，消息根本发不出去。所以主推链接形式，
+# 它既不触发 inline，也不用记语法 —— 从对话资料页直接复制就有。
+GRAB_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?t\.me/(c/)?(@?[A-Za-z0-9_]{4,32}|-?\d{4,})/?"
+    r"(?:\s+(\d{1,3}))?$", re.IGNORECASE)
+# 前缀点号：.some_bot 5  —— 手机上比打链接快
+GRAB_DOT_RE = re.compile(
+    r"^[.>]\s*@?([A-Za-z][A-Za-z0-9_]{3,31})(?:\s+(\d{1,3}))?$")
+# @name 仍然保留：用在 /grab 后面、或那个 bot 不支持 inline 时可以直接发
 GRAB_USERNAME_RE = re.compile(
     r"^@([A-Za-z][A-Za-z0-9_]{3,31})(?:\s+(\d{1,3}))?$")
 # 数字 id 至少 6 位。太短的数字更可能是用户随手打的东西，
@@ -106,32 +152,51 @@ GRAB_USERNAME_RE = re.compile(
 GRAB_NUMERIC_RE = re.compile(r"^(-?\d{6,})(?:\s+(\d{1,3}))?$")
 
 
+def _clamp(n: str | None) -> int:
+    return max(1, min(int(n), GRAB_MAX)) if n else 1
+
+
 def parse_grab_target(text: str):
     """从一行裸文本里认出抓取目标，认不出返回 None。
 
     接受：
-        @some_bot        -> ("some_bot", 1)
-        @some_bot 5      -> ("some_bot", 5)
-        123456789 3      -> ("123456789", 3)
-
-    用户名必须带 @：否则 "hello" 这种普通词也会被当成对话名，
-    然后抛一个让人摸不着头脑的错误。
+        t.me/some_bot        -> ("some_bot", 1)     推荐，不触发 inline
+        t.me/some_bot 5      -> ("some_bot", 5)
+        t.me/c/1234567890 3  -> ("-1001234567890", 3)
+        .some_bot 5          -> ("some_bot", 5)
+        @some_bot 5          -> ("some_bot", 5)     bot 支持 inline 时发不出去
+        123456789 3          -> ("123456789", 3)
     """
     t = (text or "").strip()
-    for rx in (GRAB_USERNAME_RE, GRAB_NUMERIC_RE):
+
+    mm = GRAB_LINK_RE.match(t)
+    if mm:
+        is_channel, peer, n = mm.group(1), mm.group(2).lstrip("@"), mm.group(3)
+        if is_channel:
+            # t.me/c/ 里的数字是频道 id，要补回 -100 前缀
+            if not peer.lstrip("-").isdigit():
+                return None
+            peer = peer if peer.startswith("-100") else f"-100{peer.lstrip('-')}"
+        return peer, _clamp(n)
+
+    for rx in (GRAB_DOT_RE, GRAB_USERNAME_RE, GRAB_NUMERIC_RE):
         mm = rx.match(t)
         if mm:
-            n = int(mm.group(2)) if mm.group(2) else 1
-            return mm.group(1), max(1, min(n, GRAB_MAX))
+            return mm.group(1), _clamp(mm.group(2))
     return None
 
 
 GRAB_HELP = (
-    "直接发对话名就行，不用带命令：\n\n"
-    "<code>@some_bot</code> — 抓最近 1 条媒体\n"
-    "<code>@some_bot 5</code> — 抓最近 5 条\n"
-    "<code>123456789 3</code> — 数字 id 也行\n\n"
-    "用于保存私聊里那些无法转发、也没有链接的内容。"
+    "抓私聊内容，直接发对话地址就行，不用带命令：\n\n"
+    "<code>t.me/some_bot 5</code>  抓最近 5 条媒体\n"
+    "<code>t.me/some_bot</code>  不写数字就抓 1 条\n"
+    "<code>https://t.me/some_bot 3</code>  完整 URL 也行\n"
+    "<code>t.me/c/1234567890 3</code>  私有频道，自动补 -100 前缀\n"
+    "<code>.some_bot 5</code>  点号简写，手机上打字更快\n"
+    "<code>123456789 3</code>  数字 id\n\n"
+    "<code>@some_bot 5</code> 也认，但 Telegram 常把它拦成 inline 查询，"
+    "消息发不出来，不推荐。\n\n"
+    "单次最多 20 条，会往回翻 200 条消息找媒体。"
 )
 
 
@@ -142,15 +207,15 @@ async def do_grab(m: Message, target: str, count: int) -> None:
     这里把找到的消息合成内部伪链接丢进同一套队列，
     下游的传输和投递逻辑完全复用。
     """
-    row = await db.get_user(m.from_user.id)
+    row = await db.get_user(acl.session_user(m.from_user.id))
     if not row or row["session_status"] != "ok":
-        await m.reply("还没有可用的登录凭据。请在服务器上运行 login.py。")
+        await m.reply("还没有可用的登录凭据，请联系机主。")
         return
 
     status = await m.reply(f"正在查找 {target} 最近的内容…")
     try:
-        client = await POOL.acquire(m.from_user.id)
-        async with POOL.lock_for(m.from_user.id):
+        client = await POOL.acquire(acl.session_user(m.from_user.id))
+        async with POOL.lock_for(acl.session_user(m.from_user.id)):
             try:
                 entity = await client.get_entity(
                     int(target) if target.lstrip("-").isdigit() else target)
@@ -216,50 +281,67 @@ async def cmd_killall(m: Message) -> None:
         await m.reply("当前没有进行中或排队中的任务。")
         return
 
-    # 管理员可以终止全部；普通用户只能终止自己的
-    scope = None if await acl.is_admin(m.from_user.id) else m.from_user.id
+    # 机主可以终止全部；授权用户只能终止自己的
+    scope = None if acl.is_owner(m.from_user.id) else m.from_user.id
     r = await RUNNER.killall(scope)
 
     parts = [f"已终止 {r['running']} 个进行中、{r['queued']} 个排队中的任务"]
     if r["files"]:
         parts.append(f"清理临时文件 {r['files']} 个")
-    parts.append("队列已清空，服务继续运行。")
+    if r.get("spared"):
+        parts.append(f"其他用户的 {r['spared']} 个任务未受影响，继续执行。")
+    parts.append("服务继续运行。")
     await m.reply("⛔ " + "\n".join(parts))
 
 
 @router.message(Command("logout"))
 async def cmd_logout(m: Message) -> None:
+    """只有机主能注销。
+
+    全体共用机主的那一份凭据，注销会让所有人都用不了，
+    不该由任何一个授权用户单方面触发。
+    """
     if not await _allowed(m):
         return
-    await POOL.logout(m.from_user.id)
-    await m.reply("已从 Telegram 服务端撤销该 session 并清除本地记录。")
+    if not acl.is_owner(m.from_user.id):
+        await m.reply("只有机主能注销登录凭据。")
+        return
+    await POOL.logout(acl.session_user(m.from_user.id))
+    await m.reply(
+        "已从 Telegram 服务端撤销该 session 并清除本地记录。\n"
+        "所有用户都将无法使用，直到机主重新运行 login.py。")
 
 
 @router.message(F.text)
 async def on_text(m: Message) -> None:
     if not await _allowed(m):
         return
-    links = find_links(m.text or "")
-    if not links:
-        # 没有链接时，看看是不是「@对话 条数」这种抓取写法
-        parsed = parse_grab_target(m.text or "")
-        if parsed:
-            await do_grab(m, *parsed)
-        else:
-            await m.reply(
-                "没看到消息链接。\n\n"
-                "发一条 <code>t.me/...</code> 链接，"
-                "或者发 <code>@对话名</code> 抓取私聊内容。")
+    text = m.text or ""
+
+    # 抓取判断必须排在 find_links 前面：t.me/some_bot 这种"只有对话名、
+    # 没有消息 id"的地址也会被 find_links 抓到，然后在 parse_link 那里
+    # 报一句"缺少消息 id"，用户就看不到抓取效果了。
+    parsed = parse_grab_target(text)
+    if parsed:
+        await do_grab(m, *parsed)
         return
 
-    row = await db.get_user(m.from_user.id)
+    links = find_links(text)
+    if not links:
+        await m.reply(
+            "没看到消息链接。\n\n"
+            "发一条 <code>t.me/频道/123</code> 这样的消息链接，\n"
+            "或者发 <code>t.me/对话名 5</code> 抓取私聊内容。")
+        return
+
+    row = await db.get_user(acl.session_user(m.from_user.id))
     if not row or row["session_status"] != "ok":
-        await m.reply("还没有可用的登录凭据。请在服务器上运行 python login.py。")
+        await m.reply("还没有可用的登录凭据，请联系机主。")
         return
 
     # 消息里单独出现 nosp 时，把标记写进每条链接本身，
     # 这样它能随任务落库，重试和重启后依然有效。
-    nosp = wants_nosp(m.text or "")
+    nosp = wants_nosp(text)
 
     ok = 0
     for link in links:
@@ -283,11 +365,8 @@ async def _allowed(m: Message) -> bool:
     verdict = await acl.check(m.from_user.id)
     if verdict is acl.Access.OK:
         return True
-    if verdict is acl.Access.NEED_APPLY:
-        await admin.request_access(m.bot, m.from_user)
-        await m.reply("已向管理员提交使用申请，请等待审批。")
-        return False
-    await m.reply(acl.DENY_TEXT.get(verdict, "无权限。"))
+    # 未授权的人不解释、不引导申请 —— 增删由机主主动完成
+    await m.reply(acl.DENY_TEXT.get(verdict, "无权使用。"))
     return False
 
 
@@ -306,6 +385,7 @@ async def main() -> None:
     log.info("bot @%s 已就绪", me.username)
 
     await _check_relay(bot)
+    await menu.setup(bot)
 
     dp = Dispatcher()
     dp.include_router(admin.router)
@@ -324,8 +404,8 @@ async def main() -> None:
             pass
 
     poll = asyncio.create_task(
-        dp.start_polling(bot, handle_signals=False, allowed_updates=[
-            "message", "callback_query"])
+        dp.start_polling(bot, handle_signals=False,
+                         allowed_updates=["message"])
     )
     await stop.wait()
     log.info("收到退出信号，正在收尾…")

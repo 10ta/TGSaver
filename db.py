@@ -104,6 +104,9 @@ async def _migrate() -> None:
     for col, decl in additions.items():
         if col not in have:
             await _db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+
+    # 管理员这个中间身份已取消，老库里若有则降为普通用户
+    await _db.execute("UPDATE users SET role='user' WHERE role='admin'")
     await _db.commit()
 
 
