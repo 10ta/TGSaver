@@ -255,7 +255,11 @@ class Runner:
                 await db.update_task(job.task_id, lane="slow", state="pending")
                 size = fetcher.media_size(msg)
                 hint = f"（{streamer.human_size(size)}）" if size else ""
-                await self._say(job, f"该内容禁止转存，转为搬运模式{hint}…")
+                why = ("已指定 nosp，重新上传以去掉剧透遮罩"
+                       if ref.force_reupload and
+                       not fetcher.is_protected(entity, msg)
+                       else "该内容禁止转存，转为搬运模式")
+                await self._say(job, f"{why}{hint}…")
                 await self.slow.put(job)
                 return
 

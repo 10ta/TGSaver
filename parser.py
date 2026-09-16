@@ -46,6 +46,8 @@ class MsgRef:
     topic_id: Optional[int] = None      # 论坛群的话题 id
     comment_id: Optional[int] = None    # ?comment= 讨论区楼层
     single: bool = False                # ?single 表示只要这一条，不要整个相册
+    force_reupload: bool = False         # nosp：强制重新下载上传（用于剥离剧透遮罩）
+    direct_peer: Optional[str] = None   # 内部伪链接：直接按此解析对话，不加 -100
 
     @property
     def peer_id(self) -> int:
@@ -58,13 +60,64 @@ class MsgRef:
     def is_private(self) -> bool:
         return self.channel_id is not None
 
+    @property
+    def is_comment(self) -> bool:
+        """指向频道关联讨论群里的某条评论。"""
+        return self.comment_id is not None
+
     def __str__(self) -> str:
-        head = f"@{self.username}" if self.username else f"c/{self.channel_id}"
-        return f"{head}#{self.msg_id}"
+        if self.direct_peer:
+            head = str(self.direct_peer)
+        elif self.username:
+            head = f"@{self.username}"
+        else:
+            head = f"c/{self.channel_id}"
+        tail = f"#{self.msg_id}"
+        if self.comment_id:
+            tail += f"·评论{self.comment_id}"
+        if self.force_reupload:
+            tail += "·nosp"
+        return head + tail
 
 
 class ParseError(ValueError):
     """链接格式无法识别。"""
+
+
+INTERNAL_SCHEME = "tgsaver://"
+
+# 链接后面单独跟一个 nosp 就强制重新下载上传。
+# 普通内容默认走服务端直转，那条路径零流量零磁盘，但无法剥离剧透遮罩
+# —— 遮罩是原消息的属性，转发会原样带过来。想去掉就只能重传。
+NOSP_TOKEN_RE = re.compile(r"(?:^|\s)nosp(?:\s|$)", re.IGNORECASE)
+
+
+def wants_nosp(text: str) -> bool:
+    """整条消息里是否单独出现了 nosp。"""
+    return bool(text) and bool(NOSP_TOKEN_RE.search(text))
+
+
+def with_nosp(url: str) -> str:
+    """给链接打上 nosp 标记，使其落库后重试仍然有效。"""
+    if _has_nosp_query(url):
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}nosp"
+
+
+def _has_nosp_query(url: str) -> bool:
+    q = url.split("?", 1)[1] if "?" in url else ""
+    return any(p.split("=", 1)[0].lower() == "nosp" for p in q.split("&") if p)
+
+
+def make_internal(peer: str | int, msg_id: int) -> str:
+    """生成内部伪链接。
+
+    私聊（含与 bot 的对话）没有 t.me 链接，Telegram 只为公开频道和
+    超级群生成。/grab 用这个形式把私聊消息喂进同一套队列，
+    下游的传输、投递逻辑完全复用，不需要任何分支。
+    """
+    return f"{INTERNAL_SCHEME}p/{peer}/{msg_id}"
 
 
 def find_links(text: str) -> list[str]:
@@ -98,6 +151,8 @@ def parse_link(url: str) -> MsgRef:
         raise ParseError("空链接")
 
     low = raw.lower()
+    if low.startswith(INTERNAL_SCHEME):
+        return _parse_internal(raw)
     if low.startswith("tg://"):
         return _parse_tg_scheme(raw)
 
@@ -116,6 +171,7 @@ def parse_link(url: str) -> MsgRef:
     parts = [s for s in p.path.split("/") if s]
     qs = parse_qs(p.query, keep_blank_values=True)
     single = "single" in qs
+    nosp = "nosp" in qs
     comment_id = _qs_int(qs, "comment")
     thread_q = _qs_int(qs, "thread")
 
@@ -133,14 +189,16 @@ def parse_link(url: str) -> MsgRef:
         except ValueError as e:
             raise ParseError("私有链接的 channel id 不是数字") from e
         topic_id, msg_id = _tail(parts[2:], thread_q)
-        return MsgRef(raw, None, channel_id, msg_id, topic_id, comment_id, single)
+        return MsgRef(raw, None, channel_id, msg_id, topic_id, comment_id,
+                      single, nosp)
 
     # --- bot 频道: /b/<botname>/<msg_id> ---
     if head == "b":
         if len(parts) < 3:
             raise ParseError("bot 链接缺少消息 id")
         topic_id, msg_id = _tail(parts[2:], thread_q)
-        return MsgRef(raw, parts[1], None, msg_id, topic_id, comment_id, single)
+        return MsgRef(raw, parts[1], None, msg_id, topic_id, comment_id,
+                      single, nosp)
 
     if head in _RESERVED:
         raise ParseError(f"/{head}/ 不是消息链接")
@@ -151,7 +209,8 @@ def parse_link(url: str) -> MsgRef:
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", parts[0]):
         raise ParseError("用户名格式不合法")
     topic_id, msg_id = _tail(parts[1:], thread_q)
-    return MsgRef(raw, parts[0], None, msg_id, topic_id, comment_id, single)
+    return MsgRef(raw, parts[0], None, msg_id, topic_id, comment_id,
+                  single, nosp)
 
 
 def _tail(seg: list[str], thread_q: Optional[int]) -> tuple[Optional[int], int]:
@@ -172,11 +231,35 @@ def _tail(seg: list[str], thread_q: Optional[int]) -> tuple[Optional[int], int]:
     return nums[0], nums[1]
 
 
+def _parse_internal(raw: str) -> MsgRef:
+    """tgsaver://p/<peer>/<msg_id>
+
+    peer 可以是 @username、纯用户名、或数字 id（含负号）。
+    与 t.me/c/ 不同，这里的数字**不加** -100 前缀——私聊和 bot 对话
+    的 peer 是用户 id，加前缀会指向一个不存在的频道。
+    """
+    body = raw[len(INTERNAL_SCHEME):]
+    nosp = _has_nosp_query(body)
+    body = body.split("?", 1)[0]
+    parts = [s for s in body.split("/") if s]
+    if len(parts) != 3 or parts[0] != "p":
+        raise ParseError("内部链接格式应为 tgsaver://p/<peer>/<msg_id>")
+    peer = parts[1].lstrip("@")
+    if not peer:
+        raise ParseError("内部链接缺少对话标识")
+    try:
+        msg_id = int(parts[2])
+    except ValueError as e:
+        raise ParseError("内部链接的消息 id 不是数字") from e
+    return MsgRef(raw, msg_id=msg_id, force_reupload=nosp, direct_peer=peer)
+
+
 def _parse_tg_scheme(raw: str) -> MsgRef:
     p = urlparse(raw)
     qs = parse_qs(p.query, keep_blank_values=True)
     host = (p.netloc or p.path.lstrip("/")).lower()
     single = "single" in qs
+    nosp = "nosp" in qs
     comment_id = _qs_int(qs, "comment")
     topic_id = _qs_int(qs, "thread") or _qs_int(qs, "topic")
     post = _qs_int(qs, "post")
@@ -187,12 +270,12 @@ def _parse_tg_scheme(raw: str) -> MsgRef:
         ch = _qs_int(qs, "channel")
         if ch is None:
             raise ParseError("tg://privatepost 缺少 channel 参数")
-        return MsgRef(raw, None, ch, post, topic_id, comment_id, single)
+        return MsgRef(raw, None, ch, post, topic_id, comment_id, single, nosp)
 
     if host == "resolve":
         dom = qs.get("domain", [None])[0]
         if not dom:
             raise ParseError("tg://resolve 缺少 domain 参数")
-        return MsgRef(raw, dom, None, post, topic_id, comment_id, single)
+        return MsgRef(raw, dom, None, post, topic_id, comment_id, single, nosp)
 
     raise ParseError("无法识别的 tg:// 链接")

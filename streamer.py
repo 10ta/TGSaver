@@ -26,14 +26,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from telethon import TelegramClient
+from telethon import TelegramClient, helpers, utils
+from telethon.tl.functions.messages import (
+    SendMultiMediaRequest,
+    UploadMediaRequest,
+)
 from telethon.tl.types import (
     DocumentAttributeAnimated,
     DocumentAttributeAudio,
     DocumentAttributeFilename,
     DocumentAttributeSticker,
     DocumentAttributeVideo,
+    InputMediaUploadedDocument,
+    InputMediaUploadedPhoto,
+    InputSingleMedia,
     Message,
+    UpdateNewChannelMessage,
+    UpdateNewMessage,
 )
 
 from config import CFG
@@ -138,7 +147,8 @@ def inspect_media(msg: Message) -> MediaSpec:
     """读出媒体的全部属性，保证重传后形态与原件一致。"""
     caption = msg.message or ""
     entities = list(msg.entities or [])
-
+    # 剧透遮罩不保留：重建媒体时一律不设 spoiler，
+    # 原消息带遮罩的，转存后是直接可见的。
     if msg.photo is not None:
         return MediaSpec(
             size=getattr(msg.file, "size", 0) or 0,
@@ -326,6 +336,172 @@ async def _send(client, relay: int, handle, spec: MediaSpec):
 async def _maybe_await(v: Any) -> None:
     if hasattr(v, "__await__"):
         await v
+
+
+# --------------------------------------------------------------- 相册整组
+
+async def _upload_one(client: TelegramClient, msg: Message, spec: MediaSpec,
+                      relay: int, prog, task_id, register_tmp) -> Any:
+    """把一条消息的媒体传上去，返回可用于发送的 InputFile 句柄。"""
+    use_disk = CFG.stream_max_size > 0 and spec.size > CFG.stream_max_size
+    if use_disk:
+        return await _upload_via_disk(client, msg, spec, prog,
+                                      task_id, register_tmp)
+    media = msg.photo if spec.is_photo else msg.document
+    async with _DownloadStream(
+        client, media, spec.size, spec.file_name, prog("下载")
+    ) as stream:
+        return await client.upload_file(
+            stream, file_size=spec.size, file_name=spec.file_name,
+            progress_callback=prog("上传"),
+        )
+
+
+async def _upload_via_disk(client, msg, spec: MediaSpec, prog,
+                           task_id, register_tmp) -> Any:
+    CFG.tmp_dir.mkdir(parents=True, exist_ok=True)
+    need = int(spec.size * CFG.disk_headroom)
+    free = shutil.disk_usage(CFG.tmp_dir).free
+    if free < need:
+        raise TransferError(
+            f"磁盘空间不足：需要 {_hs(need)}，{CFG.tmp_dir} 只剩 {_hs(free)}。")
+
+    path = CFG.tmp_dir / f"t{task_id or os.getpid()}_{msg.id}_{spec.file_name}"
+    if register_tmp:
+        await _maybe_await(register_tmp(str(path)))
+    log.info("落盘转存 %s (%s)", spec.file_name, _hs(spec.size))
+    try:
+        await client.download_media(msg, file=str(path),
+                                    progress_callback=prog("下载"))
+        return await client.upload_file(
+            str(path), file_name=spec.file_name, progress_callback=prog("上传"))
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            log.warning("临时文件删除失败: %s", path)
+        if register_tmp:
+            await _maybe_await(register_tmp(None))
+
+
+async def _to_input_media(client: TelegramClient, handle: Any,
+                          spec: MediaSpec, relay: int) -> Any:
+    """把上传句柄变成可放进相册的 InputMedia。
+
+    相册要求的是已经在服务端落地的媒体引用，所以必须先走一次
+    UploadMedia 把"刚传上去的文件"转成"服务端的媒体对象"，
+    再取其中的 photo / document 换成 InputMedia。
+    """
+    if spec.is_photo:
+        fm = InputMediaUploadedPhoto(file=handle)
+        r = await client(UploadMediaRequest(relay, media=fm))
+        return utils.get_input_media(r.photo)
+
+    thumb = None
+    if spec.thumb is not None:
+        try:
+            thumb = await client.upload_file(spec.thumb)
+        except Exception as e:  # noqa: BLE001
+            log.debug("缩略图上传失败，忽略: %s", e)
+
+    fm = InputMediaUploadedDocument(
+        file=handle,
+        mime_type=spec.mime_type or "application/octet-stream",
+        attributes=spec.attributes or [],
+        thumb=thumb,
+        force_file=spec.force_document,
+    )
+    r = await client(UploadMediaRequest(relay, media=fm))
+    return utils.get_input_media(
+        r.document, supports_streaming=not spec.force_document)
+
+
+def _ids_from_updates(result: Any) -> list[int]:
+    ids = []
+    for u in getattr(result, "updates", []) or []:
+        if isinstance(u, (UpdateNewChannelMessage, UpdateNewMessage)):
+            m = getattr(u, "message", None)
+            if m is not None and getattr(m, "id", None):
+                ids.append(m.id)
+    return sorted(ids)
+
+
+async def relay_protected_album(
+    client: TelegramClient,
+    msgs: list[Message],
+    relay_channel: int,
+    on_progress: Optional[Callable[..., Any]] = None,
+    task_id: Optional[int] = None,
+    register_tmp: Optional[Callable[[Optional[str]], Any]] = None,
+) -> tuple[list[int], int, str]:
+    """把一整组受保护的相册搬进中转频道，保持分组。
+
+    Telethon 的 send_file(列表) 会走 _send_album，但那条路径不传
+    attributes —— 文件名、视频时长分辨率、缩略图全会丢。所以这里
+    手工组装 SendMultiMedia，逐项保留自己的属性。
+
+    返回 (消息 id 列表, 字节数, 需要告知用户的说明)。
+    """
+    specs = [inspect_media(m) for m in msgs]
+    total = sum(s.size for s in specs)
+
+    for s in specs:
+        if s.size > CFG.max_upload_size:
+            raise TransferError(
+                f"相册中的 {s.file_name}（{_hs(s.size)}）超过账号上传上限 "
+                f"{_hs(CFG.max_upload_size)}，整组无法转存。")
+
+    for m, s in zip(msgs, specs):
+        s.thumb = await fetch_thumb(client, m)
+
+    started = time.monotonic()
+    handles = []
+    for i, (m, s) in enumerate(zip(msgs, specs)):
+        def _prog(phase: str, _i=i):
+            def cb(done: int, tot: int) -> None:
+                if on_progress:
+                    on_progress(phase, done, tot or s.size,
+                                time.monotonic() - started, _i + 1, len(msgs))
+            return cb
+        log.info("相册 %d/%d 转存 %s (%s)", i + 1, len(msgs),
+                 s.file_name, _hs(s.size))
+        handles.append(await _upload_one(client, m, s, relay_channel,
+                                         _prog, task_id, register_tmp))
+
+    # Telegram 相册上限 10 项。原相册不会超，这里只是防御性分块。
+    sent_ids: list[int] = []
+    note = ""
+    for chunk_start in range(0, len(handles), 10):
+        hs = handles[chunk_start:chunk_start + 10]
+        ss = specs[chunk_start:chunk_start + 10]
+        try:
+            multi = []
+            for h, s in zip(hs, ss):
+                im = await _to_input_media(client, h, s, relay_channel)
+                multi.append(InputSingleMedia(
+                    media=im,
+                    random_id=helpers.generate_random_long(),
+                    message=s.caption or "",
+                    entities=s.entities or None,
+                ))
+            res = await client(SendMultiMediaRequest(
+                peer=relay_channel, multi_media=multi))
+            got = _ids_from_updates(res)
+            if not got:
+                raise TransferError("相册已发出但未能读回消息 id")
+            sent_ids.extend(got)
+        except TransferError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # 字节已经传上去了，别浪费。退化成逐条发送，
+            # 至少把内容给到用户，只是分组保不住。
+            log.warning("相册整组发送失败，退化为逐条: %s", e)
+            for h, s in zip(hs, ss):
+                sent = await _send(client, relay_channel, h, s)
+                sent_ids.append(sent.id)
+            note = "相册整组发送失败，已逐条转存，分组未能保持。"
+
+    return sorted(sent_ids), total, note
 
 
 def _hs(n: int) -> str:

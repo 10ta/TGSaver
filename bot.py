@@ -8,21 +8,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
 import sys
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
+from telethon import utils
+from telethon.tl.types import MessageService
 
 import acl
 import admin
 import db
 import streamer
 from config import CFG
-from parser import ParseError, find_links, parse_link
+from parser import (
+    ParseError, find_links, make_internal, parse_link, wants_nosp, with_nosp,
+)
 from session_pool import POOL, NoSession
 from taskqueue import Runner
 
@@ -38,11 +43,18 @@ log = logging.getLogger("main")
 router = Router(name="main")
 RUNNER: Runner | None = None
 
+GRAB_MAX = 20      # 单次最多抓几条，再多容易触发 FloodWait
+GRAB_SCAN = 200    # 往回翻多少条消息去找媒体
+
 HELP = """把 Telegram 消息链接发给我，我原样取回来给你。
 
-支持公开 / 私有 / 论坛话题链接，相册自动整组，
+支持公开 / 私有 / 论坛话题 / 评论区链接，相册自动整组，
 禁止转存的内容也能搬，大文件不受 50MB 限制。
 
+链接后面加 <code>nosp</code> 可去掉剧透遮罩（会重新上传，慢一些）。
+受保护的内容本来就是重传，遮罩一律自动去掉。
+
+@对话名    抓取私聊内容，如 @some_bot 5（无法转发、没有链接的用这个）
 /status   登录状态、流量与消息统计
 /killall  终止所有进行中的任务并清空队列
 /logout   注销登录凭据
@@ -87,6 +99,109 @@ async def cmd_status(m: Message) -> None:
     await m.reply("\n".join(lines))
 
 
+GRAB_USERNAME_RE = re.compile(
+    r"^@([A-Za-z][A-Za-z0-9_]{3,31})(?:\s+(\d{1,3}))?$")
+# 数字 id 至少 6 位。太短的数字更可能是用户随手打的东西，
+# 当成对话 id 去解析只会得到一句莫名其妙的报错。
+GRAB_NUMERIC_RE = re.compile(r"^(-?\d{6,})(?:\s+(\d{1,3}))?$")
+
+
+def parse_grab_target(text: str):
+    """从一行裸文本里认出抓取目标，认不出返回 None。
+
+    接受：
+        @some_bot        -> ("some_bot", 1)
+        @some_bot 5      -> ("some_bot", 5)
+        123456789 3      -> ("123456789", 3)
+
+    用户名必须带 @：否则 "hello" 这种普通词也会被当成对话名，
+    然后抛一个让人摸不着头脑的错误。
+    """
+    t = (text or "").strip()
+    for rx in (GRAB_USERNAME_RE, GRAB_NUMERIC_RE):
+        mm = rx.match(t)
+        if mm:
+            n = int(mm.group(2)) if mm.group(2) else 1
+            return mm.group(1), max(1, min(n, GRAB_MAX))
+    return None
+
+
+GRAB_HELP = (
+    "直接发对话名就行，不用带命令：\n\n"
+    "<code>@some_bot</code> — 抓最近 1 条媒体\n"
+    "<code>@some_bot 5</code> — 抓最近 5 条\n"
+    "<code>123456789 3</code> — 数字 id 也行\n\n"
+    "用于保存私聊里那些无法转发、也没有链接的内容。"
+)
+
+
+async def do_grab(m: Message, target: str, count: int) -> None:
+    """按对话直接寻址抓取。
+
+    私聊没有 t.me 链接 —— Telegram 只为公开频道和超级群生成链接。
+    这里把找到的消息合成内部伪链接丢进同一套队列，
+    下游的传输和投递逻辑完全复用。
+    """
+    row = await db.get_user(m.from_user.id)
+    if not row or row["session_status"] != "ok":
+        await m.reply("还没有可用的登录凭据。请在服务器上运行 login.py。")
+        return
+
+    status = await m.reply(f"正在查找 {target} 最近的内容…")
+    try:
+        client = await POOL.acquire(m.from_user.id)
+        async with POOL.lock_for(m.from_user.id):
+            try:
+                entity = await client.get_entity(
+                    int(target) if target.lstrip("-").isdigit() else target)
+            except Exception as e:  # noqa: BLE001
+                await status.edit_text(
+                    f"找不到对话 {target}。\n"
+                    f"请确认你和它有过对话，用户名或 id 拼写正确。\n"
+                    f"（{type(e).__name__}）")
+                return
+
+            picked, seen_groups = [], set()
+            async for msg in client.iter_messages(entity, limit=GRAB_SCAN):
+                if msg.media is None or isinstance(msg, MessageService):
+                    continue
+                gid = getattr(msg, "grouped_id", None)
+                if gid is not None:
+                    if gid in seen_groups:
+                        continue          # 相册只取一条，下游会自动凑齐整组
+                    seen_groups.add(gid)
+                picked.append(msg)
+                if len(picked) >= count:
+                    break
+    except NoSession:
+        await status.edit_text("登录凭据已失效，请重新运行 login.py。")
+        return
+
+    if not picked:
+        await status.edit_text(
+            f"在 {target} 最近 {GRAB_SCAN} 条消息里没找到媒体内容。")
+        return
+
+    peer = utils.get_peer_id(entity)
+    for msg in reversed(picked):          # 由旧到新，保持原顺序
+        await RUNNER.submit(m.from_user.id, make_internal(peer, msg.id),
+                            m.chat.id, m.message_id)
+
+    await status.edit_text(f"已找到 {len(picked)} 条，正在处理…")
+
+
+@router.message(Command("grab"))
+async def cmd_grab(m: Message, command: CommandObject) -> None:
+    """/grab 保留作为别名，但直接发 `@对话 条数` 更省事。"""
+    if not await _allowed(m):
+        return
+    parsed = parse_grab_target(command.args or "")
+    if parsed is None:
+        await m.reply(GRAB_HELP)
+        return
+    await do_grab(m, *parsed)
+
+
 @router.message(Command("killall"))
 async def cmd_killall(m: Message) -> None:
     """终止所有进行中的任务并清空队列。"""
@@ -126,7 +241,15 @@ async def on_text(m: Message) -> None:
         return
     links = find_links(m.text or "")
     if not links:
-        await m.reply("没看到消息链接。发一条 t.me/... 给我试试。")
+        # 没有链接时，看看是不是「@对话 条数」这种抓取写法
+        parsed = parse_grab_target(m.text or "")
+        if parsed:
+            await do_grab(m, *parsed)
+        else:
+            await m.reply(
+                "没看到消息链接。\n\n"
+                "发一条 <code>t.me/...</code> 链接，"
+                "或者发 <code>@对话名</code> 抓取私聊内容。")
         return
 
     row = await db.get_user(m.from_user.id)
@@ -134,8 +257,14 @@ async def on_text(m: Message) -> None:
         await m.reply("还没有可用的登录凭据。请在服务器上运行 python login.py。")
         return
 
+    # 消息里单独出现 nosp 时，把标记写进每条链接本身，
+    # 这样它能随任务落库，重试和重启后依然有效。
+    nosp = wants_nosp(m.text or "")
+
     ok = 0
     for link in links:
+        if nosp:
+            link = with_nosp(link)
         try:
             parse_link(link)
         except ParseError as e:

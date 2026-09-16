@@ -113,3 +113,127 @@ def test_find_links_dedup_and_punct():
 def test_find_links_empty():
     assert find_links("没有链接的一句话") == []
     assert find_links("") == []
+
+
+# ------------------------------------------------- 内部伪链接 (/grab)
+
+def test_internal_username():
+    from parser import make_internal
+    r = parse_link(make_internal("some_bot", 4832))
+    assert r.direct_peer == "some_bot"
+    assert r.msg_id == 4832
+    assert not r.is_private
+    assert r.channel_id is None
+
+
+def test_internal_numeric_peer_keeps_sign():
+    """私聊 peer 是用户 id，绝不能像 t.me/c/ 那样加 -100 前缀。"""
+    from parser import make_internal
+    r = parse_link(make_internal(-1001234567890, 7))
+    assert r.direct_peer == "-1001234567890"
+    r2 = parse_link(make_internal(123456789, 7))
+    assert r2.direct_peer == "123456789"
+    assert r2.channel_id is None
+
+
+def test_internal_strips_at():
+    assert parse_link("tgsaver://p/@bot/5").direct_peer == "bot"
+
+
+@pytest.mark.parametrize("bad", [
+    "tgsaver://p/onlypeer",
+    "tgsaver://p//5",
+    "tgsaver://x/bot/5",
+    "tgsaver://p/bot/notanumber",
+])
+def test_internal_rejects(bad):
+    with pytest.raises(ParseError):
+        parse_link(bad)
+
+
+def test_internal_not_picked_up_by_find_links():
+    """内部链接是程序自己生成的，不该从用户文本里被误抓。"""
+    assert find_links("tgsaver://p/bot/5") == []
+
+
+# ------------------------------------------------- 评论链接
+
+def test_comment_link_fields():
+    """两个数字属于两套编号：181 是频道帖子，4832 是讨论群里的评论。"""
+    r = parse_link("https://t.me/FCbzmg/181?single&comment=4832")
+    assert r.username == "FCbzmg"
+    assert r.msg_id == 181
+    assert r.comment_id == 4832
+    assert r.is_comment
+    assert r.single
+
+
+def test_plain_link_is_not_comment():
+    assert not parse_link("https://t.me/FCbzmg/181").is_comment
+
+
+def test_comment_repr_shows_both():
+    r = parse_link("https://t.me/chan/181?comment=4832")
+    assert "181" in str(r) and "4832" in str(r)
+
+
+# ------------------------------------------------- nosp 标记
+
+def test_nosp_query():
+    from parser import parse_link as pl
+    assert pl("https://t.me/durov/1?nosp").force_reupload
+    assert not pl("https://t.me/durov/1").force_reupload
+
+
+def test_nosp_combines_with_single():
+    r = parse_link("https://t.me/durov/1?single&nosp")
+    assert r.force_reupload and r.single
+
+
+def test_nosp_on_private_and_comment():
+    assert parse_link("https://t.me/c/1234567890/5?nosp").force_reupload
+    r = parse_link("https://t.me/chan/181?comment=4832&nosp")
+    assert r.force_reupload and r.comment_id == 4832
+
+
+def test_nosp_on_tg_scheme():
+    assert parse_link("tg://resolve?domain=durov&post=9&nosp").force_reupload
+
+
+def test_nosp_on_internal_link():
+    assert parse_link("tgsaver://p/bot/5?nosp").force_reupload
+    assert not parse_link("tgsaver://p/bot/5").force_reupload
+
+
+def test_with_nosp_builds_correct_query():
+    from parser import with_nosp
+    assert with_nosp("https://t.me/durov/1") == "https://t.me/durov/1?nosp"
+    assert with_nosp("https://t.me/durov/1?single") == \
+        "https://t.me/durov/1?single&nosp"
+
+
+def test_with_nosp_is_idempotent():
+    from parser import with_nosp
+    once = with_nosp("https://t.me/durov/1")
+    assert with_nosp(once) == once
+
+
+@pytest.mark.parametrize("text,want", [
+    ("https://t.me/durov/1 nosp", True),
+    ("nosp https://t.me/durov/1", True),
+    ("https://t.me/durov/1\nnosp", True),
+    ("https://t.me/durov/1", False),
+    ("nospam 这个词不算", False),
+    ("nosping", False),
+    ("anosp", False),
+])
+def test_wants_nosp(text, want):
+    from parser import wants_nosp
+    assert wants_nosp(text) is want
+
+
+def test_nosp_survives_roundtrip():
+    """标记必须写进链接本身，否则任务落库重试后就丢了。"""
+    from parser import with_nosp
+    link = with_nosp("https://t.me/durov/1")
+    assert parse_link(link).force_reupload, "重新解析后标记应仍在"

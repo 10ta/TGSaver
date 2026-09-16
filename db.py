@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, lane, id);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_id, state);
+
+-- 自动监听的对话。注册一次之后由后台轮询增量抓取，
+-- 不需要每次手敲命令。
+CREATE TABLE IF NOT EXISTS watches (
+    owner_id     INTEGER NOT NULL,
+    peer         TEXT    NOT NULL,        -- 用户名或数字 id，原样保存
+    title        TEXT,                    -- 展示名，便于 /watched 辨认
+    last_seen_id INTEGER NOT NULL DEFAULT 0,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    grabbed      INTEGER NOT NULL DEFAULT 0,
+    added_at     INTEGER NOT NULL,
+    last_poll    INTEGER,
+    PRIMARY KEY (owner_id, peer)
+);
 """
 
 _db: Optional[aiosqlite.Connection] = None
@@ -332,3 +346,68 @@ async def traffic_by_path() -> dict[str, int]:
     r = await cur.fetchone()
     return {"direct": r["direct"] or 0, "moved": r["moved"] or 0,
             "bytes": r["bytes"] or 0}
+
+
+# ------------------------------------------------------------------ watches
+
+async def add_watch(owner_id: int, peer: str, title: str,
+                    last_seen_id: int) -> bool:
+    """注册监听。返回 True 表示新建，False 表示已存在（重新启用）。"""
+    row = await get_watch(owner_id, peer)
+    if row is not None:
+        await conn().execute(
+            "UPDATE watches SET enabled=1, title=? WHERE owner_id=? AND peer=?",
+            (title, owner_id, peer))
+        await conn().commit()
+        return False
+    await conn().execute(
+        """INSERT INTO watches (owner_id, peer, title, last_seen_id, added_at)
+           VALUES (?,?,?,?,?)""",
+        (owner_id, peer, title, last_seen_id, now()))
+    await conn().commit()
+    return True
+
+
+async def get_watch(owner_id: int, peer: str) -> Optional[aiosqlite.Row]:
+    cur = await conn().execute(
+        "SELECT * FROM watches WHERE owner_id=? AND peer=?", (owner_id, peer))
+    return await cur.fetchone()
+
+
+async def remove_watch(owner_id: int, peer: str) -> bool:
+    cur = await conn().execute(
+        "DELETE FROM watches WHERE owner_id=? AND peer=?", (owner_id, peer))
+    await conn().commit()
+    return cur.rowcount > 0
+
+
+async def list_watches(owner_id: Optional[int] = None,
+                       only_enabled: bool = False) -> list[aiosqlite.Row]:
+    sql = "SELECT * FROM watches"
+    cond, args = [], []
+    if owner_id is not None:
+        cond.append("owner_id=?")
+        args.append(owner_id)
+    if only_enabled:
+        cond.append("enabled=1")
+    if cond:
+        sql += " WHERE " + " AND ".join(cond)
+    sql += " ORDER BY added_at"
+    cur = await conn().execute(sql, tuple(args))
+    return list(await cur.fetchall())
+
+
+async def bump_watch(owner_id: int, peer: str, last_seen_id: int,
+                     grabbed: int = 0) -> None:
+    await conn().execute(
+        """UPDATE watches SET last_seen_id=?, grabbed=grabbed+?, last_poll=?
+           WHERE owner_id=? AND peer=?""",
+        (last_seen_id, grabbed, now(), owner_id, peer))
+    await conn().commit()
+
+
+async def set_watch_enabled(owner_id: int, peer: str, on: bool) -> None:
+    await conn().execute(
+        "UPDATE watches SET enabled=? WHERE owner_id=? AND peer=?",
+        (1 if on else 0, owner_id, peer))
+    await conn().commit()
