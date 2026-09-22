@@ -2,7 +2,7 @@
 
 链接 -> FxTwitter API 取数据 -> 组装成:
 
-    用户昵称: #用户ID
+    用户昵称 #用户ID :
     ┃ 帖子正文（引用块）
     原文链接                ← 指向 x.com 原帖的超链接
 
@@ -28,6 +28,12 @@ log = logging.getLogger("tweet")
 
 FXTWITTER_API = os.getenv("FXTWITTER_API", "https://api.fxtwitter.com").rstrip("/")
 LINK_TEXT = "原文链接"
+
+# 末行「原文链接」旁边的署名，比如你自己频道的链接。两项都留空则不显示；
+# 只填文字不填链接则显示为纯文字。写在 .env 里而不是代码里，
+# 这样公开仓库被别人 clone 时不会带上你的频道。
+SIGN_TEXT = os.getenv("TWEET_SIGNATURE_TEXT", "").strip()
+SIGN_URL = os.getenv("TWEET_SIGNATURE_URL", "").strip()
 
 # Bot API 按 URL 发送时 Telegram 服务器愿意去拉的上限。
 # 超过就只能由本机下载再上传。
@@ -292,9 +298,9 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     """组装消息 HTML。超长时截断正文，返回 (html, 是否截断)。
 
     格式：
-        昵称: #ID
+        昵称 #ID :
         <blockquote>正文</blockquote>
-        <a href="原帖">原文链接</a>
+        <a href="原帖">原文链接</a> <a href="署名链接">署名</a>
 
     超链接的 URL 不计入 Telegram 的长度限制，只有显示文字算。
     """
@@ -303,7 +309,8 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     text = tw.text.strip()
 
     head_plain = name + (f" {tag}" if tag else "") + " :"
-    overhead = utf16_len(head_plain) + 1 + utf16_len(LINK_TEXT)   # 末行前换行
+    last_plain = LINK_TEXT + (f" {SIGN_TEXT}" if SIGN_TEXT else "")
+    overhead = utf16_len(head_plain) + 1 + utf16_len(last_plain)  # 末行前换行
     if text:
         overhead += 1                                             # 正文前换行
     budget = max(limit - overhead, 0)
@@ -320,7 +327,13 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     parts = [head]
     if text:
         parts.append(f"<blockquote>{html.escape(text, quote=False)}</blockquote>")
-    parts.append(f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>')
+    last = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
+    if SIGN_TEXT:
+        sign = html.escape(SIGN_TEXT, quote=False)
+        if SIGN_URL:
+            sign = f'<a href="{html.escape(SIGN_URL, quote=True)}">{sign}</a>'
+        last += " " + sign
+    parts.append(last)
     return "\n".join(parts), truncated
 
 

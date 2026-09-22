@@ -198,9 +198,9 @@ https://fxtwitter.com/用户/status/123
 （`api.fxtwitter.com/2/status/{id}`）获取，整理成：
 
 ```
-用户昵称: #用户ID
+用户昵称 #用户ID :
 ┃ 帖子正文（引用块）
-原文链接                ← 指向 x.com 原帖的超链接
+原文链接 @署名          ← 两个都是超链接；署名可选，见下
 ```
 
 图片视频拼成相册，说明挂在第一项上。
@@ -242,6 +242,16 @@ Bot API 对 URL 有大小限制（照片 5MB、视频 20MB）。已知超限时�
 - 帖子被删、账号冻结、受保护时直接报原因，不重试
 
 自建了 FxEmbed 实例的话，改 `.env` 里的 `FXTWITTER_API`。
+
+末行「原文链接」旁边可以加一个署名（比如你自己的频道），在 `.env` 里配：
+
+```
+TWEET_SIGNATURE_TEXT=@你的频道
+TWEET_SIGNATURE_URL=https://t.me/your_channel
+```
+
+两项都留空则不显示；只填文字则显示为纯文字。默认为空，
+所以公开仓库被别人 clone 时不会带上你的频道。
 
 ### 私聊内容：发对话地址
 

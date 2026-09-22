@@ -281,6 +281,47 @@ def test_nickname_line_has_colon_then_quote():
     assert "原文链接" not in q and "#jack" not in q, "链接和 tag 必须在引用块之外"
 
 
+def test_signature_with_link(monkeypatch):
+    from telethon.extensions import html as tl_html
+    from telethon.tl.types import MessageEntityTextUrl
+    monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV")
+    monkeypatch.setattr(tweet, "SIGN_URL", "https://t.me/optv4")
+    text, ents = tl_html.parse(tweet.build_html(Tweet("1", "杰克", "jack", "hi"), 4096)[0])
+    assert text.splitlines()[-1] == "原文链接 @欧派TV"
+    urls = [e.url for e in ents if isinstance(e, MessageEntityTextUrl)]
+    assert urls == ["https://x.com/jack/status/1", "https://t.me/optv4"]
+
+
+def test_signature_text_only(monkeypatch):
+    monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV")
+    monkeypatch.setattr(tweet, "SIGN_URL", "")
+    html, _ = tweet.build_html(Tweet("1", "J", "j", "hi"), 4096)
+    assert html.splitlines()[-1].endswith("</a> @欧派TV")
+
+
+def test_signature_absent_by_default():
+    """公开仓库默认不带任何人的署名。"""
+    assert tweet.SIGN_TEXT == "" and tweet.SIGN_URL == ""
+    html, _ = tweet.build_html(Tweet("1", "J", "j", "hi"), 4096)
+    assert html.splitlines()[-1] == '<a href="https://x.com/j/status/1">原文链接</a>'
+
+
+def test_signature_counted_in_length(monkeypatch):
+    from telethon.extensions import html as tl_html
+    monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV" * 5)
+    monkeypatch.setattr(tweet, "SIGN_URL", "https://t.me/optv4")
+    html, cut = tweet.build_html(Tweet("1", "J", "j", "字" * 3000), 1024)
+    assert cut and tweet.utf16_len(tl_html.parse(html)[0]) <= 1024
+
+
+def test_signature_escaped(monkeypatch):
+    monkeypatch.setattr(tweet, "SIGN_TEXT", "<b>x</b>")
+    monkeypatch.setattr(tweet, "SIGN_URL", 'https://a"b')
+    html, _ = tweet.build_html(Tweet("1", "J", "j", "hi"), 4096)
+    assert "<b>x</b>" not in html and "&lt;b&gt;" in html
+    assert 'a"b' not in html
+
+
 def test_build_escapes_html():
     t = Tweet("1", "A<b>", "a", "1 < 2 & <script>")
     html, _ = tweet.build_html(t, 4096)
