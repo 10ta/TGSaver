@@ -201,34 +201,45 @@ https://fxtwitter.com/用户/status/123
 ┌──────────────────────┐
 │  原帖图片 / 视频大图预览  │   ← fxtwitter 链接预览，显示在正文上方
 └──────────────────────┘
-**用户昵称** :
-┃ 帖子正文（引用块）
+┃ **用户昵称** : 帖子正文      ← 昵称并入引用块开头
 原帖链接 · #用户ID          ← 「原帖链接」指向 x.com 原帖
 
 via @署名                  ← 可选，见下
 ```
 
-#### 两种呈现方式
+#### 三种呈现方式
 
 由 `.env` 里的 `TWEET_MODE` 决定：
 
-| | `preview`（默认） | `media` |
-|---|---|---|
-| 做法 | 一条文字消息 + fxtwitter 链接预览 | 真正发送图片视频 |
-| 速度 | 最快，只发一条文字 | 通常 < 1 秒，超限时回退中转 |
-| 本机流量 | 0 | 通常 0，回退时 2× |
-| 大小限制 | 无 | URL 直发照片 5MB / 视频 20MB，超了走中转 |
-| 多图 | fxtwitter 合成的一张拼图 | 独立相册，每张可单独保存 |
-| 媒体是否独立副本 | 否，是 Telegram 抓取后缓存的预览 | 是 |
+| | `auto`（默认） | `preview` | `media` |
+|---|---|---|---|
+| 做法 | 先检查预览，齐全发预览，缺了发原始媒体 | 强制文字 + 链接预览 | 强制发送原始图片视频 |
+| 速度 | 大多数秒回 | 最快 | 通常 < 1 秒，超限回退中转 |
+| 长视频 | ✓ 自动改发原始视频 | 可能不出现 | ✓ |
+| 多图 | fxtwitter 拼图 | fxtwitter 拼图 | 独立相册 |
 
-`preview` 模式下，预览地址用 `link_preview_options.url` 单独指定，
-不必出现在正文里，所以「原帖链接」仍然指向 x.com。纯文字推文不开预览，
-否则预览卡片只会把正文再显示一遍。
+**auto 怎么知道预览会不会失败。** Bot API 发完消息不会告诉你预览里有没有
+媒体，所以「发完再检查」行不通。auto 用 user 账号调 MTProto 的
+`GetWebPagePreview`，**发送之前**先问 Telegram 这个链接会生成什么预览——
+和 Telegram 客户端输入链接时显示预览草稿是同一个接口。这次询问还会让
+Telegram 把结果缓存下来，bot 紧接着发送时直接用缓存。
 
-`media` 模式的细节：先把 twimg 的 URL 直接交给 Telegram 服务器去拉
-（和 Telegram 渲染链接预览是同一个机制），被拒时回退到本机下载、
-user 账号上传中转频道再复制。被拒只会发生在用户还什么都没收到的阶段，
-不会收到两份。说明挂在相册第一项上，超过 1024 字时拆成「媒体 + 文字」两条。
+判定规则：
+
+- 原帖有视频，预览里必须有视频文件；只剩封面图算失败
+- 视频只认 Telegram 存下来的文件，内嵌播放器不算——那是实时去源站拉的，
+  原帖删了就放不了
+- 多个视频、或图视频混排，预览必然装不下，不用问直接发原始媒体
+- 预览一直在生成中，等到 `TWEET_PREVIEW_TIMEOUT` 秒（默认 20）还没好，算失败
+- 检查本身出错（session 失效等）时按预览发，至少文字能送到
+
+判定失败后走的就是 `media` 模式的逻辑：先 URL 直发，被拒再中转，
+整条链路上规划不会被重置回预览。
+
+`media` 模式的细节：先把 twimg 的 URL 直接交给 Telegram 服务器去拉，
+被拒时回退到本机下载、user 账号上传中转频道再复制。被拒只会发生在用户
+还什么都没收到的阶段，不会收到两份。说明挂在相册第一项上，超过 1024 字
+时拆成「媒体 + 文字」两条。
 
 #### 其他细节
 
@@ -240,7 +251,8 @@ user 账号上传中转频道再复制。被拒只会发生在用户还什么都
 #### 可选配置
 
 ```
-TWEET_MODE=preview                      # 或 media
+TWEET_MODE=auto                         # 或 preview / media
+TWEET_PREVIEW_TIMEOUT=20                # auto 等预览生成的最长秒数
 TWEET_SIGNATURE_TEXT=@你的频道           # 末尾 "via 署名" 那一行，留空不显示
 TWEET_SIGNATURE_URL=https://t.me/xxx
 FXTWITTER_API=https://api.fxtwitter.com # 自建 FxEmbed 实例时改这里
@@ -450,6 +462,17 @@ chmod +x git-*.sh
 commit 历史，等同泄露，必须去 @BotFather 用 `/revoke` 换新的。
 
 ---
+## 补丁更新
+```bash
+scp tweet-auto.patch root@你的服务器:/opt/tgsaver/
+
+cd /opt/tgsaver
+git pull
+git apply --check tweet-auto.patch && git apply tweet-auto.patch
+rm tweet-auto.patch
+./git-push.sh "commit logs"
+systemctl restart tgsaver
+```
 
 ## 测试
 
@@ -458,7 +481,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-294 项，覆盖：
+317 项，覆盖：
 
 - **链接解析**的全部形态，含论坛话题三段式（中间那个数字是话题 id 不是消息 id，
   这是最容易写错的地方）、`?single`、`tg://` 协议、各类非法输入
@@ -473,7 +496,9 @@ pytest -q
 - **推文**：链接识别（含 fxtwitter 等镜像与误判反例）、API 响应解析
   （tombstone / 404 / 401 / 媒体顺序 / 码率与大小）、输出格式逐字比对、
   HTML 转义、UTF-16 截断、URL 直发的各种媒体类型、被拒时用户未收到任何
-  内容、快通道回退慢通道、已知超限跳过直发、中转路径的流式与落盘
+  内容、快通道回退慢通道、已知超限跳过直发、中转路径的流式与落盘、
+  auto 模式的预览判定（新旧两种协议返回、封面图不算视频、内嵌播放器不算、
+  超时、检查出错）以及判定失败后整条链路保持 media 规划
 - **命令菜单**：命令名与描述符合 Telegram 格式、无重复、管理命令不外泄、
   菜单里列出的每个命令都真的有处理函数
 - **授权模型**：准入判定、身份只有两种（残留的 admin 角色不获得特权、

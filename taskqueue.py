@@ -349,17 +349,22 @@ class Runner:
     async def _run_tweet(self, job: Job, lane: str) -> None:
         """推文。
 
-        快通道：把媒体 URL 直接交给 Telegram，由它的服务器去拉。
-                 常见情况下亚秒级完成，本机零流量。
-        慢通道：Telegram 拒收（太大 / 拉不到）时回退到这里，
+        auto 模式：先问 Telegram 预览里有没有媒体，齐全就发预览，
+                   缺了（长视频、敏感内容、超时等）就改发原始媒体。
+        快通道：预览或 URL 直发，由 Telegram 服务器去拉，本机零流量。
+        慢通道：URL 直发被拒（太大 / 拉不到）时回退到这里，
                  由本机下载、user 账号上传到中转频道，不受大小限制。
         """
         ref = tweet.parse(job.link)
         tw = job.tweet or await tweet.fetch(ref)
         job.tweet = tw
-        job.extra = tweet.plan(tw)
+        if job.extra is None or job.extra.get("kind") != "tweet":
+            job.extra = tweet.plan(tw)
 
         if lane == "fast":
+            if (job.extra["mode"] == "preview" and tweet.TWEET_MODE == "auto"
+                    and not job.extra.get("checked")):
+                await self._check_preview(job, tw)
             reason = tweet.needs_relay(tw, job.extra)
             if reason is None:
                 try:
@@ -408,6 +413,32 @@ class Runner:
             job.extra["split"] = True      # 相册整组失败已逐条发，投递也逐条
         res = fetcher.Relayed(ids, len(ids) > 1 and not note, "B", nbytes, note)
         await self._finish(job, res)
+
+    async def _check_preview(self, job: Job, tw: Any) -> None:
+        """auto 模式：发送前确认预览里带齐了媒体，不齐就改成发原始媒体。
+
+        检查本身失败（session 失效、网络问题）时维持预览——至少文字能送到。
+        """
+        why = tweet.prejudge_preview(tw)
+        verdict = "missing" if why else None
+
+        if verdict is None:
+            try:
+                client = await POOL.acquire(acl.session_user(job.owner_id))
+                verdict = await tweet.probe_preview(
+                    client, tw,
+                    on_pending=lambda: self._say(job, "等待预览生成…"))
+                if verdict == "missing":
+                    why = "预览缺少媒体"
+            except Exception as e:  # noqa: BLE001
+                log.warning("task=%s 预览检查失败，按预览发送: %s", job.task_id, e)
+                verdict = "ok"
+
+        job.extra["checked"] = True
+        if verdict == "missing":
+            log.info("task=%s %s，改发原始媒体", job.task_id, why)
+            job.extra = {**tweet.plan(tw, mode="media"), "checked": True}
+            await self._say(job, f"{why}，改为发送原始媒体…")
 
     async def _finish(self, job: Job, res: fetcher.Relayed) -> None:
         """搬运完成。先把结果落库，再投递。

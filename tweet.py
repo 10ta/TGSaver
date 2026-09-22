@@ -30,10 +30,15 @@ FXTWITTER_API = os.getenv("FXTWITTER_API", "https://api.fxtwitter.com").rstrip("
 LINK_TEXT = "原帖链接"
 
 # 呈现方式：
-#   preview  一条文字消息 + fxtwitter 链接预览（大图置顶）。最快、零流量、
-#            无大小限制；但多图会变成 fxtwitter 合成的拼图，媒体不是独立副本
-#   media    真正发送图片视频（URL 直发，超限回退中转）。可单独保存每张图
-TWEET_MODE = os.getenv("TWEET_MODE", "preview").strip().lower()
+#   auto     先问 Telegram 预览里有没有媒体：齐全就发预览，缺了就发原始媒体（默认）
+#   preview  强制预览：一条文字消息 + fxtwitter 大图预览。最快、零流量、无大小限制，
+#            但多图是 fxtwitter 合成的拼图，长视频可能根本不出现
+#   media    强制发送原始媒体（URL 直发，超限回退中转）。可单独保存每张图
+TWEET_MODE = os.getenv("TWEET_MODE", "auto").strip().lower()
+
+# auto 模式下等 Telegram 生成预览的最长秒数。多图时 fxtwitter 要现场拼图，
+# 可能要十几秒；等不到就当预览失败，改发原始媒体。
+PREVIEW_TIMEOUT = float(os.getenv("TWEET_PREVIEW_TIMEOUT", "20"))
 FX_HOST = os.getenv("FXTWITTER_HOST", "fxtwitter.com").strip()
 
 # 末尾 "via 署名" 那一行，比如你自己频道的链接。两项都留空则不显示；
@@ -311,25 +316,23 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     """组装消息 HTML。超长时截断正文，返回 (html, 是否截断)。
 
     格式：
-        <b>昵称</b> :
-        <blockquote>正文</blockquote>
+        <blockquote><b>昵称</b> : 正文</blockquote>
         <a href="原帖">原帖链接</a> · #ID
 
         via <a href="署名链接">署名</a>
 
+    没有正文时引用块里只有「昵称 :」。
     超链接的 URL 不计入 Telegram 的长度限制，只有显示文字算。
     """
     name = tw.name.strip() or tw.screen_name
     tag = id_tag(tw)
     text = tw.text.strip()
 
-    head_plain = f"{name} :"
+    head_plain = f"{name} :" + (" " if text else "")
     last_plain = LINK_TEXT + (f" · {tag}" if tag else "")
     sign_plain = f"\n\nvia {SIGN_TEXT}" if SIGN_TEXT else ""
     overhead = (utf16_len(head_plain) + 1 + utf16_len(last_plain)
                 + utf16_len(sign_plain))
-    if text:
-        overhead += 1
     budget = max(limit - overhead, 0)
 
     truncated = False
@@ -337,9 +340,11 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
         truncated = True
         text = _cut_utf16(text, max(budget - 1, 0)).rstrip() + "…"
 
-    parts = [f"<b>{html.escape(name, quote=False)}</b> :"]
+    quote = f"<b>{html.escape(name, quote=False)}</b> :"
     if text:
-        parts.append(f"<blockquote>{html.escape(text, quote=False)}</blockquote>")
+        quote += " " + html.escape(text, quote=False)
+    parts = [f"<blockquote>{quote}</blockquote>"]
+
     last = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
     if tag:
         last += " · " + html.escape(tag, quote=False)
@@ -352,21 +357,25 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     return "\n".join(parts), truncated
 
 
-def plan(tw: Tweet) -> dict:
+def plan(tw: Tweet, mode: str | None = None) -> dict:
     """决定呈现形态，返回可以直接落库的描述。
 
     text        纯文字推文，一条消息，不带预览（预览只会把正文再显示一遍）
-    preview     有媒体，TWEET_MODE=preview：一条消息 + 置顶大图预览
-    media       有媒体，TWEET_MODE=media：媒体带说明（单个或相册）
+    preview     一条消息 + 置顶大图预览
+    media       媒体带说明（单个或相册）
     media_long  同上但说明超过 1024，媒体后面另跟一条文字
+
+    mode 不给时按 TWEET_MODE。auto 在这里先按 preview 规划，
+    由调度器在发送前检查预览，不行再用 mode="media" 重新规划。
     """
+    mode = (mode or TWEET_MODE)
     base = {"kind": "tweet", "url": tw.url, "preview_url": tw.preview_url}
 
     if not tw.media:
         body, _ = build_html(tw, TEXT_LIMIT)
         return {**base, "mode": "text", "html": body, "caption": False}
 
-    if TWEET_MODE != "media":
+    if mode != "media":
         body, _ = build_html(tw, TEXT_LIMIT)
         return {**base, "mode": "preview", "html": body, "caption": False}
 
@@ -394,3 +403,94 @@ def needs_relay(tw: Tweet, extra: dict | None = None) -> str | None:
         if m.kind != "photo" and m.size > URL_FILE_MAX:
             return "视频超过 20MB"
     return None
+
+
+# ------------------------------------------------------------------ 预览检查
+
+def prejudge_preview(tw: Tweet) -> str | None:
+    """不用问 Telegram 就能断定预览装不下的情况，返回原因；否则 None。
+
+    一个链接预览只能挂一个媒体对象。多张图 fxtwitter 会拼成一张图，
+    这没问题；但多个视频、或图和视频混排时，预览必然丢东西。
+    """
+    videos = sum(1 for m in tw.media if m.kind in ("video", "gif"))
+    photos = sum(1 for m in tw.media if m.kind == "photo")
+    if videos > 1:
+        return "多个视频，预览只能显示一个"
+    if videos and photos:
+        return "图片和视频混排，预览装不下"
+    return None
+
+
+def _is_video_doc(doc: Any) -> bool:
+    if doc is None:
+        return False
+    mime = (getattr(doc, "mime_type", "") or "").lower()
+    if mime.startswith("video/"):
+        return True
+    from telethon.tl.types import DocumentAttributeVideo
+    return any(isinstance(a, DocumentAttributeVideo)
+               for a in (getattr(doc, "attributes", None) or []))
+
+
+def judge_preview(result: Any, tw: Tweet) -> str:
+    """判断 Telegram 给出的预览是否带齐了媒体。
+
+    返回 ok / pending / missing。
+
+    视频只认 document（Telegram 自己存了一份文件）。embed_url 是内嵌播放器，
+    每次播放都实时去源站拉，原帖一删就放不了，不算数。
+    """
+    from telethon.tl.types import (MessageMediaWebPage, WebPage,
+                                   WebPagePending)
+    # 新协议层外面包了一层 messages.WebPagePreview，旧的直接是 MessageMedia
+    media = getattr(result, "media", result)
+    if not isinstance(media, MessageMediaWebPage):
+        return "missing"
+    wp = media.webpage
+    if isinstance(wp, WebPagePending):
+        return "pending"
+    if not isinstance(wp, WebPage):
+        return "missing"
+
+    has_video = _is_video_doc(wp.document)
+    has_image = wp.photo is not None or has_video or (
+        wp.document is not None
+        and (getattr(wp.document, "mime_type", "") or "").startswith("image/"))
+
+    if any(m.kind in ("video", "gif") for m in tw.media):
+        return "ok" if has_video else "missing"
+    return "ok" if has_image else "missing"
+
+
+async def probe_preview(client: Any, tw: Tweet, timeout: float = None,
+                        on_pending: Any = None, interval: float = 1.5) -> str:
+    """发送之前问 Telegram：这个链接会生成什么样的预览。
+
+    和 Telegram 客户端输入链接时显示预览草稿是同一个接口。附带的好处是
+    Telegram 会把结果缓存下来，bot 紧接着发送时直接用缓存。
+
+    返回 ok / missing。一直是 pending 直到超时，也算 missing。
+    """
+    import asyncio
+    import time
+    from telethon.tl.functions.messages import GetWebPagePreviewRequest
+
+    timeout = PREVIEW_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    notified = False
+    while True:
+        res = await client(GetWebPagePreviewRequest(message=tw.preview_url))
+        verdict = judge_preview(res, tw)
+        if verdict != "pending":
+            return verdict
+        if not notified and on_pending is not None:
+            notified = True
+            r = on_pending()
+            if hasattr(r, "__await__"):
+                await r
+        left = deadline - time.monotonic()
+        if left <= 0:
+            log.info("预览等待超时（%ss）：%s", timeout, tw.preview_url)
+            return "missing"
+        await asyncio.sleep(min(interval, left))

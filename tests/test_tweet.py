@@ -255,24 +255,26 @@ def test_build_format_matches_spec():
     html, cut = tweet.build_html(t, 4096)
     assert not cut
     assert html == (
-        "<b>DT TAKURO</b> :\n"
-        "<blockquote>がっつり見えてない?</blockquote>\n"
+        "<blockquote><b>DT TAKURO</b> : がっつり見えてない?</blockquote>\n"
         '<a href="https://x.com/KarenCo55187924/status/1">原帖链接</a> · #KarenCo55187924')
 
 
 def test_nickname_fully_bold_colon_outside():
     from telethon.tl.types import MessageEntityBold
     text, ents = _parse(tweet.build_html(Tweet("1", "DT TAKURO", "k", "hi"), 4096)[0])
-    assert text.splitlines()[0] == "DT TAKURO :"
+    assert text.splitlines()[0] == "DT TAKURO : hi"
     bold = [e for e in ents if isinstance(e, MessageEntityBold)]
     assert len(bold) == 1 and (bold[0].offset, bold[0].length) == (0, len("DT TAKURO"))
 
 
-def test_quote_contains_only_text():
-    text, ents = _parse(tweet.build_html(Tweet("1", "杰克", "jack", "line1\nline2"), 4096)[0])
-    bq = [e for e in ents if isinstance(e, MessageEntityBlockquote)][0]
-    q = text.encode("utf-16-le")[bq.offset * 2:(bq.offset + bq.length) * 2].decode("utf-16-le")
-    assert q == "line1\nline2"
+def test_quote_starts_with_nickname():
+    """昵称和冒号并入引用块开头，正文紧跟其后，多行正文保持换行。"""
+    text, ents = _parse(tweet.build_html(Tweet("1", "李秀", "x", "line1\nline2"), 4096)[0])
+    bq = [e for e in ents if isinstance(e, MessageEntityBlockquote)]
+    assert len(bq) == 1
+    q = text.encode("utf-16-le")[bq[0].offset * 2:(bq[0].offset + bq[0].length) * 2].decode("utf-16-le")
+    assert q == "李秀 : line1\nline2"
+    assert "原帖链接" not in q and "#x" not in q
 
 
 def test_link_line_points_to_x():
@@ -326,18 +328,19 @@ def test_build_escapes_html():
     t = Tweet("1", "A<b>", "a", "1 < 2 & <script>")
     html, _ = tweet.build_html(t, 4096)
     assert "<script>" not in html and "&lt;script&gt;" in html
-    assert html.startswith("<b>A&lt;b&gt;</b> :")
+    assert html.startswith("<blockquote><b>A&lt;b&gt;</b> :")
 
 
 def test_build_without_text():
+    """没有正文时引用块里只有「昵称 :」。"""
     html, _ = tweet.build_html(Tweet("1", "杰克", "jack", ""), 4096)
-    assert "blockquote" not in html
-    assert html.splitlines() == ["<b>杰克</b> :",
+    assert html.splitlines() == ["<blockquote><b>杰克</b> :</blockquote>",
                                  '<a href="https://x.com/jack/status/1">原帖链接</a> · #jack']
 
 
 def test_falls_back_to_screen_name_when_no_nickname():
-    assert tweet.build_html(Tweet("1", "", "jack", "hi"), 4096)[0].startswith("<b>jack</b> :")
+    assert tweet.build_html(Tweet("1", "", "jack", "hi"), 4096)[0].startswith(
+        "<blockquote><b>jack</b> : hi")
 
 
 def test_link_url_not_counted_in_length():
@@ -371,8 +374,9 @@ def media_mode(monkeypatch):
     monkeypatch.setattr(tweet, "TWEET_MODE", "media")
 
 
-def test_default_mode_is_preview():
-    assert tweet.TWEET_MODE == "preview"
+def test_default_mode_is_auto():
+    assert tweet.TWEET_MODE == "auto"
+    assert tweet.PREVIEW_TIMEOUT == 20
 
 
 def test_plan_preview_for_media():
@@ -528,8 +532,9 @@ async def test_relay_path_also_handles_preview():
 
 
 @pytest.mark.asyncio
-async def test_preview_fast_path_never_relays(qdb):
+async def test_preview_fast_path_never_relays(qdb, monkeypatch):
     import taskqueue
+    monkeypatch.setattr(tweet, "TWEET_MODE", "preview")
     r = _runner()
     t = Tweet("1", "J", "j", "hi", [WebMedia("video", "https://big", size=500 * 1024 ** 2)])
     tid = await qdb.add_task(42, "https://x.com/j/status/1", 9, 5)
@@ -966,3 +971,266 @@ def test_fxtwitter_links_trigger():
               "fxtwitter.com/Russell3402/status/1969686534",
               "https://fixupx.com/Russell3402/status/1969686534"):
         assert tweet.find_links(u) == ["https://x.com/Russell3402/status/1969686534"]
+
+
+
+# ================================================================ 预览检查（auto 模式）
+
+from telethon.tl.types import (  # noqa: E402
+    Document, MessageMediaEmpty, MessageMediaWebPage, Photo,
+    WebPage, WebPageEmpty, WebPagePending,
+)
+from telethon.tl.types.messages import WebPagePreview  # noqa: E402
+
+
+def _photo():
+    return Photo(id=1, access_hash=1, file_reference=b"", date=None, sizes=[], dc_id=1)
+
+
+def _doc(mime):
+    return Document(id=1, access_hash=1, file_reference=b"", date=None,
+                    mime_type=mime, size=1, dc_id=1, attributes=[])
+
+
+def _page(photo=None, document=None, embed=None, wrap=True):
+    wp = WebPage(id=1, url="u", display_url="u", hash=0, photo=photo,
+                 document=document, embed_url=embed)
+    media = MessageMediaWebPage(webpage=wp)
+    return WebPagePreview(media=media, chats=[], users=[]) if wrap else media
+
+
+def _pending(wrap=True):
+    media = MessageMediaWebPage(webpage=WebPagePending(id=1, date=None))
+    return WebPagePreview(media=media, chats=[], users=[]) if wrap else media
+
+
+PHOTO_TW = Tweet("1", "J", "j", "hi", [WebMedia("photo", "https://a")])
+VIDEO_TW = Tweet("1", "J", "j", "hi", [WebMedia("video", "https://v")])
+
+
+@pytest.mark.parametrize("wrap", [True, False], ids=["新协议包装", "旧协议直返"])
+def test_judge_handles_both_protocol_shapes(wrap):
+    assert tweet.judge_preview(_page(photo=_photo(), wrap=wrap), PHOTO_TW) == "ok"
+    assert tweet.judge_preview(_pending(wrap=wrap), PHOTO_TW) == "pending"
+
+
+def test_judge_photo_ok():
+    assert tweet.judge_preview(_page(photo=_photo()), PHOTO_TW) == "ok"
+
+
+def test_judge_empty_preview_is_missing():
+    assert tweet.judge_preview(_page(), PHOTO_TW) == "missing"
+    assert tweet.judge_preview(MessageMediaEmpty(), PHOTO_TW) == "missing"
+    empty = WebPagePreview(media=MessageMediaWebPage(webpage=WebPageEmpty(id=1)),
+                           chats=[], users=[])
+    assert tweet.judge_preview(empty, PHOTO_TW) == "missing"
+
+
+def test_judge_video_needs_video_document():
+    assert tweet.judge_preview(_page(document=_doc("video/mp4")), VIDEO_TW) == "ok"
+
+
+def test_judge_cover_only_counts_as_missing():
+    """原帖有视频、预览只剩封面图：算失败。"""
+    assert tweet.judge_preview(_page(photo=_photo()), VIDEO_TW) == "missing"
+
+
+def test_judge_embed_player_not_trusted():
+    """内嵌播放器是实时去源站拉的，原帖删了就放不了，不算有视频。"""
+    assert tweet.judge_preview(
+        _page(photo=_photo(), embed="https://fxtwitter.com/embed"), VIDEO_TW) == "missing"
+
+
+@pytest.mark.parametrize("media,why", [
+    ([WebMedia("video", "a"), WebMedia("video", "b")], "多个视频"),
+    ([WebMedia("photo", "a"), WebMedia("video", "b")], "混排"),
+    ([WebMedia("photo", "a"), WebMedia("gif", "b")], "混排"),
+])
+def test_prejudge_obvious_failures(media, why):
+    assert why in tweet.prejudge_preview(Tweet("1", "J", "j", "", media))
+
+
+def test_prejudge_passes_multi_photo_and_single_video():
+    many = Tweet("1", "J", "j", "", [WebMedia("photo", str(i)) for i in range(4)])
+    assert tweet.prejudge_preview(many) is None, "多图由 fxtwitter 拼图，不算失败"
+    assert tweet.prejudge_preview(VIDEO_TW) is None
+
+
+class SeqClient:
+    """按顺序吐出预设结果的假 Telethon 客户端。"""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = 0
+
+    async def __call__(self, req):
+        assert type(req).__name__ == "GetWebPagePreviewRequest"
+        assert req.message == "https://fxtwitter.com/j/status/1"
+        self.calls += 1
+        r = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+@pytest.mark.asyncio
+async def test_probe_polls_until_ready():
+    c = SeqClient(_pending(), _pending(), _page(photo=_photo()))
+    notes = []
+    v = await tweet.probe_preview(c, PHOTO_TW, timeout=5, interval=0.01,
+                                  on_pending=lambda: notes.append(1))
+    assert v == "ok" and c.calls == 3
+    assert notes == [1], "「等待预览生成」只提示一次"
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_counts_as_missing():
+    c = SeqClient(_pending())
+    v = await tweet.probe_preview(c, PHOTO_TW, timeout=0.05, interval=0.01)
+    assert v == "missing"
+
+
+@pytest.mark.asyncio
+async def test_probe_immediate_result_no_notice():
+    notes = []
+    v = await tweet.probe_preview(SeqClient(_page(photo=_photo())), PHOTO_TW,
+                                  timeout=5, on_pending=lambda: notes.append(1))
+    assert v == "ok" and notes == []
+
+
+def test_timeout_configurable():
+    """在子进程里验证：reload 会重建模块里的类，污染其他测试。"""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "TWEET_PREVIEW_TIMEOUT": "7.5", "TWEET_MODE": "MEDIA"}
+    out = subprocess.run(
+        [sys.executable, "-c", "import tweet; print(tweet.PREVIEW_TIMEOUT, tweet.TWEET_MODE)"],
+        cwd=root, env=env, capture_output=True, text=True, check=True).stdout.split()
+    assert out == ["7.5", "media"], "大小写也应被规整"
+
+
+# ---------------------------------------------------------------- auto 调度
+
+@pytest.fixture
+def auto_mode(monkeypatch):
+    monkeypatch.setattr(tweet, "TWEET_MODE", "auto")
+
+
+def _use_client(monkeypatch, client):
+    import taskqueue
+
+    async def acquire(uid):
+        if isinstance(client, Exception):
+            raise client
+        return client
+    monkeypatch.setattr(taskqueue.POOL, "acquire", acquire)
+
+
+async def _auto_job(qdb, tw):
+    import taskqueue
+    tid = await qdb.add_task(42, "https://x.com/j/status/1", 9, 5)
+    return taskqueue.Job(tid, 42, "https://x.com/j/status/1", 9, 5, tweet=tw), tid
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_preview_ok_sends_preview(qdb, monkeypatch):
+    _use_client(monkeypatch, SeqClient(_page(photo=_photo())))
+    r = _runner()
+    job, tid = await _auto_job(qdb, PHOTO_TW)
+    await r._run_tweet(job, "fast")
+    assert [c[0] for c in r.bot.calls] == ["text"]
+    assert r.bot.calls[0][2]["link_preview_options"].show_above_text
+    assert (await qdb.get_task(tid))["state"] == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_missing_switches_to_media(qdb, monkeypatch):
+    """那条十几分钟视频的情况：预览里没视频 -> 改发原始视频。"""
+    _use_client(monkeypatch, SeqClient(_page(photo=_photo())))
+    r = _runner()
+    job, tid = await _auto_job(qdb, VIDEO_TW)
+    await r._run_tweet(job, "fast")
+    assert [c[0] for c in r.bot.calls] == ["video"], "应改为 URL 直发视频"
+    assert "<blockquote>" in r.bot.calls[0][2]["caption"]
+    assert any("改为发送原始媒体" in x for x in r.said)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_missing_then_rejected_goes_relay_as_media(qdb, monkeypatch):
+    """预览失败 -> 改 media -> URL 直发被拒 -> 慢通道。到慢通道时必须仍是 media，
+    不能又被重新规划回 preview。"""
+    _use_client(monkeypatch, SeqClient(_page()))
+    r = _runner()
+    r.bot = FakeBot(reject=True)
+    job, tid = await _auto_job(qdb, VIDEO_TW)
+    await r._run_tweet(job, "fast")
+    assert r.slow.qsize() == 1
+    queued = r.slow.get_nowait()
+    assert queued.extra["mode"] == "media" and queued.extra["checked"]
+
+    import json
+    assert json.loads((await qdb.get_task(tid))["extra"])["mode"] == "media", \
+        "落库的规划也得是 media，重启后才不会变回预览"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_timeout_switches_to_media(qdb, monkeypatch):
+    monkeypatch.setattr(tweet, "PREVIEW_TIMEOUT", 0.05)
+    _use_client(monkeypatch, SeqClient(_pending()))
+    r = _runner()
+    job, _ = await _auto_job(qdb, PHOTO_TW)
+    await r._run_tweet(job, "fast")
+    assert [c[0] for c in r.bot.calls] == ["photo"]
+    assert any("等待预览生成" in x for x in r.said)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_check_error_falls_back_to_preview(qdb, monkeypatch):
+    """检查本身出错（session 失效等）时按预览发，至少文字能到。"""
+    _use_client(monkeypatch, RuntimeError("session 失效"))
+    r = _runner()
+    job, tid = await _auto_job(qdb, VIDEO_TW)
+    await r._run_tweet(job, "fast")
+    assert [c[0] for c in r.bot.calls] == ["text"]
+    assert (await qdb.get_task(tid))["state"] == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_prejudge_skips_probe(qdb, monkeypatch):
+    """图视频混排一看就知道预览装不下，不用去问 Telegram。"""
+    c = SeqClient(_page(photo=_photo()))
+    _use_client(monkeypatch, c)
+    r = _runner()
+    tw = Tweet("1", "J", "j", "hi", [WebMedia("photo", "a"), WebMedia("video", "b")])
+    job, _ = await _auto_job(qdb, tw)
+    await r._run_tweet(job, "fast")
+    assert c.calls == 0
+    assert [c_[0] for c_ in r.bot.calls] == ["group"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_text_only_never_probes(qdb, monkeypatch):
+    c = SeqClient(_page())
+    _use_client(monkeypatch, c)
+    r = _runner()
+    job, _ = await _auto_job(qdb, Tweet("1", "J", "j", "hi"))
+    await r._run_tweet(job, "fast")
+    assert c.calls == 0 and [x[0] for x in r.bot.calls] == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_forced_preview_never_probes(qdb, monkeypatch):
+    monkeypatch.setattr(tweet, "TWEET_MODE", "preview")
+    c = SeqClient(_page())
+    _use_client(monkeypatch, c)
+    r = _runner()
+    job, _ = await _auto_job(qdb, VIDEO_TW)
+    await r._run_tweet(job, "fast")
+    assert c.calls == 0 and [x[0] for x in r.bot.calls] == ["text"]
