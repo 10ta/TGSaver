@@ -252,17 +252,18 @@ def test_build_format_matches_spec():
     html, cut = tweet.build_html(t, 4096)
     assert not cut
     assert html == (
-        "Russell:\n"
+        "Russell #Russell3402 :\n"
         "<blockquote>已经到了看到价格就知道在卖什么的程度😂</blockquote>\n"
-        '<a href="https://x.com/Russell3402/status/1">原文链接</a> #Russell3402')
+        '<a href="https://x.com/Russell3402/status/1">原文链接</a>')
 
 
-def test_link_precedes_id_and_points_to_x():
+def test_id_tag_follows_nickname_and_link_is_last():
     from telethon.extensions import html as tl_html
     from telethon.tl.types import MessageEntityTextUrl
     t = Tweet("1", "杰克", "jack", "hi")
     text, ents = tl_html.parse(tweet.build_html(t, 4096)[0])
-    assert text.splitlines()[-1] == "原文链接 #jack"
+    assert text.splitlines()[0] == "杰克 #jack :"
+    assert text.splitlines()[-1] == "原文链接"
     links = [e for e in ents if isinstance(e, MessageEntityTextUrl)]
     assert len(links) == 1 and links[0].url == "https://x.com/jack/status/1"
 
@@ -272,30 +273,31 @@ def test_nickname_line_has_colon_then_quote():
     t = Tweet("1", "杰克", "jack", "line1\nline2")
     text, ents = tl_html.parse(tweet.build_html(t, 4096)[0])
     lines = text.splitlines()
-    assert lines[0] == "杰克:"
+    assert lines[0] == "杰克 #jack :"
     bq = [e for e in ents if isinstance(e, MessageEntityBlockquote)][0]
     quoted = text.encode("utf-16-le")[bq.offset * 2:(bq.offset + bq.length) * 2]
     assert quoted.decode("utf-16-le") == "line1\nline2"
-    assert "原文链接" not in quoted.decode("utf-16-le"), "链接和 tag 必须在引用块之外"
+    q = quoted.decode("utf-16-le")
+    assert "原文链接" not in q and "#jack" not in q, "链接和 tag 必须在引用块之外"
 
 
 def test_build_escapes_html():
     t = Tweet("1", "A<b>", "a", "1 < 2 & <script>")
     html, _ = tweet.build_html(t, 4096)
     assert "<script>" not in html and "&lt;script&gt;" in html
-    assert html.startswith("A&lt;b&gt;:")
+    assert html.startswith("A&lt;b&gt; #a :")
 
 
 def test_build_without_text():
     t = Tweet("1", "杰克", "jack", "")
     html, _ = tweet.build_html(t, 4096)
     assert "blockquote" not in html
-    assert html.splitlines()[0] == "杰克:"
+    assert html.splitlines() == ["杰克 #jack :", '<a href="https://x.com/jack/status/1">原文链接</a>']
 
 
 def test_falls_back_to_screen_name_when_no_nickname():
     t = Tweet("1", "", "jack", "hi")
-    assert tweet.build_html(t, 4096)[0].startswith("jack:")
+    assert tweet.build_html(t, 4096)[0].startswith("jack #jack :")
 
 
 def test_link_url_not_counted_in_length():

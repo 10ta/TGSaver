@@ -2,9 +2,9 @@
 
 链接 -> FxTwitter API 取数据 -> 组装成:
 
-    用户昵称:
+    用户昵称: #用户ID
     ┃ 帖子正文（引用块）
-    原文链接 #用户ID        ← "原文链接" 是指向 x.com 原帖的超链接
+    原文链接                ← 指向 x.com 原帖的超链接
 
 媒体优先交给 Telegram 服务器按 URL 自己去拉（和 Telegram 渲染
 fxtwitter 链接预览是同一个机制，毫秒级、本机零流量）；超出 Bot API
@@ -292,9 +292,9 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     """组装消息 HTML。超长时截断正文，返回 (html, 是否截断)。
 
     格式：
-        昵称:
+        昵称: #ID
         <blockquote>正文</blockquote>
-        <a href="原帖">原文链接</a> #ID
+        <a href="原帖">原文链接</a>
 
     超链接的 URL 不计入 Telegram 的长度限制，只有显示文字算。
     """
@@ -302,10 +302,10 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     tag = id_tag(tw)
     text = tw.text.strip()
 
-    last_plain = LINK_TEXT + (f" {tag}" if tag else "")
-    overhead = utf16_len(name) + 1 + 1 + utf16_len(last_plain)   # 冒号 + 末行前换行
+    head_plain = name + (f" {tag}" if tag else "") + " :"
+    overhead = utf16_len(head_plain) + 1 + utf16_len(LINK_TEXT)   # 末行前换行
     if text:
-        overhead += 1                                            # 正文前换行
+        overhead += 1                                             # 正文前换行
     budget = max(limit - overhead, 0)
 
     truncated = False
@@ -313,13 +313,14 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
         truncated = True
         text = _cut_utf16(text, max(budget - 1, 0)).rstrip() + "…"
 
-    link = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
-    last = link + (f" {html.escape(tag, quote=False)}" if tag else "")
-
-    parts = [html.escape(name, quote=False) + ":"]
+    head = html.escape(name, quote=False)
+    if tag:
+        head += " " + html.escape(tag, quote=False)
+    head += " :"
+    parts = [head]
     if text:
         parts.append(f"<blockquote>{html.escape(text, quote=False)}</blockquote>")
-    parts.append(last)
+    parts.append(f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>')
     return "\n".join(parts), truncated
 
 

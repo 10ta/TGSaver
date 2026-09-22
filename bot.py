@@ -73,7 +73,7 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 <code>x.com/用户/status/123</code>
 <code>fxtwitter.com/用户/status/123</code>  twitter / vxtwitter / fixupx 等也认
 
-整理成「昵称: + 引用正文 + 原文链接 #ID」，图片视频拼成相册。
+整理成「昵称: #ID + 引用正文 + 原文链接」，图片视频拼成相册。
 媒体由 Telegram 服务器直接拉取，通常一秒内完成；
 超过大小限制时自动改为服务器中转。
 
