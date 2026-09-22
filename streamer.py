@@ -94,11 +94,13 @@ class _DownloadStream:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
 
+    def _chunks(self):
+        """数据源。子类覆盖它就能换成别的来源（比如 HTTP）。"""
+        return self._client.iter_download(self._media, request_size=CHUNK)
+
     async def _produce(self) -> None:
         try:
-            async for chunk in self._client.iter_download(
-                self._media, request_size=CHUNK
-            ):
+            async for chunk in self._chunks():
                 await self._q.put(bytes(chunk))
                 self._done += len(chunk)
                 if self._on_progress:
@@ -468,7 +470,198 @@ async def relay_protected_album(
         handles.append(await _upload_one(client, m, s, relay_channel,
                                          _prog, task_id, register_tmp))
 
-    # Telegram 相册上限 10 项。原相册不会超，这里只是防御性分块。
+    ids, note = await send_handles_as_album(
+        client, relay_channel, handles, specs)
+    return ids, total, note
+
+
+# --------------------------------------------------------------- 网络媒体
+
+@dataclass
+class WebMedia:
+    """来自网页的媒体（目前是推文）。与 Telegram 消息无关，所以单独建模。"""
+
+    kind: str                     # photo | video | gif
+    url: str
+    width: int = 0
+    height: int = 0
+    duration: float = 0.0
+    thumb_url: Optional[str] = None
+    size: int = 0                 # 已知时填，用来预判能否走 URL 直发
+
+
+class _HttpStream(_DownloadStream):
+    """同一个有界管道，数据源换成 HTTP 响应体。"""
+
+    def __init__(self, resp: Any, size: int, name: str,
+                 on_progress: Optional[ProgressCb] = None) -> None:
+        super().__init__(None, None, size, name, on_progress)
+        self._resp = resp
+
+    def _chunks(self):
+        return self._resp.content.iter_chunked(CHUNK)
+
+
+HTTP_UA = "Mozilla/5.0 (compatible; TgSaver/1.0)"
+
+
+def http_session():
+    import aiohttp
+    return aiohttp.ClientSession(
+        headers={"User-Agent": HTTP_UA},
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=90),
+    )
+
+
+def _web_spec(item: WebMedia, idx: int, size: int) -> MediaSpec:
+    if item.kind == "photo":
+        return MediaSpec(size=size, file_name=f"photo_{idx + 1}.jpg",
+                         mime_type="image/jpeg", attributes=[], is_photo=True,
+                         force_document=False, caption="", entities=[])
+    name = f"{'gif' if item.kind == 'gif' else 'video'}_{idx + 1}.mp4"
+    attrs = [
+        DocumentAttributeVideo(
+            duration=float(item.duration or 0), w=int(item.width or 0),
+            h=int(item.height or 0), supports_streaming=True,
+            nosound=item.kind == "gif"),
+        DocumentAttributeFilename(file_name=name),
+    ]
+    if item.kind == "gif":
+        attrs.append(DocumentAttributeAnimated())
+    return MediaSpec(size=size, file_name=name, mime_type="video/mp4",
+                     attributes=attrs, is_photo=False, force_document=False,
+                     caption="", entities=[])
+
+
+async def _fetch_small(http, url: Optional[str], name: str) -> Optional[io.BytesIO]:
+    """缩略图这类小文件直接进内存。失败不影响主流程。"""
+    if not url:
+        return None
+    try:
+        async with http.get(url) as r:
+            if r.status != 200:
+                return None
+            data = await r.read()
+        if not data or len(data) > 1024 * 1024:
+            return None
+        bio = io.BytesIO(data)
+        bio.name = name
+        return bio
+    except Exception as e:  # noqa: BLE001
+        log.debug("小文件获取失败 %s: %s", url, e)
+        return None
+
+
+async def _upload_web(client: TelegramClient, http, item: WebMedia, idx: int,
+                      prog, task_id, register_tmp) -> tuple[Any, MediaSpec]:
+    """下载一个网络媒体并传到 Telegram，返回 (句柄, 规格)。
+
+    有 Content-Length 就走有界管道边下边传，零磁盘；
+    没有的话大小未知，upload_file 无法流式，只能先落到临时目录。
+    """
+    async with http.get(item.url) as resp:
+        if resp.status != 200:
+            raise TransferError(f"媒体下载失败（HTTP {resp.status}）")
+        size = resp.content_length
+
+        if size:
+            if size > CFG.max_upload_size:
+                raise TransferError(
+                    f"第 {idx + 1} 个媒体 {_hs(size)} 超过上传上限 "
+                    f"{_hs(CFG.max_upload_size)}。")
+            spec = _web_spec(item, idx, size)
+            async with _HttpStream(resp, size, spec.file_name,
+                                   prog("下载")) as stream:
+                handle = await client.upload_file(
+                    stream, file_size=size, file_name=spec.file_name,
+                    progress_callback=prog("上传"))
+        else:
+            CFG.tmp_dir.mkdir(parents=True, exist_ok=True)
+            path = CFG.tmp_dir / f"w{task_id or os.getpid()}_{idx}"
+            if register_tmp:
+                await _maybe_await(register_tmp(str(path)))
+            try:
+                got = 0
+                with open(path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(CHUNK):
+                        got += len(chunk)
+                        if got > CFG.max_upload_size:
+                            raise TransferError(
+                                f"第 {idx + 1} 个媒体超过上传上限 "
+                                f"{_hs(CFG.max_upload_size)}。")
+                        f.write(chunk)
+                spec = _web_spec(item, idx, got)
+                handle = await client.upload_file(
+                    str(path), file_name=spec.file_name,
+                    progress_callback=prog("上传"))
+            finally:
+                path.unlink(missing_ok=True)
+                if register_tmp:
+                    await _maybe_await(register_tmp(None))
+
+    if not spec.is_photo:
+        spec.thumb = await _fetch_small(http, item.thumb_url, "thumb.jpg")
+    return handle, spec
+
+
+async def relay_web_media(
+    client: TelegramClient,
+    items: list[WebMedia],
+    relay_channel: int,
+    caption_html: Optional[str] = None,
+    on_progress: Optional[Callable[..., Any]] = None,
+    task_id: Optional[int] = None,
+    register_tmp: Optional[Callable[[Optional[str]], Any]] = None,
+) -> tuple[list[int], int, str]:
+    """把一组网络媒体搬进中转频道。
+
+    caption_html 挂在第一项上（单个媒体就是它本身，相册就是封面那张），
+    和 Telegram 客户端发相册时的习惯一致。
+
+    返回 (消息 id 列表, 字节数, 说明)。
+    """
+    if not items:
+        raise TransferError("没有可搬运的媒体")
+
+    started = time.monotonic()
+    handles, specs, total = [], [], 0
+    async with http_session() as http:
+        for i, item in enumerate(items):
+            def _prog(phase: str, _i=i):
+                def cb(done: int, tot: int) -> None:
+                    if on_progress:
+                        on_progress(phase, done, tot or 0,
+                                    time.monotonic() - started, _i + 1, len(items))
+                return cb
+            log.info("网络媒体 %d/%d %s", i + 1, len(items), item.kind)
+            h, sp = await _upload_web(client, http, item, i, _prog,
+                                      task_id, register_tmp)
+            handles.append(h)
+            specs.append(sp)
+            total += sp.size
+
+    if caption_html:
+        from telethon.extensions import html as tl_html
+        specs[0].caption, specs[0].entities = tl_html.parse(caption_html)
+
+    if len(handles) == 1:
+        sent = await _send(client, relay_channel, handles[0], specs[0])
+        return [sent.id], total, ""
+
+    ids, note = await send_handles_as_album(client, relay_channel, handles, specs)
+    return ids, total, note
+
+
+async def send_handles_as_album(
+    client: TelegramClient, relay_channel: int,
+    handles: list, specs: list[MediaSpec],
+) -> tuple[list[int], str]:
+    """把已上传的句柄组装成相册发出去。受保护内容和推文两条路径共用。
+
+    返回 (消息 id 列表, 说明)。整组失败时用已有句柄逐条补发，
+    不重传字节，并在说明里告知分组没保住。
+    """
+    # Telegram 相册上限 10 项，超出按 10 分块。
     sent_ids: list[int] = []
     note = ""
     for chunk_start in range(0, len(handles), 10):
@@ -501,7 +694,7 @@ async def relay_protected_album(
                 sent_ids.append(sent.id)
             note = "相册整组发送失败，已逐条转存，分组未能保持。"
 
-    return sorted(sent_ids), total, note
+    return sorted(sent_ids), note
 
 
 def _hs(n: int) -> str:

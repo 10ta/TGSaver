@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     relay_chat_id   INTEGER,
     relay_ids       TEXT,
     relay_is_album  INTEGER NOT NULL DEFAULT 0,
+    -- 非 Telegram 来源（如推文）的呈现方式，JSON。投递失败重试时
+    -- 凭它重组消息和按钮，不必重新请求外部 API。
+    extra           TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -100,6 +103,7 @@ async def _migrate() -> None:
         "relay_chat_id": "INTEGER",
         "relay_ids": "TEXT",
         "relay_is_album": "INTEGER NOT NULL DEFAULT 0",
+        "extra": "TEXT",
     }
     for col, decl in additions.items():
         if col not in have:

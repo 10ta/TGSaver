@@ -25,6 +25,7 @@ import admin
 import db
 import menu
 import streamer
+import tweet
 from config import CFG
 from parser import (
     ParseError, find_links, make_internal, parse_link, wants_nosp, with_nosp,
@@ -66,7 +67,17 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 
 会重新下载上传，比直转慢。受保护的内容本来就是重传，遮罩一律自动去掉，不用加。
 
-<b>③ 抓私聊内容</b>
+<b>③ 保存推文</b>
+直接发 X / Twitter 帖子链接：
+
+<code>x.com/用户/status/123</code>
+<code>fxtwitter.com/用户/status/123</code>  twitter / vxtwitter / fixupx 等也认
+
+整理成「昵称: + 引用正文 + 原文链接 #ID」，图片视频拼成相册。
+媒体由 Telegram 服务器直接拉取，通常一秒内完成；
+超过大小限制时自动改为服务器中转。
+
+<b>④ 抓私聊内容</b>
 私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），
 所以改发<b>对话地址</b>，后面跟要抓几条：
 
@@ -326,11 +337,13 @@ async def on_text(m: Message) -> None:
         await do_grab(m, *parsed)
         return
 
+    tweets = tweet.find_links(text)
     links = find_links(text)
-    if not links:
+    if not links and not tweets:
         await m.reply(
             "没看到消息链接。\n\n"
             "发一条 <code>t.me/频道/123</code> 这样的消息链接，\n"
+            "或者 <code>x.com/用户/status/123</code> 推文链接，\n"
             "或者发 <code>t.me/对话名 5</code> 抓取私聊内容。")
         return
 
@@ -338,6 +351,10 @@ async def on_text(m: Message) -> None:
     if not row or row["session_status"] != "ok":
         await m.reply("还没有可用的登录凭据，请联系机主。")
         return
+
+    # 推文：媒体要经 user 账号上传到中转频道，所以同样需要凭据
+    for t in tweets:
+        await RUNNER.submit(m.from_user.id, t, m.chat.id, m.message_id)
 
     # 消息里单独出现 nosp 时，把标记写进每条链接本身，
     # 这样它能随任务落库，重试和重启后依然有效。
@@ -355,6 +372,7 @@ async def on_text(m: Message) -> None:
         await RUNNER.submit(m.from_user.id, link, m.chat.id, m.message_id)
         ok += 1
 
+    ok += len(tweets)
     if ok > 1:
         await m.reply(f"已接收 {ok} 条链接，按顺序处理。")
 
@@ -411,6 +429,7 @@ async def main() -> None:
     log.info("收到退出信号，正在收尾…")
     poll.cancel()
     await RUNNER.stop()
+    await tweet.close()
     await POOL.stop()
     await db.close()
     await bot.session.close()

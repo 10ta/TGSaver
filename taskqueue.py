@@ -30,6 +30,7 @@ import db
 import fetcher
 import sender
 import streamer
+import tweet
 from config import CFG
 from parser import MsgRef, ParseError, parse_link
 from session_pool import POOL, NoSession
@@ -37,7 +38,8 @@ from session_pool import POOL, NoSession
 log = logging.getLogger("queue")
 
 # 这些错误是确定性的，重试没有意义
-FATAL = (fetcher.FetchError, ParseError, NoSession, streamer.TransferError)
+FATAL = (fetcher.FetchError, ParseError, NoSession, streamer.TransferError,
+         tweet.TweetError)
 
 # 投递阶段的确定性错误：bot 不在频道里、被踢、频道不存在等。
 # 这类错误重试 3 次只会把已经搬完的大文件重传 3 遍，必须当场判死。
@@ -83,6 +85,8 @@ class Job:
     relay_chat_id: Optional[int] = None
     relay_ids: Optional[list[int]] = None
     relay_is_album: bool = False
+    extra: Optional[dict] = None   # 推文等非 Telegram 来源的呈现方式
+    tweet: Any = None              # 进程内缓存的推文数据，快通道转慢通道时复用
     lane: str = "fast"          # 当前所在通道，killall 重新排队时要用
     last_edit: float = field(default=0.0)
     last_text: str = ""
@@ -132,6 +136,7 @@ class Runner:
                 relay_chat_id=r["relay_chat_id"],
                 relay_ids=json.loads(r["relay_ids"]) if r["relay_ids"] else None,
                 relay_is_album=bool(r["relay_is_album"]),
+                extra=json.loads(r["extra"]) if r["extra"] else None,
             )
             job.lane = r["lane"] or "fast"
             (self.slow if job.lane == "slow" else self.fast).put_nowait(job)
@@ -207,11 +212,15 @@ class Runner:
                      msg_id: int) -> int:
         task_id = await db.add_task(owner_id, link, chat_id, msg_id)
         job = Job(task_id, owner_id, link, chat_id, msg_id)
-        depth = self.fast.qsize() + self.slow.qsize()
-        job.status_msg_id = await self._say(
-            job, "已排队" + (f"（前面 {depth} 个）" if depth else "，正在处理…")
-        )
-        await db.update_task(task_id, status_msg_id=job.status_msg_id)
+
+        # 推文走 URL 直发时通常不到一秒就完成，先发一条「已排队」再删掉
+        # 反而让结果出现得更慢。只有回退到中转时才显示进度。
+        if not tweet.is_tweet(link):
+            depth = self.fast.qsize() + self.slow.qsize()
+            job.status_msg_id = await self._say(
+                job, "已排队" + (f"（前面 {depth} 个）" if depth else "，正在处理…")
+            )
+            await db.update_task(task_id, status_msg_id=job.status_msg_id)
         await self.fast.put(job)
         return task_id
 
@@ -252,7 +261,9 @@ class Runner:
                 log.info("task=%s 已搬运，跳过传输直接投递", job.task_id)
                 await self._deliver(job)
                 return
-            if lane == "fast":
+            if tweet.is_tweet(job.link):
+                await self._run_tweet(job, lane)
+            elif lane == "fast":
                 await self._run_fast(job)
             else:
                 await self._run_slow(job)
@@ -335,6 +346,69 @@ class Runner:
 
     # ------------------------------------------------------------ 收尾
 
+    async def _run_tweet(self, job: Job, lane: str) -> None:
+        """推文。
+
+        快通道：把媒体 URL 直接交给 Telegram，由它的服务器去拉。
+                 常见情况下亚秒级完成，本机零流量。
+        慢通道：Telegram 拒收（太大 / 拉不到）时回退到这里，
+                 由本机下载、user 账号上传到中转频道，不受大小限制。
+        """
+        ref = tweet.parse(job.link)
+        tw = job.tweet or await tweet.fetch(ref)
+        job.tweet = tw
+        job.extra = tweet.plan(tw)
+
+        if lane == "fast":
+            reason = tweet.needs_relay(tw)
+            if reason is None:
+                try:
+                    await sender.send_tweet_direct(
+                        self.bot, tw, job.extra,
+                        job.request_chat_id, job.request_msg_id)
+                except sender.UrlRejected as e:
+                    reason = "Telegram 拒绝直接拉取"
+                    log.info("task=%s URL 直发被拒，回退中转: %s", job.task_id, e)
+                else:
+                    await db.update_task(job.task_id, state="done", error=None,
+                                         extra=json.dumps(job.extra))
+                    await db.bump_usage(job.owner_id, 0)
+                    await self._drop_status(job)
+                    return
+
+            job.lane = "slow"
+            await db.update_task(job.task_id, lane="slow", state="pending",
+                                 extra=json.dumps(job.extra))
+            await self._say(job, f"{reason}，改为服务器中转…")
+            await self.slow.put(job)
+            return
+
+        # ---------- 慢通道：服务器中转 ----------
+        if not tw.media:
+            await self._deliver(job)
+            return
+
+        n = len(tw.media)
+        await self._say(job, f"正在中转 {n} 个媒体…" if n > 1 else "正在中转媒体…")
+
+        async def register_tmp(path: Optional[str]) -> None:
+            await db.update_task(job.task_id, tmp_path=path)
+
+        suid = acl.session_user(job.owner_id)
+        client = await POOL.acquire(suid)
+        relay_ch = await acl.relay_channel_for(job.owner_id)
+        async with POOL.lock_for(suid):
+            ids, nbytes, note = await streamer.relay_web_media(
+                client, tw.media, relay_ch,
+                caption_html=job.extra["html"] if job.extra.get("caption") else None,
+                on_progress=lambda *a: self._progress(job, *a),
+                task_id=job.task_id, register_tmp=register_tmp,
+            )
+        if note:
+            job.extra["split"] = True      # 相册整组失败已逐条发，投递也逐条
+        res = fetcher.Relayed(ids, len(ids) > 1 and not note, "B", nbytes, note)
+        await self._finish(job, res)
+
     async def _finish(self, job: Job, res: fetcher.Relayed) -> None:
         """搬运完成。先把结果落库，再投递。
 
@@ -352,15 +426,22 @@ class Runner:
             relay_chat_id=relay_ch,
             relay_ids=json.dumps(res.message_ids),
             relay_is_album=1 if res.is_album else 0,
+            extra=json.dumps(job.extra) if job.extra else None,
         )
         await self._deliver(job, note=res.note)
 
     async def _deliver(self, job: Job, note: str = "") -> None:
         """把中转频道里的结果复制给用户。可独立重跑。"""
-        await sender.deliver(
-            self.bot, job.relay_chat_id, job.relay_ids,
-            job.request_chat_id, job.request_msg_id, job.relay_is_album,
-        )
+        if job.extra and job.extra.get("kind") == "tweet":
+            await sender.deliver_tweet(
+                self.bot, job.relay_chat_id, job.relay_ids, job.extra,
+                job.request_chat_id, job.request_msg_id,
+            )
+        else:
+            await sender.deliver(
+                self.bot, job.relay_chat_id, job.relay_ids,
+                job.request_chat_id, job.request_msg_id, job.relay_is_album,
+            )
         row = await db.get_task(job.task_id)
         moved = row["bytes_moved"] if row else 0
         await db.update_task(job.task_id, state="done", error=None)
