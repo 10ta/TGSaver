@@ -32,6 +32,44 @@ from tweet import Tweet, TweetError  # noqa: E402
 from streamer import WebMedia  # noqa: E402
 
 
+class FakeHead:
+    """替身 HTTP 会话，只实现 HEAD。sizes: url -> 长度，缺省返回 404。"""
+
+    def __init__(self, sizes=None, fail=False):
+        self.sizes = sizes or {}
+        self.fail = fail
+        self.heads = []
+
+    def head(self, url, allow_redirects=True):
+        self.heads.append(url)
+        outer = self
+
+        class R:
+            status = 200 if url in outer.sizes else 404
+            content_length = outer.sizes.get(url)
+
+            async def __aenter__(self_):
+                if outer.fail:
+                    raise OSError("network down")
+                return self_
+
+            async def __aexit__(self_, *a):
+                pass
+        return R()
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch):
+    """每个测试都不连网，并清掉预览查询的限流冷却。"""
+    fake = FakeHead()
+
+    async def sess():
+        return fake
+    monkeypatch.setattr(tweet, "_api_session", sess)
+    monkeypatch.setattr(tweet, "_probe_blocked_until", 0.0)
+    return fake
+
+
 # ================================================================ 链接识别
 
 @pytest.mark.parametrize("text,want", [
@@ -1063,10 +1101,11 @@ class SeqClient:
         self.results = list(results)
         self.calls = 0
 
-    async def __call__(self, req):
+    async def __call__(self, req, flood_sleep_threshold=None):
         assert type(req).__name__ == "GetWebPagePreviewRequest"
         assert req.message == "https://fxtwitter.com/j/status/1"
         self.calls += 1
+        self.thresholds = getattr(self, "thresholds", []) + [flood_sleep_threshold]
         r = self.results.pop(0) if len(self.results) > 1 else self.results[0]
         if isinstance(r, Exception):
             raise r
@@ -1077,7 +1116,7 @@ class SeqClient:
 async def test_probe_polls_until_ready():
     c = SeqClient(_pending(), _pending(), _page(photo=_photo()))
     notes = []
-    v = await tweet.probe_preview(c, PHOTO_TW, timeout=5, interval=0.01,
+    v = await tweet.probe_preview(c, PHOTO_TW, timeout=5, backoff=(0.01,),
                                   on_pending=lambda: notes.append(1))
     assert v == "ok" and c.calls == 3
     assert notes == [1], "「等待预览生成」只提示一次"
@@ -1086,7 +1125,7 @@ async def test_probe_polls_until_ready():
 @pytest.mark.asyncio
 async def test_probe_timeout_counts_as_missing():
     c = SeqClient(_pending())
-    v = await tweet.probe_preview(c, PHOTO_TW, timeout=0.05, interval=0.01)
+    v = await tweet.probe_preview(c, PHOTO_TW, timeout=0.05, backoff=(0.01,))
     assert v == "missing"
 
 
@@ -1234,3 +1273,141 @@ async def test_forced_preview_never_probes(qdb, monkeypatch):
     job, _ = await _auto_job(qdb, VIDEO_TW)
     await r._run_tweet(job, "fast")
     assert c.calls == 0 and [x[0] for x in r.bot.calls] == ["text"]
+
+
+
+# ================================================================ 对 user 账号的克制
+
+@pytest.mark.asyncio
+async def test_probe_backoff_intervals(monkeypatch):
+    """轮询间隔逐渐拉长，而不是固定高频。"""
+    import asyncio as aio
+    slept = []
+    real_sleep = aio.sleep
+
+    async def fake_sleep(d):
+        slept.append(d)
+        await real_sleep(0)
+    monkeypatch.setattr(aio, "sleep", fake_sleep)
+
+    c = SeqClient(*([_pending()] * 5), _page(photo=_photo()))
+    assert await tweet.probe_preview(c, PHOTO_TW, timeout=100) == "ok"
+    assert slept == [1, 2, 3, 5, 8]
+
+
+def test_default_backoff_is_sparse():
+    """20 秒内的请求次数要明显少于固定 1.5 秒间隔的十几次。"""
+    t, n = 0, 1
+    for d in tweet.PREVIEW_BACKOFF + (8,) * 10:
+        if t + d > 20:
+            break
+        t += d
+        n += 1
+    assert n <= 6, f"20 秒内会发 {n} 次"
+
+
+@pytest.mark.asyncio
+async def test_probe_never_lets_telethon_sleep():
+    """被限流时必须立刻报错，不能让 Telethon 默默睡最多 60 秒。"""
+    c = SeqClient(_pending(), _page(photo=_photo()))
+    await tweet.probe_preview(c, PHOTO_TW, timeout=5, backoff=(0.01,))
+    assert c.thresholds and all(t == 0 for t in c.thresholds)
+
+
+@pytest.mark.asyncio
+async def test_flood_starts_cooldown():
+    from telethon.errors import FloodWaitError
+    c = SeqClient(FloodWaitError(request=None, capture=30))
+    with pytest.raises(FloodWaitError):
+        await tweet.probe_preview(c, PHOTO_TW, timeout=5)
+
+    c2 = SeqClient(_page(photo=_photo()))
+    with pytest.raises(tweet.ProbeUnavailable):
+        await tweet.probe_preview(c2, PHOTO_TW, timeout=5)
+    assert c2.calls == 0, "冷却期内不该再碰 user 账号"
+
+
+@pytest.mark.asyncio
+async def test_cooldown_expires(monkeypatch):
+    import time
+    monkeypatch.setattr(tweet, "_probe_blocked_until", time.monotonic() - 1)
+    c = SeqClient(_page(photo=_photo()))
+    assert await tweet.probe_preview(c, PHOTO_TW, timeout=5) == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_auto_flood_sends_preview(qdb, monkeypatch):
+    from telethon.errors import FloodWaitError
+    _use_client(monkeypatch, SeqClient(FloodWaitError(request=None, capture=30)))
+    r = _runner()
+    job, tid = await _auto_job(qdb, VIDEO_TW)
+    await r._run_tweet(job, "fast")
+    assert [c[0] for c in r.bot.calls] == ["text"], "限流时按预览发"
+    assert (await qdb.get_task(tid))["state"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_fill_sizes_sets_unknown_only(_isolate):
+    _isolate.sizes = {"https://v1": 30_000_000, "https://v2": 1000}
+    tw = Tweet("1", "J", "j", "", [WebMedia("video", "https://v1"),
+                                   WebMedia("video", "https://v2", size=77),
+                                   WebMedia("photo", "https://gone")])
+    await tweet.fill_sizes(tw)
+    assert [m.size for m in tw.media] == [30_000_000, 77, 0]
+    assert "https://v2" not in _isolate.heads, "已知大小的不该再查"
+
+
+@pytest.mark.asyncio
+async def test_fill_sizes_tolerates_network_failure(_isolate):
+    _isolate.fail = True
+    tw = Tweet("1", "J", "j", "", [WebMedia("video", "https://v")])
+    await tweet.fill_sizes(tw)
+    assert tw.media[0].size == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_head_oversize_skips_rejected_send(qdb, _isolate):
+    """HEAD 查到超过 20MB，直接走中转，不再触发一次可预见的「被拒」。"""
+    import taskqueue
+    _isolate.sizes = {"https://big.mp4": 300 * 1024 ** 2}
+    r = _runner()
+    t = Tweet("1", "J", "j", "hi", [WebMedia("video", "https://big.mp4")])
+    tid = await qdb.add_task(42, "https://x.com/j/status/1", 9, 5)
+    job = taskqueue.Job(tid, 42, "https://x.com/j/status/1", 9, 5, tweet=t)
+    await r._run_tweet(job, "fast")
+    assert r.bot.calls == [], "不该向 Telegram 发一个注定被拒的请求"
+    assert r.slow.qsize() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_head_small_still_direct(qdb, _isolate):
+    import taskqueue
+    _isolate.sizes = {"https://s.mp4": 3 * 1024 ** 2}
+    r = _runner()
+    t = Tweet("1", "J", "j", "hi", [WebMedia("video", "https://s.mp4")])
+    tid = await qdb.add_task(42, "https://x.com/j/status/1", 9, 5)
+    job = taskqueue.Job(tid, 42, "https://x.com/j/status/1", 9, 5, tweet=t)
+    await r._run_tweet(job, "fast")
+    assert [c[0] for c in r.bot.calls] == ["video"]
+
+
+@pytest.mark.asyncio
+async def test_preview_mode_does_not_head(qdb, monkeypatch, _isolate):
+    """预览模式不发媒体，查大小是白费。"""
+    import taskqueue
+    monkeypatch.setattr(tweet, "TWEET_MODE", "preview")
+    r = _runner()
+    t = Tweet("1", "J", "j", "hi", [WebMedia("video", "https://v")])
+    tid = await qdb.add_task(42, "https://x.com/j/status/1", 9, 5)
+    job = taskqueue.Job(tid, 42, "https://x.com/j/status/1", 9, 5, tweet=t)
+    await r._run_tweet(job, "fast")
+    assert _isolate.heads == []
+
+
+def test_global_flood_threshold_untouched():
+    """全局阈值不能改：上传途中碰上几秒限流应该原地等，而不是整个任务重来。"""
+    src = (Path(__file__).resolve().parent.parent / "session_pool.py").read_text()
+    assert "flood_sleep_threshold" not in src

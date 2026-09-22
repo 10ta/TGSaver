@@ -236,6 +236,20 @@ Telegram 把结果缓存下来，bot 紧接着发送时直接用缓存。
 判定失败后走的就是 `media` 模式的逻辑：先 URL 直发，被拒再中转，
 整条链路上规划不会被重置回预览。
 
+**对 user 账号尽量克制。** 预览查询是这套逻辑里唯一带「高频」特征的请求，
+所以做了三层约束：
+
+- 预览生成中时，轮询间隔按 1、2、3、5、8 秒逐渐拉长，20 秒内最多 6 次请求
+- 这类请求单独设 `flood_sleep_threshold=0`：被限流时立刻报错并按预览发送，
+  而不是让 Telethon 默默睡最多 60 秒。**只对这一种请求这么设**，上传照旧允许
+  短暂等待——否则大文件传到一半碰上几秒限流，整个任务会重下重传
+- 被限流 X 秒后进入冷却期，这 X 秒内的推文直接按预览发，不再碰 user 账号
+
+**大小预查。** 发原始媒体前，对大小未知的视频先向推特 CDN 发一个 HEAD 请求
+拿 `Content-Length`，超过 Bot API 的 URL 上限就直接走中转，不去触发一次
+可预见的「URL 直发被拒」。这个请求打的是推特，不是 Telegram，对账号没有影响；
+失败就保持未知，照旧先试后回退。
+
 `media` 模式的细节：先把 twimg 的 URL 直接交给 Telegram 服务器去拉，
 被拒时回退到本机下载、user 账号上传中转频道再复制。被拒只会发生在用户
 还什么都没收到的阶段，不会收到两份。说明挂在相册第一项上，超过 1024 字
@@ -463,6 +477,7 @@ commit 历史，等同泄露，必须去 @BotFather 用 `/revoke` 换新的。
 
 ---
 ## 补丁更新
+
 ```bash
 scp tweet-auto.patch root@你的服务器:/opt/tgsaver/
 
@@ -471,7 +486,8 @@ git pull
 git apply --check tweet-auto.patch && git apply tweet-auto.patch
 rm tweet-auto.patch
 ./git-push.sh "commit logs"
-systemctl restart tgsaver
+
+git pull; systemctl restart tgsaver; journalctl --output cat -fu tgsaver
 ```
 
 ## 测试
@@ -481,7 +497,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-317 项，覆盖：
+329 项，覆盖：
 
 - **链接解析**的全部形态，含论坛话题三段式（中间那个数字是话题 id 不是消息 id，
   这是最容易写错的地方）、`?single`、`tg://` 协议、各类非法输入
@@ -498,7 +514,8 @@ pytest -q
   HTML 转义、UTF-16 截断、URL 直发的各种媒体类型、被拒时用户未收到任何
   内容、快通道回退慢通道、已知超限跳过直发、中转路径的流式与落盘、
   auto 模式的预览判定（新旧两种协议返回、封面图不算视频、内嵌播放器不算、
-  超时、检查出错）以及判定失败后整条链路保持 media 规划
+  超时、检查出错）以及判定失败后整条链路保持 media 规划、
+  轮询退避、限流冷却、单次请求不自动等待、HEAD 预查大小
 - **命令菜单**：命令名与描述符合 Telegram 格式、无重复、管理命令不外泄、
   菜单里列出的每个命令都真的有处理函数
 - **授权模型**：准入判定、身份只有两种（残留的 admin 角色不获得特权、

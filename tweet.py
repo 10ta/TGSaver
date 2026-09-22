@@ -463,24 +463,61 @@ def judge_preview(result: Any, tw: Tweet) -> str:
     return "ok" if has_image else "missing"
 
 
+# 预览生成中时的轮询间隔（秒），逐渐拉长。大多数预览几秒内就好，快的依然快；
+# 慢的少问几次。20 秒内最多 6 次请求，固定 1.5 秒间隔的话是十几次。
+PREVIEW_BACKOFF = (1, 2, 3, 5, 8)
+
+# 预览查询被限流后，到这个时刻之前不再查询，直接按预览发送。
+_probe_blocked_until = 0.0
+
+
+class ProbeUnavailable(RuntimeError):
+    """当前不宜查询预览（限流冷却中）。调用方按「检查出错」处理：直接发预览。"""
+
+
 async def probe_preview(client: Any, tw: Tweet, timeout: float = None,
-                        on_pending: Any = None, interval: float = 1.5) -> str:
+                        on_pending: Any = None,
+                        backoff: tuple = None) -> str:
     """发送之前问 Telegram：这个链接会生成什么样的预览。
 
     和 Telegram 客户端输入链接时显示预览草稿是同一个接口。附带的好处是
     Telegram 会把结果缓存下来，bot 紧接着发送时直接用缓存。
 
     返回 ok / missing。一直是 pending 直到超时，也算 missing。
+
+    对 user 账号尽量克制：
+      - 轮询间隔按 PREVIEW_BACKOFF 逐渐拉长
+      - 单次请求 flood_sleep_threshold=0：被限流时立刻报错，而不是让
+        Telethon 默默睡最多 60 秒再重试（那样 20 秒超时就形同虚设）。
+        只对这一种请求这么设，上传照旧允许短暂等待——否则大文件
+        传到一半碰上几秒限流，整个任务会重下重传
+      - 被限流后进入冷却期，期间不再查询
     """
     import asyncio
     import time
+    from telethon.errors import FloodWaitError
     from telethon.tl.functions.messages import GetWebPagePreviewRequest
 
+    global _probe_blocked_until
+    now = time.monotonic()
+    if now < _probe_blocked_until:
+        raise ProbeUnavailable(
+            f"预览查询限流冷却中，还剩 {int(_probe_blocked_until - now)} 秒")
+
     timeout = PREVIEW_TIMEOUT if timeout is None else timeout
-    deadline = time.monotonic() + timeout
+    steps = list(backoff or PREVIEW_BACKOFF)
+    deadline = now + timeout
     notified = False
+    i = 0
     while True:
-        res = await client(GetWebPagePreviewRequest(message=tw.preview_url))
+        try:
+            res = await client(GetWebPagePreviewRequest(message=tw.preview_url),
+                               flood_sleep_threshold=0)
+        except FloodWaitError as e:
+            _probe_blocked_until = time.monotonic() + e.seconds
+            log.warning("预览查询被限流 %s 秒，期间推文直接按预览发送", e.seconds)
+            raise
+
         verdict = judge_preview(res, tw)
         if verdict != "pending":
             return verdict
@@ -493,4 +530,35 @@ async def probe_preview(client: Any, tw: Tweet, timeout: float = None,
         if left <= 0:
             log.info("预览等待超时（%ss）：%s", timeout, tw.preview_url)
             return "missing"
-        await asyncio.sleep(min(interval, left))
+        await asyncio.sleep(min(steps[min(i, len(steps) - 1)], left))
+        i += 1
+
+
+# ------------------------------------------------------------------ 大小预查
+
+async def fill_sizes(tw: Tweet, timeout: float = 5.0) -> None:
+    """对大小未知的媒体发 HEAD 请求，补上 Content-Length。
+
+    有了大小，needs_relay 就能提前判断是否超过 Bot API 的 URL 上限，
+    省掉一次「发给 Telegram -> 被拒」。HEAD 打的是推特的 CDN，
+    不是 Telegram，对你的账号没有任何影响。
+
+    失败（超时、不给长度）就保持未知，照旧先试后回退。
+    """
+    import asyncio
+
+    todo = [m for m in tw.media if not m.size]
+    if not todo:
+        return
+    http = await _api_session()
+
+    async def one(m: WebMedia) -> None:
+        try:
+            async with asyncio.timeout(timeout):
+                async with http.head(m.url, allow_redirects=True) as r:
+                    if r.status == 200 and r.content_length:
+                        m.size = int(r.content_length)
+        except Exception as e:  # noqa: BLE001
+            log.debug("HEAD 取大小失败 %s: %s", m.url, e)
+
+    await asyncio.gather(*(one(m) for m in todo))

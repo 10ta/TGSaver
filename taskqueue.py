@@ -365,6 +365,10 @@ class Runner:
             if (job.extra["mode"] == "preview" and tweet.TWEET_MODE == "auto"
                     and not job.extra.get("checked")):
                 await self._check_preview(job, tw)
+            if job.extra["mode"] in ("media", "media_long"):
+                # 大小未知的先 HEAD 一下，超限的直接走中转，
+                # 不去触发一次可预见的「URL 直发被拒」
+                await tweet.fill_sizes(tw)
             reason = tweet.needs_relay(tw, job.extra)
             if reason is None:
                 try:
