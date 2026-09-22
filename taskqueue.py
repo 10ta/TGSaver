@@ -360,7 +360,7 @@ class Runner:
         job.extra = tweet.plan(tw)
 
         if lane == "fast":
-            reason = tweet.needs_relay(tw)
+            reason = tweet.needs_relay(tw, job.extra)
             if reason is None:
                 try:
                     await sender.send_tweet_direct(
@@ -384,7 +384,7 @@ class Runner:
             return
 
         # ---------- 慢通道：服务器中转 ----------
-        if not tw.media:
+        if not tw.media or job.extra["mode"] == "preview":
             await self._deliver(job)
             return
 

@@ -88,6 +88,23 @@ async def _send_text(bot: Bot, to_chat: int, html_text: str, reply_to=None) -> N
                            link_preview_options=_NO_PREVIEW)
 
 
+async def _send_preview(bot: Bot, to_chat: int, extra: dict, reply_to=None) -> None:
+    """一条文字消息 + fxtwitter 链接预览，大图显示在正文上方。
+
+    预览地址不必出现在正文里：「原帖链接」指向 x.com，
+    预览单独用 fxtwitter，两者互不影响。
+    """
+    await bot.send_message(
+        to_chat, extra["html"], parse_mode="HTML",
+        reply_parameters=_rp(reply_to),
+        # is_disabled 必须显式给 False：不给的话 aiogram 会去取 bot 全局默认值，
+        # 哪天全局默认改成禁用预览，这里就会悄悄失效
+        link_preview_options=LinkPreviewOptions(
+            is_disabled=False, url=extra["preview_url"],
+            prefer_large_media=True, show_above_text=True),
+    )
+
+
 async def send_tweet_direct(bot: Bot, tw, extra: dict, to_chat: int,
                             reply_to: int | None) -> int:
     """快速路径：把媒体 URL 直接交给 Telegram，由它的服务器去拉。
@@ -99,6 +116,9 @@ async def send_tweet_direct(bot: Bot, tw, extra: dict, to_chat: int,
     mode = extra["mode"]
     if mode == "text":
         await _send_text(bot, to_chat, extra["html"], reply_to)
+        return 1
+    if mode == "preview":
+        await _send_preview(bot, to_chat, extra, reply_to)
         return 1
 
     cap = extra["html"] if extra.get("caption") else None
@@ -157,6 +177,9 @@ async def deliver_tweet(
     mode = extra.get("mode")
     if mode == "text":
         await _send_text(bot, to_chat, extra["html"], reply_to)
+        return 1
+    if mode == "preview":
+        await _send_preview(bot, to_chat, extra, reply_to)
         return 1
 
     if not relay_ids:

@@ -73,9 +73,8 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 <code>x.com/用户/status/123</code>
 <code>fxtwitter.com/用户/status/123</code>  twitter / vxtwitter / fixupx 等也认
 
-整理成「昵称 #ID : + 引用正文 + 原文链接」，图片视频拼成相册。
-媒体由 Telegram 服务器直接拉取，通常一秒内完成；
-超过大小限制时自动改为服务器中转。
+整理成「粗体昵称 + 引用正文 + 原帖链接 · #ID」，
+原帖的图片视频以大图预览显示在消息上方，通常一秒内完成。
 
 <b>④ 抓私聊内容</b>
 私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），

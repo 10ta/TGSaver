@@ -238,80 +238,80 @@ def test_to_hashtag(name, want):
 
 
 def test_only_id_is_tagged():
-    """昵称不再做成 hashtag，只有 ID 有。"""
     t = Tweet("1", "Russell", "Russell3402", "hi")
     html, _ = tweet.build_html(t, 4096)
-    assert "#Russell3402" in html
-    assert "#Russell " not in html and not html.startswith("#")
+    assert "#Russell3402" in html and "#Russell " not in html
 
 
 # ================================================================ 组装
 
+def _parse(html):
+    from telethon.extensions import html as tl_html
+    return tl_html.parse(html)
+
+
 def test_build_format_matches_spec():
-    t = Tweet("1", "Russell", "Russell3402", "已经到了看到价格就知道在卖什么的程度😂")
+    t = Tweet("1", "DT TAKURO", "KarenCo55187924", "がっつり見えてない?")
     html, cut = tweet.build_html(t, 4096)
     assert not cut
     assert html == (
-        "Russell #Russell3402 :\n"
-        "<blockquote>已经到了看到价格就知道在卖什么的程度😂</blockquote>\n"
-        '<a href="https://x.com/Russell3402/status/1">原文链接</a>')
+        "<b>DT TAKURO</b> :\n"
+        "<blockquote>がっつり見えてない?</blockquote>\n"
+        '<a href="https://x.com/KarenCo55187924/status/1">原帖链接</a> · #KarenCo55187924')
 
 
-def test_id_tag_follows_nickname_and_link_is_last():
-    from telethon.extensions import html as tl_html
-    from telethon.tl.types import MessageEntityTextUrl
-    t = Tweet("1", "杰克", "jack", "hi")
-    text, ents = tl_html.parse(tweet.build_html(t, 4096)[0])
-    assert text.splitlines()[0] == "杰克 #jack :"
-    assert text.splitlines()[-1] == "原文链接"
-    links = [e for e in ents if isinstance(e, MessageEntityTextUrl)]
-    assert len(links) == 1 and links[0].url == "https://x.com/jack/status/1"
+def test_nickname_fully_bold_colon_outside():
+    from telethon.tl.types import MessageEntityBold
+    text, ents = _parse(tweet.build_html(Tweet("1", "DT TAKURO", "k", "hi"), 4096)[0])
+    assert text.splitlines()[0] == "DT TAKURO :"
+    bold = [e for e in ents if isinstance(e, MessageEntityBold)]
+    assert len(bold) == 1 and (bold[0].offset, bold[0].length) == (0, len("DT TAKURO"))
 
 
-def test_nickname_line_has_colon_then_quote():
-    from telethon.extensions import html as tl_html
-    t = Tweet("1", "杰克", "jack", "line1\nline2")
-    text, ents = tl_html.parse(tweet.build_html(t, 4096)[0])
-    lines = text.splitlines()
-    assert lines[0] == "杰克 #jack :"
+def test_quote_contains_only_text():
+    text, ents = _parse(tweet.build_html(Tweet("1", "杰克", "jack", "line1\nline2"), 4096)[0])
     bq = [e for e in ents if isinstance(e, MessageEntityBlockquote)][0]
-    quoted = text.encode("utf-16-le")[bq.offset * 2:(bq.offset + bq.length) * 2]
-    assert quoted.decode("utf-16-le") == "line1\nline2"
-    q = quoted.decode("utf-16-le")
-    assert "原文链接" not in q and "#jack" not in q, "链接和 tag 必须在引用块之外"
+    q = text.encode("utf-16-le")[bq.offset * 2:(bq.offset + bq.length) * 2].decode("utf-16-le")
+    assert q == "line1\nline2"
 
 
-def test_signature_with_link(monkeypatch):
-    from telethon.extensions import html as tl_html
+def test_link_line_points_to_x():
+    from telethon.tl.types import MessageEntityTextUrl
+    text, ents = _parse(tweet.build_html(Tweet("1", "杰克", "jack", "hi"), 4096)[0])
+    assert text.splitlines()[-1] == "原帖链接 · #jack"
+    assert [e.url for e in ents if isinstance(e, MessageEntityTextUrl)] == \
+        ["https://x.com/jack/status/1"]
+
+
+def test_signature_line(monkeypatch):
     from telethon.tl.types import MessageEntityTextUrl
     monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV")
     monkeypatch.setattr(tweet, "SIGN_URL", "https://t.me/optv4")
-    text, ents = tl_html.parse(tweet.build_html(Tweet("1", "杰克", "jack", "hi"), 4096)[0])
-    assert text.splitlines()[-1] == "原文链接 @欧派TV"
-    urls = [e.url for e in ents if isinstance(e, MessageEntityTextUrl)]
-    assert urls == ["https://x.com/jack/status/1", "https://t.me/optv4"]
+    text, ents = _parse(tweet.build_html(Tweet("1", "杰克", "jack", "hi"), 4096)[0])
+    assert text.endswith("原帖链接 · #jack\n\nvia @欧派TV"), "署名前要空一行"
+    assert [e.url for e in ents if isinstance(e, MessageEntityTextUrl)] == \
+        ["https://x.com/jack/status/1", "https://t.me/optv4"]
 
 
 def test_signature_text_only(monkeypatch):
     monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV")
     monkeypatch.setattr(tweet, "SIGN_URL", "")
     html, _ = tweet.build_html(Tweet("1", "J", "j", "hi"), 4096)
-    assert html.splitlines()[-1].endswith("</a> @欧派TV")
+    assert html.endswith("\n\nvia @欧派TV")
 
 
 def test_signature_absent_by_default():
     """公开仓库默认不带任何人的署名。"""
     assert tweet.SIGN_TEXT == "" and tweet.SIGN_URL == ""
     html, _ = tweet.build_html(Tweet("1", "J", "j", "hi"), 4096)
-    assert html.splitlines()[-1] == '<a href="https://x.com/j/status/1">原文链接</a>'
+    assert "via" not in html and not html.endswith("\n")
 
 
 def test_signature_counted_in_length(monkeypatch):
-    from telethon.extensions import html as tl_html
     monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV" * 5)
     monkeypatch.setattr(tweet, "SIGN_URL", "https://t.me/optv4")
     html, cut = tweet.build_html(Tweet("1", "J", "j", "字" * 3000), 1024)
-    assert cut and tweet.utf16_len(tl_html.parse(html)[0]) <= 1024
+    assert cut and tweet.utf16_len(_parse(html)[0]) <= 1024
 
 
 def test_signature_escaped(monkeypatch):
@@ -326,46 +326,71 @@ def test_build_escapes_html():
     t = Tweet("1", "A<b>", "a", "1 < 2 & <script>")
     html, _ = tweet.build_html(t, 4096)
     assert "<script>" not in html and "&lt;script&gt;" in html
-    assert html.startswith("A&lt;b&gt; #a :")
+    assert html.startswith("<b>A&lt;b&gt;</b> :")
 
 
 def test_build_without_text():
-    t = Tweet("1", "杰克", "jack", "")
-    html, _ = tweet.build_html(t, 4096)
+    html, _ = tweet.build_html(Tweet("1", "杰克", "jack", ""), 4096)
     assert "blockquote" not in html
-    assert html.splitlines() == ["杰克 #jack :", '<a href="https://x.com/jack/status/1">原文链接</a>']
+    assert html.splitlines() == ["<b>杰克</b> :",
+                                 '<a href="https://x.com/jack/status/1">原帖链接</a> · #jack']
 
 
 def test_falls_back_to_screen_name_when_no_nickname():
-    t = Tweet("1", "", "jack", "hi")
-    assert tweet.build_html(t, 4096)[0].startswith("jack #jack :")
+    assert tweet.build_html(Tweet("1", "", "jack", "hi"), 4096)[0].startswith("<b>jack</b> :")
 
 
 def test_link_url_not_counted_in_length():
-    """超链接的 URL 不计入长度，只有「原文链接」四个字算。"""
-    from telethon.extensions import html as tl_html
     t = Tweet("1", "J", "j", "字" * 2000)
     html, cut = tweet.build_html(t, 1024)
     assert cut
-    text, _ = tl_html.parse(html)
-    n = tweet.utf16_len(text)
-    assert n <= 1024
-    assert n >= 1020, f"预算算得太保守，只用了 {n}"
+    n = tweet.utf16_len(_parse(html)[0])
+    assert 1020 <= n <= 1024, f"预算不准：{n}"
 
 
 def test_truncation_counts_emoji_as_two():
-    from telethon.extensions import html as tl_html
-    t = Tweet("1", "Jack", "jack", "😀" * 1000)
-    html, cut = tweet.build_html(t, 1024)
-    assert cut
-    assert tweet.utf16_len(tl_html.parse(html)[0]) <= 1024
+    html, cut = tweet.build_html(Tweet("1", "Jack", "jack", "😀" * 1000), 1024)
+    assert cut and tweet.utf16_len(_parse(html)[0]) <= 1024
 
 
 def test_no_truncation_when_fits():
     assert not tweet.build_html(Tweet("1", "J", "j", "short"), 1024)[1]
 
 
+def test_preview_url_uses_fxtwitter():
+    t = Tweet("123", "J", "jack", "")
+    assert t.preview_url == "https://fxtwitter.com/jack/status/123"
+    assert t.url == "https://x.com/jack/status/123"
+
+
 # ================================================================ 形态规划
+
+@pytest.fixture
+def media_mode(monkeypatch):
+    """TWEET_MODE=media：真正发送媒体的那套逻辑。"""
+    monkeypatch.setattr(tweet, "TWEET_MODE", "media")
+
+
+def test_default_mode_is_preview():
+    assert tweet.TWEET_MODE == "preview"
+
+
+def test_plan_preview_for_media():
+    p = tweet.plan(Tweet("1", "J", "j", "hi", [WebMedia("photo", "https://u")]))
+    assert p["mode"] == "preview"
+    assert p["preview_url"] == "https://fxtwitter.com/j/status/1"
+
+
+def test_plan_preview_even_for_huge_video():
+    """预览模式不发媒体，大小限制根本不相关，永远不需要中转。"""
+    t = Tweet("1", "J", "j", "hi", [WebMedia("video", "https://u", size=999 * 1024 ** 2)])
+    p = tweet.plan(t)
+    assert p["mode"] == "preview" and tweet.needs_relay(t, p) is None
+
+
+def test_text_only_has_no_preview():
+    """纯文字推文不开预览：预览卡片只会把正文再显示一遍。"""
+    assert tweet.plan(Tweet("1", "J", "j", "hi"))["mode"] == "text"
 
 def _m(k="photo", size=0):
     return WebMedia(k, "https://u", size=size)
@@ -376,23 +401,27 @@ def test_plan_text_only():
     assert p["mode"] == "text" and p["kind"] == "tweet"
 
 
+@pytest.mark.usefixtures("media_mode")
 def test_plan_single_media_has_caption():
     p = tweet.plan(Tweet("1", "J", "j", "hi", [_m()]))
     assert p["mode"] == "media" and p["caption"] is True
 
 
+@pytest.mark.usefixtures("media_mode")
 def test_plan_album_also_has_caption():
     """去掉按钮后，相册的说明可以直接挂在第一项上。"""
     p = tweet.plan(Tweet("1", "J", "j", "hi", [_m(), _m("video")]))
     assert p["mode"] == "media" and p["caption"] is True
 
 
+@pytest.mark.usefixtures("media_mode")
 def test_plan_long_text():
     p = tweet.plan(Tweet("1", "J", "j", "x" * 2000, [_m(), _m()]))
     assert p["mode"] == "media_long" and p["caption"] is False
     assert "…" not in p["html"]
 
 
+@pytest.mark.usefixtures("media_mode")
 def test_plan_is_json_serializable():
     import json
     p = tweet.plan(Tweet("1", "J", "j", "hi <&>", [_m(), _m()]))
@@ -409,8 +438,10 @@ def test_plan_is_json_serializable():
     ([_m("gif")], False),
     ([_m("gif"), _m("photo")], True),              # 动图进不了相册
 ])
+@pytest.mark.usefixtures("media_mode")
 def test_needs_relay(media, expect_relay):
-    assert (tweet.needs_relay(Tweet("1", "J", "j", "", media)) is not None) is expect_relay
+    t = Tweet("1", "J", "j", "", media)
+    assert (tweet.needs_relay(t, tweet.plan(t)) is not None) is expect_relay
 
 
 def test_video_size_captured_from_best_format():
@@ -472,6 +503,44 @@ def _no_buttons(bot):
 
 
 @pytest.mark.asyncio
+async def test_direct_preview_options():
+    import sender
+    bot = FakeBot()
+    t = Tweet("1", "J", "j", "hi", [WebMedia("photo", "https://a"), WebMedia("video", "https://b")])
+    await sender.send_tweet_direct(bot, t, tweet.plan(t), 9, 5)
+    assert [c[0] for c in bot.calls] == ["text"], "预览模式只发一条消息，不发媒体"
+    kw = bot.calls[0][2]
+    lp = kw["link_preview_options"]
+    assert lp.url == "https://fxtwitter.com/j/status/1"
+    assert lp.prefer_large_media is True and lp.show_above_text is True
+    assert not lp.is_disabled
+    assert kw["reply_parameters"].message_id == 5
+
+
+@pytest.mark.asyncio
+async def test_relay_path_also_handles_preview():
+    """重启后从库里恢复的预览任务走 deliver_tweet，也得能发。"""
+    import sender
+    bot = FakeBot()
+    t = Tweet("1", "J", "j", "hi", [WebMedia("photo", "https://a")])
+    await sender.deliver_tweet(bot, None, None, tweet.plan(t), 9, 5)
+    assert bot.calls[0][2]["link_preview_options"].show_above_text
+
+
+@pytest.mark.asyncio
+async def test_preview_fast_path_never_relays(qdb):
+    import taskqueue
+    r = _runner()
+    t = Tweet("1", "J", "j", "hi", [WebMedia("video", "https://big", size=500 * 1024 ** 2)])
+    tid = await qdb.add_task(42, "https://x.com/j/status/1", 9, 5)
+    job = taskqueue.Job(tid, 42, "https://x.com/j/status/1", 9, 5, tweet=t)
+    await r._run_tweet(job, "fast")
+    assert [c[0] for c in r.bot.calls] == ["text"]
+    assert r.slow.empty()
+    assert (await qdb.get_task(tid))["state"] == "done"
+
+
+@pytest.mark.asyncio
 async def test_direct_text():
     import sender
     bot = FakeBot()
@@ -482,6 +551,7 @@ async def test_direct_text():
     assert _no_buttons(bot)
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_direct_single_photo_by_url():
     """媒体交给 Telegram 按 URL 拉，不经过本机。"""
@@ -496,6 +566,7 @@ async def test_direct_single_photo_by_url():
     assert len(bot.calls) == 1 and _no_buttons(bot)
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_direct_video_carries_dimensions():
     import sender
@@ -507,6 +578,7 @@ async def test_direct_video_carries_dimensions():
     assert kw["supports_streaming"]
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_direct_gif_as_animation():
     import sender
@@ -516,6 +588,7 @@ async def test_direct_gif_as_animation():
     assert bot.calls[0][0] == "animation"
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_direct_album_caption_on_first_only():
     import sender
@@ -529,6 +602,7 @@ async def test_direct_album_caption_on_first_only():
     assert all(g.caption is None for g in group[1:])
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_direct_long_text_follows_media():
     import sender
@@ -540,6 +614,7 @@ async def test_direct_long_text_follows_media():
     assert getattr(bot.calls[0][1][0], "caption", None) is None
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_direct_rejection_raises_url_rejected():
     import sender
@@ -550,6 +625,7 @@ async def test_direct_rejection_raises_url_rejected():
     assert bot.calls == [], "被拒时用户什么都不该收到，才能安全回退"
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_relay_delivery_album_uses_copy_messages():
     import sender
@@ -559,6 +635,7 @@ async def test_relay_delivery_album_uses_copy_messages():
     assert [c[0] for c in bot.calls] == ["copies"]
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_relay_delivery_split_copies_individually():
     import sender
@@ -569,6 +646,7 @@ async def test_relay_delivery_split_copies_individually():
     assert [c[0] for c in bot.calls] == ["copy", "copy"]
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_relay_delivery_long_appends_text():
     import sender
@@ -818,6 +896,7 @@ async def qdb(tmp_path):
     await db.close()
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_fast_path_completes_without_relay(qdb, monkeypatch):
     import taskqueue
@@ -832,6 +911,7 @@ async def test_fast_path_completes_without_relay(qdb, monkeypatch):
     assert (await qdb.get_task(tid))["state"] == "done"
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_rejected_falls_back_to_slow(qdb):
     import taskqueue
@@ -850,6 +930,7 @@ async def test_rejected_falls_back_to_slow(qdb):
     assert row["lane"] == "slow" and row["extra"]
 
 
+@pytest.mark.usefixtures("media_mode")
 @pytest.mark.asyncio
 async def test_known_oversize_skips_direct_attempt(qdb):
     """已知超限就别白发一次必然失败的请求。"""

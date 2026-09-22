@@ -27,9 +27,16 @@ from streamer import WebMedia
 log = logging.getLogger("tweet")
 
 FXTWITTER_API = os.getenv("FXTWITTER_API", "https://api.fxtwitter.com").rstrip("/")
-LINK_TEXT = "原文链接"
+LINK_TEXT = "原帖链接"
 
-# 末行「原文链接」旁边的署名，比如你自己频道的链接。两项都留空则不显示；
+# 呈现方式：
+#   preview  一条文字消息 + fxtwitter 链接预览（大图置顶）。最快、零流量、
+#            无大小限制；但多图会变成 fxtwitter 合成的拼图，媒体不是独立副本
+#   media    真正发送图片视频（URL 直发，超限回退中转）。可单独保存每张图
+TWEET_MODE = os.getenv("TWEET_MODE", "preview").strip().lower()
+FX_HOST = os.getenv("FXTWITTER_HOST", "fxtwitter.com").strip()
+
+# 末尾 "via 署名" 那一行，比如你自己频道的链接。两项都留空则不显示；
 # 只填文字不填链接则显示为纯文字。写在 .env 里而不是代码里，
 # 这样公开仓库被别人 clone 时不会带上你的频道。
 SIGN_TEXT = os.getenv("TWEET_SIGNATURE_TEXT", "").strip()
@@ -108,9 +115,15 @@ class Tweet:
 
     @property
     def url(self) -> str:
-        """按钮指向的原帖，统一用 x.com。"""
+        """「原帖链接」指向的原帖，统一用 x.com。"""
         user = self.screen_name or "i"
         return f"https://x.com/{user}/status/{self.id}"
+
+    @property
+    def preview_url(self) -> str:
+        """交给 Telegram 生成预览的地址。fxtwitter 专门为预览优化过。"""
+        user = self.screen_name or "i"
+        return f"https://{FX_HOST}/{user}/status/{self.id}"
 
 
 _TOMBSTONE = {
@@ -298,9 +311,11 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     """组装消息 HTML。超长时截断正文，返回 (html, 是否截断)。
 
     格式：
-        昵称 #ID :
+        <b>昵称</b> :
         <blockquote>正文</blockquote>
-        <a href="原帖">原文链接</a> <a href="署名链接">署名</a>
+        <a href="原帖">原帖链接</a> · #ID
+
+        via <a href="署名链接">署名</a>
 
     超链接的 URL 不计入 Telegram 的长度限制，只有显示文字算。
     """
@@ -308,11 +323,13 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     tag = id_tag(tw)
     text = tw.text.strip()
 
-    head_plain = name + (f" {tag}" if tag else "") + " :"
-    last_plain = LINK_TEXT + (f" {SIGN_TEXT}" if SIGN_TEXT else "")
-    overhead = utf16_len(head_plain) + 1 + utf16_len(last_plain)  # 末行前换行
+    head_plain = f"{name} :"
+    last_plain = LINK_TEXT + (f" · {tag}" if tag else "")
+    sign_plain = f"\n\nvia {SIGN_TEXT}" if SIGN_TEXT else ""
+    overhead = (utf16_len(head_plain) + 1 + utf16_len(last_plain)
+                + utf16_len(sign_plain))
     if text:
-        overhead += 1                                             # 正文前换行
+        overhead += 1
     budget = max(limit - overhead, 0)
 
     truncated = False
@@ -320,50 +337,55 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
         truncated = True
         text = _cut_utf16(text, max(budget - 1, 0)).rstrip() + "…"
 
-    head = html.escape(name, quote=False)
-    if tag:
-        head += " " + html.escape(tag, quote=False)
-    head += " :"
-    parts = [head]
+    parts = [f"<b>{html.escape(name, quote=False)}</b> :"]
     if text:
         parts.append(f"<blockquote>{html.escape(text, quote=False)}</blockquote>")
     last = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
+    if tag:
+        last += " · " + html.escape(tag, quote=False)
+    parts.append(last)
     if SIGN_TEXT:
         sign = html.escape(SIGN_TEXT, quote=False)
         if SIGN_URL:
             sign = f'<a href="{html.escape(SIGN_URL, quote=True)}">{sign}</a>'
-        last += " " + sign
-    parts.append(last)
+        parts += ["", f"via {sign}"]
     return "\n".join(parts), truncated
 
 
 def plan(tw: Tweet) -> dict:
     """决定呈现形态，返回可以直接落库的描述。
 
-    text        纯文字，一条消息
-    media       有媒体，说明挂在第一项上（单个媒体或相册都一样）
-    media_long  说明超过 1024，媒体不带说明，后面另跟一条文字消息
+    text        纯文字推文，一条消息，不带预览（预览只会把正文再显示一遍）
+    preview     有媒体，TWEET_MODE=preview：一条消息 + 置顶大图预览
+    media       有媒体，TWEET_MODE=media：媒体带说明（单个或相册）
+    media_long  同上但说明超过 1024，媒体后面另跟一条文字
     """
+    base = {"kind": "tweet", "url": tw.url, "preview_url": tw.preview_url}
+
     if not tw.media:
         body, _ = build_html(tw, TEXT_LIMIT)
-        return {"kind": "tweet", "mode": "text", "html": body, "url": tw.url,
-                "caption": False}
+        return {**base, "mode": "text", "html": body, "caption": False}
+
+    if TWEET_MODE != "media":
+        body, _ = build_html(tw, TEXT_LIMIT)
+        return {**base, "mode": "preview", "html": body, "caption": False}
 
     cap, cut = build_html(tw, CAPTION_LIMIT)
     if not cut:
-        return {"kind": "tweet", "mode": "media", "html": cap, "url": tw.url,
-                "caption": True}
+        return {**base, "mode": "media", "html": cap, "caption": True}
     body, _ = build_html(tw, TEXT_LIMIT)
-    return {"kind": "tweet", "mode": "media_long", "html": body, "url": tw.url,
-            "caption": False}
+    return {**base, "mode": "media_long", "html": body, "caption": False}
 
 
-def needs_relay(tw: Tweet) -> str | None:
-    """这条推文能否直接按 URL 交给 Telegram。能就返回 None，否则返回原因。
+def needs_relay(tw: Tweet, extra: dict | None = None) -> str | None:
+    """这条推文能否直接由 bot 发出。能就返回 None，否则返回原因。
 
-    已知大小时提前判断，省一次必然失败的请求；大小未知就先试，
-    Telegram 拒收后再回退。
+    文字和预览两种形态只发一条文字消息，永远不需要中转。
+    媒体形态下，已知大小时提前判断，省一次必然失败的请求；
+    大小未知就先试，Telegram 拒收后再回退。
     """
+    if extra and extra.get("mode") in ("text", "preview"):
+        return None
     if len(tw.media) > 1 and any(m.kind == "gif" for m in tw.media):
         return "动图不能放进相册"
     for m in tw.media:

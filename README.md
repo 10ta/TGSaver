@@ -194,64 +194,60 @@ https://fxtwitter.com/用户/status/123
 `twitter.com` / `vxtwitter` / `fixupx` / `fixvx`、`/i/status/`、
 带 `/photo/1` 或 `?s=46` 这类尾巴的都认，同一条帖子贴多次只处理一次。
 
-数据经 [FxEmbed](https://github.com/FxEmbed/FxEmbed) 的 JSON API
-（`api.fxtwitter.com/2/status/{id}`）获取，整理成：
+正文数据经 [FxEmbed](https://github.com/FxEmbed/FxEmbed) 的 JSON API
+（`api.fxtwitter.com/2/status/{id}`）获取，组装成：
 
 ```
-用户昵称 #用户ID :
+┌──────────────────────┐
+│  原帖图片 / 视频大图预览  │   ← fxtwitter 链接预览，显示在正文上方
+└──────────────────────┘
+**用户昵称** :
 ┃ 帖子正文（引用块）
-原文链接 @署名          ← 两个都是超链接；署名可选，见下
+原帖链接 · #用户ID          ← 「原帖链接」指向 x.com 原帖
+
+via @署名                  ← 可选，见下
 ```
 
-图片视频拼成相册，说明挂在第一项上。
+#### 两种呈现方式
 
-#### 两段式：先让 Telegram 自己拉，拉不动再中转
+由 `.env` 里的 `TWEET_MODE` 决定：
 
-Telegram 渲染 fxtwitter 链接预览之所以毫秒级，是因为媒体由 **Telegram
-服务器自己去 twimg 拉**，不经过发链接的人。Bot API 同样支持：
-`sendPhoto` / `sendMediaGroup` 直接传 URL 即可。所以：
+| | `preview`（默认） | `media` |
+|---|---|---|
+| 做法 | 一条文字消息 + fxtwitter 链接预览 | 真正发送图片视频 |
+| 速度 | 最快，只发一条文字 | 通常 < 1 秒，超限时回退中转 |
+| 本机流量 | 0 | 通常 0，回退时 2× |
+| 大小限制 | 无 | URL 直发照片 5MB / 视频 20MB，超了走中转 |
+| 多图 | fxtwitter 合成的一张拼图 | 独立相册，每张可单独保存 |
+| 媒体是否独立副本 | 否，是 Telegram 抓取后缓存的预览 | 是 |
 
-| 通道 | 做法 | 速度 | 本机流量 |
-|---|---|---|---|
-| 快 | 把 twimg 的 URL 直接交给 Telegram | 通常 < 1 秒 | 0 |
-| 慢 | 本机下载 → user 账号上传中转频道 → bot 复制 | 取决于大小 | 2× |
+`preview` 模式下，预览地址用 `link_preview_options.url` 单独指定，
+不必出现在正文里，所以「原帖链接」仍然指向 x.com。纯文字推文不开预览，
+否则预览卡片只会把正文再显示一遍。
 
-Bot API 对 URL 有大小限制（照片 5MB、视频 20MB）。已知超限时直接走慢通道，
-省一次必然失败的请求；大小未知就先试，Telegram 拒收再回退。回退时推文
-数据随任务带过去，不必再请求一次 API。
-
-被拒只会发生在「用户还什么都没收到」的阶段，所以回退不会出现收到两份的情况。
-「媒体 + 长文字」形态下，媒体一旦送达，后面的文字发送失败就不再回退。
-
-快通道不发「已排队」提示——直发通常不到一秒，先发一条再删反而让结果出现得更慢。
-只有回退到中转时才显示进度。API 连接会复用，省掉每次的 TLS 握手。
-
-**为什么不直接用链接预览 / Instant View？** 那是 Telegram 实时抓取的，
-原帖一删预览就没了。归档要持有实际内容，所以媒体仍然真正发出来，
-只是让 Telegram 服务器代劳搬运。
+`media` 模式的细节：先把 twimg 的 URL 直接交给 Telegram 服务器去拉
+（和 Telegram 渲染链接预览是同一个机制），被拒时回退到本机下载、
+user 账号上传中转频道再复制。被拒只会发生在用户还什么都没收到的阶段，
+不会收到两份。说明挂在相册第一项上，超过 1024 字时拆成「媒体 + 文字」两条。
 
 #### 其他细节
 
-- 说明挂第一项时受 1024 字限制，超了变成「媒体 + 一条文字消息」；
-  纯文字上限 4096，再长截断加省略号。长度按 UTF-16 算，emoji 占 2 个；
+- 纯文字消息上限 4096，超长截断加省略号。长度按 UTF-16 算，emoji 占 2 个；
   超链接的 URL 本身不计入长度
-- ID 里的非法字符替换成下划线后做成 hashtag
-- 图片取推特图床的 `4096x4096` 规格而不是 `orig`——原图偶尔超过
-  Telegram 照片的尺寸限制
-- 视频挑 **h264** 的最高码率 mp4；hevc / av1 部分客户端播不了
+- 图片取推特图床的 `4096x4096` 规格；视频挑 **h264** 的最高码率 mp4
 - 帖子被删、账号冻结、受保护时直接报原因，不重试
 
-自建了 FxEmbed 实例的话，改 `.env` 里的 `FXTWITTER_API`。
-
-末行「原文链接」旁边可以加一个署名（比如你自己的频道），在 `.env` 里配：
+#### 可选配置
 
 ```
-TWEET_SIGNATURE_TEXT=@你的频道
-TWEET_SIGNATURE_URL=https://t.me/your_channel
+TWEET_MODE=preview                      # 或 media
+TWEET_SIGNATURE_TEXT=@你的频道           # 末尾 "via 署名" 那一行，留空不显示
+TWEET_SIGNATURE_URL=https://t.me/xxx
+FXTWITTER_API=https://api.fxtwitter.com # 自建 FxEmbed 实例时改这里
+FXTWITTER_HOST=fxtwitter.com            # 生成预览用的域名
 ```
 
-两项都留空则不显示；只填文字则显示为纯文字。默认为空，
-所以公开仓库被别人 clone 时不会带上你的频道。
+署名默认为空，所以公开仓库被别人 clone 时不会带上你的频道。
 
 ### 私聊内容：发对话地址
 
@@ -327,7 +323,7 @@ https://t.me/chan/123 nosp
 
 ```
 t.me/频道/123      发消息链接即可，无需命令
-x.com/用户/status/1 发推文链接，整理成昵称 + 引用 + 相册 + 原文链接
+x.com/用户/status/1 发推文链接，整理成昵称 + 引用 + 大图预览 + 原帖链接
 t.me/频道/123 nosp 加 nosp 去掉剧透遮罩（会重传）
 t.me/对话名 5      抓私聊内容（没有消息链接的用这个）
 
@@ -462,7 +458,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-143 项，覆盖：
+294 项，覆盖：
 
 - **链接解析**的全部形态，含论坛话题三段式（中间那个数字是话题 id 不是消息 id，
   这是最容易写错的地方）、`?single`、`tg://` 协议、各类非法输入
