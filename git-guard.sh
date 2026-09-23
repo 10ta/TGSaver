@@ -162,9 +162,18 @@ guard_review() {
     printf "\n%s(--yes 已指定，跳过确认)%s\n" "$DIM" "$RST"
     return 0
   fi
+  # 先清掉输入缓冲里残留的东西。有些终端会主动往输入里塞控制序列
+  # （比如深浅色主题通知 ESC[?997;1n），不清掉会和你按的 y 混在一起。
+  while read -r -t 0.05 -n 256 _ 2>/dev/null; do :; done
+
   printf "\n确认无误？[y/N] "
   read -r ans
-  [ "$ans" = "y" ] || [ "$ans" = "Y" ] || die "已取消。"
+  # 提示之后到来的控制序列也可能混进来，剥掉再判断
+  ans=$(printf '%s' "$ans" | sed $'s/\033\\[[0-9;?]*[A-Za-z]//g' | tr -d '[:space:]')
+  case "$ans" in
+    y|Y|yes|Yes|YES) ;;
+    *) die "已取消（收到的输入：$(printf '%q' "$ans")）。" ;;
+  esac
 }
 
 # ------------------------------------------------------------
