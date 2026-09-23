@@ -1411,3 +1411,299 @@ def test_global_flood_threshold_untouched():
     """全局阈值不能改：上传途中碰上几秒限流应该原地等，而不是整个任务重来。"""
     src = (Path(__file__).resolve().parent.parent / "session_pool.py").read_text()
     assert "flood_sleep_threshold" not in src
+
+
+# ================================================================ 多条合并
+
+def _tw_with(n_media, name="J", sid="j", text="hi", tid="1"):
+    return Tweet(tid, name, sid, text, [WebMedia("photo", f"p{i}") for i in range(n_media)])
+
+
+def _plain(html_str):
+    from telethon.extensions import html as tl_html
+    return tl_html.parse(html_str)[0]
+
+
+def test_batch_format_matches_screenshot():
+    a = _tw_with(1, "微濕的貓", "ccxxyi73", "今天心情不美麗", "11")
+    b = _tw_with(3, "恶霸兔", "xingxing_alan", "666", "22")
+    extra, media = tweet.plan_batch([a, b])
+    assert extra["mode"] == "media" and extra["batch"] and len(media) == 4
+    assert _plain(extra["html"]).splitlines() == [
+        "微濕的貓 1 : 今天心情不美麗",
+        "恶霸兔 2-4 : 666",
+        "原帖链接 1 · #ccxxyi73",
+        "原帖链接 2-4 · #xingxing_alan",
+    ]
+
+
+def test_batch_numbers_have_spaces_around():
+    """序号与昵称、冒号、原帖链接、点号之间都留一个空格。"""
+    extra, _ = tweet.plan_batch([_tw_with(1), _tw_with(2)])
+    lines = _plain(extra["html"]).splitlines()
+    assert lines[0].startswith("J 1 : ") and lines[1].startswith("J 2-3 : ")
+    assert lines[2] == "原帖链接 1 · #j" and lines[3] == "原帖链接 2-3 · #j"
+
+
+def test_batch_media_order_follows_links():
+    a = Tweet("1", "A", "a", "", [WebMedia("photo", "a1")])
+    b = Tweet("2", "B", "b", "", [WebMedia("video", "b1"), WebMedia("photo", "b2")])
+    _, media = tweet.plan_batch([a, b])
+    assert [m.url for m in media] == ["a1", "b1", "b2"]
+
+
+def test_batch_text_only_tweet_has_no_number():
+    a = _tw_with(1, "A", "a")
+    b = Tweet("2", "B", "b", "纯文字", [])
+    extra, media = tweet.plan_batch([a, b])
+    assert len(media) == 1
+    lines = _plain(extra["html"]).splitlines()
+    assert lines[0].startswith("A 1 : ") and lines[1] == "B : 纯文字"
+    assert lines[3] == "原帖链接 · #b", "没有媒体就没有序号"
+
+
+def test_batch_all_text_only_becomes_text_message():
+    extra, media = tweet.plan_batch([_tw_with(0, "A", "a"), _tw_with(0, "B", "b")])
+    assert extra["mode"] == "text" and media == []
+
+
+def test_batch_skip_note():
+    extra, _ = tweet.plan_batch([_tw_with(1)], skipped=2)
+    assert "其中 2 条未能取到" in _plain(extra["html"])
+
+
+def test_batch_no_note_when_nothing_skipped():
+    extra, _ = tweet.plan_batch([_tw_with(1)])
+    assert "未能取到" not in extra["html"]
+
+
+def test_batch_escapes_and_signature(monkeypatch):
+    monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV")
+    monkeypatch.setattr(tweet, "SIGN_URL", "https://t.me/optv4")
+    extra, _ = tweet.plan_batch([_tw_with(1, "A<b>", "a", "1 < 2")])
+    assert "&lt;b&gt;" in extra["html"] and "<script" not in extra["html"]
+    assert _plain(extra["html"]).endswith("\n\nvia @欧派TV")
+
+
+def test_batch_nickname_containing_link_text_survives():
+    """昵称里正好有「原帖链接」四个字时也不能拼错。"""
+    extra, _ = tweet.plan_batch([_tw_with(1, "原帖链接君", "x")])
+    lines = _plain(extra["html"]).splitlines()
+    assert lines[0].startswith("原帖链接君 1 : ")
+    assert lines[1] == "原帖链接 1 · #x"
+
+
+# ---------------------------------------------------------------- 长度预算
+
+def test_batch_caption_never_exceeds_1024():
+    tws = [_tw_with(1, f"N{i}", f"s{i}", "字" * 900, str(i)) for i in range(3)]
+    extra, _ = tweet.plan_batch(tws)
+    assert extra["mode"] == "media" and extra["caption"]
+    assert tweet.utf16_len(_plain(extra["html"])) <= 1024
+
+
+def test_batch_truncation_is_fair():
+    """短正文原样保留，只削长的，不能让一条长推把别人挤没。"""
+    tws = [_tw_with(1, "A", "a", "短句", "1"),
+           _tw_with(1, "B", "b", "字" * 2000, "2")]
+    extra, _ = tweet.plan_batch(tws)
+    lines = _plain(extra["html"]).splitlines()
+    assert lines[0] == "A 1 : 短句", "短的不该被动"
+    assert lines[1].endswith("…") and len(lines[1]) > 100
+
+
+def test_fair_caps_algorithm():
+    assert tweet._fair_caps([10, 20, 30], 100) == [10, 20, 30]
+    assert tweet._fair_caps([10, 100], 60) == [10, 50]
+    assert tweet._fair_caps([50, 50], 60) == [30, 30]
+    assert tweet._fair_caps([10, 20], 0) == [0, 0]
+    assert tweet._fair_caps([10, 20], -5) == [0, 0]
+
+
+def test_batch_falls_back_when_fixed_part_too_long():
+    """条目太多，正文削到 0 仍装不下，改成媒体 + 另发一条文字。"""
+    tws = [_tw_with(1, f"很长的昵称第{i}号", f"screenname{i}", "正文", str(i))
+           for i in range(30)]
+    extra, media = tweet.plan_batch(tws)
+    assert extra["mode"] == "media_long" and extra["caption"] is False
+    assert len(media) == 30
+
+
+# ---------------------------------------------------------------- 切分
+
+def _pairs(counts):
+    return [(f"https://x.com/u/status/{i}", _tw_with(n, tid=str(i)))
+            for i, n in enumerate(counts)]
+
+
+@pytest.mark.parametrize("counts,take_n,rest_n", [
+    ([1, 3], 2, 0),
+    ([4, 4, 4], 2, 1),          # 8 个够，再加 4 个就超 10
+    ([4, 4, 4, 4], 2, 2),
+    ([10, 1], 1, 1),
+    ([1] * 10, 10, 0),
+    ([1] * 12, 10, 2),
+    ([0, 0, 4], 3, 0),          # 纯文字不占媒体位
+])
+def test_split_by_media_count(counts, take_n, rest_n):
+    take, rest = tweet.split_batch(_pairs(counts))
+    assert (len(take), len(rest)) == (take_n, rest_n)
+    assert sum(len(t.media) for _, t in take) <= tweet.ALBUM_MAX
+
+
+def test_split_keeps_one_tweet_media_together():
+    """一条推文的媒体不会被拆到两条消息里。"""
+    take, rest = tweet.split_batch(_pairs([9, 3]))
+    assert len(take) == 1 and len(rest) == 1
+
+
+def test_split_order_preserved():
+    pairs = _pairs([4, 4, 4])
+    take, rest = tweet.split_batch(pairs)
+    assert take + rest == pairs
+
+
+# ---------------------------------------------------------------- 调度
+
+class BatchClient(SeqClient):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_batch_sends_one_album(qdb, monkeypatch):
+    import taskqueue
+    tws = {"11": _tw_with(1, "A", "a", "x", "11"), "22": _tw_with(3, "B", "b", "y", "22")}
+
+    async def fake_fetch(ref):
+        return tws[ref.id]
+    monkeypatch.setattr(tweet, "fetch", fake_fetch)
+
+    r = _runner()
+    link = "https://x.com/a/status/11 https://x.com/b/status/22"
+    tid = await qdb.add_task(42, link, 9, 5)
+    await r._run_tweet(taskqueue.Job(tid, 42, link, 9, 5), "fast")
+
+    assert [c[0] for c in r.bot.calls] == ["group"]
+    group = r.bot.calls[0][1]
+    assert len(group) == 4, "两条推文的媒体合成一个相册"
+    assert "<b>A</b> 1 :" in group[0].caption
+    assert "<b>B</b> 2-4 :" in group[0].caption
+    assert all(g.caption is None for g in group[1:]), "说明只挂第一项"
+    assert (await qdb.get_task(tid))["state"] == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_batch_skips_failed_and_notes_it(qdb, monkeypatch):
+    async def fake_fetch(ref):
+        if ref.id == "22":
+            raise tweet.TweetError("帖子已被删除")
+        return _tw_with(1, "A", "a", "x", ref.id)
+    monkeypatch.setattr(tweet, "fetch", fake_fetch)
+
+    import taskqueue
+    r = _runner()
+    link = " ".join(f"https://x.com/u/status/{i}" for i in (11, 22, 33))
+    tid = await qdb.add_task(42, link, 9, 5)
+    await r._run_tweet(taskqueue.Job(tid, 42, link, 9, 5), "fast")
+
+    cap = r.bot.calls[0][1][0].caption
+    assert "其中 1 条未能取到" in cap
+    assert cap.count("原帖链接") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_batch_all_failed_is_fatal(qdb, monkeypatch):
+    async def fake_fetch(ref):
+        raise tweet.TweetError("没了")
+    monkeypatch.setattr(tweet, "fetch", fake_fetch)
+
+    import taskqueue
+    r = _runner()
+    link = "https://x.com/u/status/11 https://x.com/u/status/22"
+    tid = await qdb.add_task(42, link, 9, 5)
+    with pytest.raises(tweet.TweetError, match="全部取不到"):
+        await r._run_tweet(taskqueue.Job(tid, 42, link, 9, 5), "fast")
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_batch_overflow_requeues_remainder(qdb, monkeypatch):
+    """12 个媒体：这条发 10 个，剩下的重新入队。"""
+    async def fake_fetch(ref):
+        return _tw_with(4, "A", "a", "x", ref.id)
+    monkeypatch.setattr(tweet, "fetch", fake_fetch)
+
+    import taskqueue
+    r = _runner()
+    submitted = []
+
+    async def fake_submit(owner, link, chat, msg):
+        submitted.append(link)
+        return 999
+    r.submit = fake_submit
+
+    link = " ".join(f"https://x.com/u/status/{i}" for i in (11, 22, 33))
+    tid = await qdb.add_task(42, link, 9, 5)
+    await r._run_tweet(taskqueue.Job(tid, 42, link, 9, 5), "fast")
+
+    assert len(r.bot.calls[0][1]) == 8, "只发装得下的部分"
+    assert submitted == ["https://x.com/u/status/33"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("auto_mode")
+async def test_batch_never_probes_preview(qdb, monkeypatch):
+    """合并必然走 media：一条消息只能有一个链接预览。"""
+    async def fake_fetch(ref):
+        return _tw_with(1, "A", "a", "x", ref.id)
+    monkeypatch.setattr(tweet, "fetch", fake_fetch)
+    c = SeqClient(_page(photo=_photo()))
+    _use_client(monkeypatch, c)
+
+    import taskqueue
+    r = _runner()
+    link = "https://x.com/u/status/11 https://x.com/u/status/22"
+    tid = await qdb.add_task(42, link, 9, 5)
+    await r._run_tweet(taskqueue.Job(tid, 42, link, 9, 5), "fast")
+    assert c.calls == 0
+    assert [x[0] for x in r.bot.calls] == ["group"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_batch_retry_does_not_refetch(qdb, monkeypatch):
+    """回退慢通道后再跑，不该重新请求 API、也不该重算规划。"""
+    calls = []
+
+    async def fake_fetch(ref):
+        calls.append(ref.id)
+        return _tw_with(1, "A", "a", "x", ref.id)
+    monkeypatch.setattr(tweet, "fetch", fake_fetch)
+
+    import taskqueue
+    r = _runner()
+    r.bot = FakeBot(reject=True)
+    link = "https://x.com/u/status/11 https://x.com/u/status/22"
+    tid = await qdb.add_task(42, link, 9, 5)
+    job = taskqueue.Job(tid, 42, link, 9, 5)
+    await r._run_tweet(job, "fast")
+    assert r.slow.qsize() == 1 and len(calls) == 2
+
+    queued = r.slow.get_nowait()
+    assert queued.extra["batch"] and queued.tweet is not None
+
+
+def test_bot_merges_multiple_tweet_links():
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
+    assert 'RUNNER.submit(m.from_user.id, " ".join(tweets)' in src, \
+        "多条推文应合成一个任务，而不是各发各的"
+
+
+def test_status_id_needs_at_least_two_digits():
+    """真实推文 id 有十几位；只认 2 位以上，免得把 x.com/u/status/1 这种造出来的
+    测试数据当成有效链接，掩盖问题。"""
+    assert tweet.find_links("https://x.com/u/status/1") == []
+    assert tweet.find_links("https://x.com/u/status/12") == ["https://x.com/u/status/12"]

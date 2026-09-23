@@ -405,6 +405,150 @@ def needs_relay(tw: Tweet, extra: dict | None = None) -> str | None:
     return None
 
 
+# ------------------------------------------------------------------ 多条合并
+
+ALBUM_MAX = 10          # Telegram 相册上限
+SKIP_NOTE = "⚠️ 其中 {n} 条未能取到"
+
+
+def _label(start: int, count: int) -> str:
+    """媒体在相册里的位置。1 个是 "3"，多个是 "3-5"。"""
+    if count <= 0:
+        return ""
+    return str(start) if count == 1 else f"{start}-{start + count - 1}"
+
+
+def _fair_caps(lengths: list[int], budget: int) -> list[int]:
+    """把有限的正文预算公平分给多条推文。
+
+    短的原样保留，只削长的：找一个统一上限 L，使得 sum(min(len_i, L)) <= budget。
+    这样一条长推不会把别人的正文全挤掉。
+    """
+    if budget <= 0:
+        return [0] * len(lengths)
+    if sum(lengths) <= budget:
+        return list(lengths)
+    lo, hi = 0, max(lengths)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if sum(min(x, mid) for x in lengths) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return [min(x, lo) for x in lengths]
+
+
+def build_batch_html(entries: list[tuple], limit: int,
+                     skipped: int = 0) -> tuple[str, bool]:
+    """把多条推文拼成一条消息的说明文字。
+
+    entries 是 [(Tweet, label)]，label 是这条推文的媒体在相册里的位置
+    （纯文字推文为空串，不带序号）。
+
+    格式：
+        <blockquote><b>昵称</b> 1 : 正文</blockquote>
+        <blockquote><b>昵称2</b> 2-4 : 正文2</blockquote>
+        原帖链接 1 · #ID
+        原帖链接 2-4 · #ID2
+
+        via 署名
+
+    返回 (html, 是否装得下)。装不下指固定部分本身就超了 limit，
+    这时正文已经被截到 0，调用方该改用更宽松的上限另发一条文字消息。
+    """
+    names, labels, tags, texts = [], [], [], []
+    for tw, label in entries:
+        names.append(tw.name.strip() or tw.screen_name)
+        labels.append(label)
+        tags.append(id_tag(tw))
+        texts.append(tw.text.strip())
+
+    # 纯文本形态，只用来算长度
+    heads = [f"{n} {l} :" if l else f"{n} :" for n, l in zip(names, labels)]
+    links = [LINK_TEXT + (f" {l}" if l else "") + (f" · {t}" if t else "")
+             for l, t in zip(labels, tags)]
+
+    note = SKIP_NOTE.format(n=skipped) if skipped else ""
+    sign_plain = f"\n\nvia {SIGN_TEXT}" if SIGN_TEXT else ""
+
+    n_lines = len(heads) + len(links) + (1 if note else 0)
+    fixed = (sum(utf16_len(h) for h in heads)
+             + sum(utf16_len(x) for x in links)
+             + utf16_len(note) + utf16_len(sign_plain)
+             + max(n_lines - 1, 0)                      # 行间换行
+             + sum(1 for t in texts if t))              # 昵称与正文之间的空格
+    caps = _fair_caps([utf16_len(t) for t in texts], limit - fixed)
+
+    esc = lambda x: html.escape(x, quote=False)         # noqa: E731
+    parts = []
+    for name, label, text, cap in zip(names, labels, texts, caps):
+        quote = f"<b>{esc(name)}</b>"
+        if label:
+            quote += f" {label}"
+        quote += " :"
+        if text and cap > 0:
+            body = text if utf16_len(text) <= cap else \
+                _cut_utf16(text, max(cap - 1, 0)).rstrip() + "…"
+            quote += " " + esc(body)
+        parts.append(f"<blockquote>{quote}</blockquote>")
+
+    for (tw, _), label, tag in zip(entries, labels, tags):
+        line = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
+        if label:
+            line += f" {label}"
+        if tag:
+            line += f" · {esc(tag)}"
+        parts.append(line)
+    if note:
+        parts.append(esc(note))
+    if SIGN_TEXT:
+        sign = esc(SIGN_TEXT)
+        if SIGN_URL:
+            sign = f'<a href="{html.escape(SIGN_URL, quote=True)}">{sign}</a>'
+        parts += ["", f"via {sign}"]
+    return "\n".join(parts), fixed <= limit
+
+
+def split_batch(pairs: list[tuple]) -> tuple[list[tuple], list[tuple]]:
+    """按媒体数量切一刀，返回 (这条消息要发的, 剩下的)。
+
+    一条推文的媒体不拆散，累加到 10 个为止。剩下的由调用方重新入队：
+    还是多条就继续合并，只剩一条就走单条的 auto 流程。
+    """
+    take, total = [], 0
+    for i, (link, tw) in enumerate(pairs):
+        n = len(tw.media)
+        if take and total + n > ALBUM_MAX:
+            return take, pairs[i:]
+        take.append((link, tw))
+        total += n
+    return take, []
+
+
+def plan_batch(tws: list, skipped: int = 0) -> tuple[dict, list]:
+    """规划一条合并消息，返回 (落库用的描述, 按顺序排好的媒体列表)。
+
+    合并必然走 media 逻辑：一条消息只能有一个链接预览，装不下多条推文的媒体。
+    """
+    entries, media, pos = [], [], 1
+    for tw in tws:
+        entries.append((tw, _label(pos, len(tw.media))))
+        media.extend(tw.media)
+        pos += len(tw.media)
+
+    base = {"kind": "tweet", "batch": True,
+            "url": tws[0].url, "preview_url": tws[0].preview_url}
+    if not media:
+        body, _ = build_batch_html(entries, TEXT_LIMIT, skipped)
+        return {**base, "mode": "text", "html": body, "caption": False}, []
+
+    cap, fits = build_batch_html(entries, CAPTION_LIMIT, skipped)
+    if fits:
+        return {**base, "mode": "media", "html": cap, "caption": True}, media
+    body, _ = build_batch_html(entries, TEXT_LIMIT, skipped)
+    return {**base, "mode": "media_long", "html": body, "caption": False}, media
+
+
 # ------------------------------------------------------------------ 预览检查
 
 def prejudge_preview(tw: Tweet) -> str | None:

@@ -76,6 +76,7 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 整理成引用块「昵称 : 正文」+ 原帖链接 · #ID，
 原帖的图片视频以大图预览显示在消息上方；
 预览抓不到媒体时（比如长视频）自动改发原始媒体。
+一次发多条链接会尽量拼成一条消息，昵称和链接后带媒体序号。
 
 <b>④ 抓私聊内容</b>
 私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），
@@ -352,9 +353,10 @@ async def on_text(m: Message) -> None:
         await m.reply("还没有可用的登录凭据，请联系机主。")
         return
 
-    # 推文：媒体要经 user 账号上传到中转频道，所以同样需要凭据
-    for t in tweets:
-        await RUNNER.submit(m.from_user.id, t, m.chat.id, m.message_id)
+    # 推文：多条合并成一个任务，拼成一条消息返回
+    if tweets:
+        await RUNNER.submit(m.from_user.id, " ".join(tweets),
+                            m.chat.id, m.message_id)
 
     # 消息里单独出现 nosp 时，把标记写进每条链接本身，
     # 这样它能随任务落库，重试和重启后依然有效。
@@ -372,7 +374,7 @@ async def on_text(m: Message) -> None:
         await RUNNER.submit(m.from_user.id, link, m.chat.id, m.message_id)
         ok += 1
 
-    ok += len(tweets)
+    ok += 1 if tweets else 0
     if ok > 1:
         await m.reply(f"已接收 {ok} 条链接，按顺序处理。")
 

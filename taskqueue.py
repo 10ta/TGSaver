@@ -355,16 +355,26 @@ class Runner:
         慢通道：URL 直发被拒（太大 / 拉不到）时回退到这里，
                  由本机下载、user 账号上传到中转频道，不受大小限制。
         """
+        links = tweet.find_links(job.link)
+        if len(links) > 1:
+            await self._run_tweet_batch(job, lane, links)
+            return
+
         ref = tweet.parse(job.link)
         tw = job.tweet or await tweet.fetch(ref)
         job.tweet = tw
         if job.extra is None or job.extra.get("kind") != "tweet":
             job.extra = tweet.plan(tw)
 
+        if lane == "fast" and job.extra["mode"] == "preview" \
+                and tweet.TWEET_MODE == "auto" and not job.extra.get("checked"):
+            await self._check_preview(job, tw)
+        await self._send_tweet_media(job, lane)
+
+    async def _send_tweet_media(self, job: Job, lane: str) -> None:
+        """推文的发送环节。单条和合并共用。"""
+        tw = job.tweet
         if lane == "fast":
-            if (job.extra["mode"] == "preview" and tweet.TWEET_MODE == "auto"
-                    and not job.extra.get("checked")):
-                await self._check_preview(job, tw)
             if job.extra["mode"] in ("media", "media_long"):
                 # 大小未知的先 HEAD 一下，超限的直接走中转，
                 # 不去触发一次可预见的「URL 直发被拒」
@@ -417,6 +427,42 @@ class Runner:
             job.extra["split"] = True      # 相册整组失败已逐条发，投递也逐条
         res = fetcher.Relayed(ids, len(ids) > 1 and not note, "B", nbytes, note)
         await self._finish(job, res)
+
+    async def _run_tweet_batch(self, job: Job, lane: str,
+                               links: list[str]) -> None:
+        """一次发来的多条推文，尽量拼成一条消息。
+
+        逐条按原有逻辑取数据，只在组装层合并。取不到的跳过并在末尾说明。
+        媒体超过一个相册（10 个）就切一刀，剩下的重新入队：还是多条继续合并，
+        只剩一条就走单条的 auto 流程。
+        """
+        if job.tweet is None:
+            await self._say(job, f"正在获取 {len(links)} 条帖子…")
+            pairs, skipped = [], 0
+            for link in links:
+                try:
+                    pairs.append((link, await tweet.fetch(tweet.parse(link))))
+                except tweet.TweetError as e:
+                    skipped += 1
+                    log.info("task=%s 跳过 %s：%s", job.task_id, link, e)
+                except Exception as e:  # noqa: BLE001
+                    skipped += 1
+                    log.warning("task=%s 跳过 %s：%s", job.task_id, link, e)
+
+            if not pairs:
+                raise tweet.TweetError(f"{skipped} 条帖子全部取不到。")
+
+            take, rest = tweet.split_batch(pairs)
+            if rest:
+                # 剩下的另起一个任务：多条继续合并，单条走 auto
+                await self.submit(job.owner_id, " ".join(l for l, _ in rest),
+                                  job.request_chat_id, job.request_msg_id)
+
+            job.extra, media = tweet.plan_batch([t for _, t in take], skipped)
+            job.tweet = tweet.Tweet(
+                id=take[0][1].id, name="", screen_name="", text="", media=media)
+
+        await self._send_tweet_media(job, lane)
 
     async def _check_preview(self, job: Job, tw: Any) -> None:
         """auto 模式：发送前确认预览里带齐了媒体，不齐就改成发原始媒体。
