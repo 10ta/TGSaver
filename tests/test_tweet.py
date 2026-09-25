@@ -1640,8 +1640,8 @@ async def test_batch_overflow_requeues_remainder(qdb, monkeypatch):
     r = _runner()
     submitted = []
 
-    async def fake_submit(owner, link, chat, msg):
-        submitted.append(link)
+    async def fake_submit(owner, link, chat, msg, forward_to=None):
+        submitted.append((link, forward_to))
         return 999
     r.submit = fake_submit
 
@@ -1650,7 +1650,7 @@ async def test_batch_overflow_requeues_remainder(qdb, monkeypatch):
     await r._run_tweet(taskqueue.Job(tid, 42, link, 9, 5), "fast")
 
     assert len(r.bot.calls[0][1]) == 8, "只发装得下的部分"
-    assert submitted == ["https://x.com/u/status/33"]
+    assert submitted == [("https://x.com/u/status/33", None)]
 
 
 @pytest.mark.asyncio

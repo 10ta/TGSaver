@@ -23,12 +23,14 @@ from telethon.tl.types import MessageService
 import acl
 import admin
 import db
+import forward
 import menu
 import streamer
 import tweet
 from config import CFG
 from parser import (
-    ParseError, find_links, make_internal, parse_link, wants_nosp, with_nosp,
+    ParseError, find_links, make_internal, parse_forward, parse_link,
+    wants_nosp, with_nosp,
 )
 from session_pool import POOL, NoSession
 from taskqueue import Runner
@@ -78,7 +80,16 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 预览抓不到媒体时（比如长视频）自动改发原始媒体。
 一次发多条链接会尽量拼成一条消息，昵称和链接后带媒体序号。
 
-<b>④ 抓私聊内容</b>
+<b>④ 转发到别处</b>
+消息末尾加 <code>fw</code> 和去向，结果不发给你，直接进那个频道 / 群：
+
+<code>x.com/用户/status/123 fw @我的频道</code>
+<code>t.me/频道/456 fw -1001234567890</code>
+<code>x.com/用户/status/123 fw</code>  用上次的去向
+
+用你的账号转发并隐藏来源，看不到 bot。成功时没有回复，失败才提示。
+
+<b>⑤ 抓私聊内容</b>
 私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），
 所以改发<b>对话地址</b>，后面跟要抓几条：
 
@@ -330,6 +341,17 @@ async def on_text(m: Message) -> None:
         return
     text = m.text or ""
 
+    # fw 必须最先剥掉：`fw t.me/mychannel` 里的 t.me/mychannel 是转发去向，
+    # 不是"抓取该对话最近 1 条"。
+    has_fw, fw_spec, text = parse_forward(text)
+    fw_to = None
+    if has_fw:
+        fw_to = await _resolve_forward(m, fw_spec)
+        if fw_to is None:
+            return
+        if not text.strip():
+            return                      # 只写了 fw，用途是设默认去向
+
     # 抓取判断必须排在 find_links 前面：t.me/some_bot 这种"只有对话名、
     # 没有消息 id"的地址也会被 find_links 抓到，然后在 parse_link 那里
     # 报一句"缺少消息 id"，用户就看不到抓取效果了。
@@ -356,7 +378,7 @@ async def on_text(m: Message) -> None:
     # 推文：多条合并成一个任务，拼成一条消息返回
     if tweets:
         await RUNNER.submit(m.from_user.id, " ".join(tweets),
-                            m.chat.id, m.message_id)
+                            m.chat.id, m.message_id, forward_to=fw_to)
 
     # 消息里单独出现 nosp 时，把标记写进每条链接本身，
     # 这样它能随任务落库，重试和重启后依然有效。
@@ -371,12 +393,55 @@ async def on_text(m: Message) -> None:
         except ParseError as e:
             await m.reply(f"跳过 {link}\n原因：{e}")
             continue
-        await RUNNER.submit(m.from_user.id, link, m.chat.id, m.message_id)
+        await RUNNER.submit(m.from_user.id, link, m.chat.id, m.message_id,
+                            forward_to=fw_to)
         ok += 1
 
     ok += 1 if tweets else 0
     if ok > 1:
         await m.reply(f"已接收 {ok} 条链接，按顺序处理。")
+
+
+async def _resolve_forward(m: Message, spec: str | None) -> str | None:
+    """确定 fw 的去向并校验权限。出错时已经回复了用户，返回 None。
+
+    没写去向就用上次的；校验通过后记下来，下次可以省略。
+    """
+    uid = m.from_user.id
+    row = await db.get_user(uid)
+
+    if not spec:
+        last = row["last_forward"] if row else None
+        if not last:
+            await m.reply("还没用过 fw，第一次请指定去向：\n"
+                          "<code>fw @频道名</code>")
+            return None
+        return last
+
+    try:
+        target = forward.normalize(spec)
+    except forward.ForwardError as e:
+        await m.reply(str(e))
+        return None
+
+    if target != (row["last_forward"] if row else None):
+        # 换了去向就当场验一次，别等任务跑完才发现发不出去
+        if not row or row["session_status"] != "ok":
+            await m.reply("还没有可用的登录凭据，请联系机主。")
+            return None
+        try:
+            client = await POOL.acquire(acl.session_user(uid))
+            async with POOL.lock_for(acl.session_user(uid)):
+                await forward.resolve(client, target)
+        except forward.ForwardError as e:
+            await m.reply(str(e))
+            return None
+        except NoSession:
+            await m.reply("登录凭据已失效，请联系机主。")
+            return None
+        await db.upsert_user(uid, last_forward=target)
+        await m.reply(f"转发去向已设为 <code>{target}</code>")
+    return target
 
 
 async def _allowed(m: Message) -> bool:

@@ -105,6 +105,33 @@ def with_nosp(url: str) -> str:
     return f"{url}{sep}nosp"
 
 
+# 消息里出现 fw 就把结果转发到指定去向。去向可以省略（用上次的），
+# 但不能因此把普通句子里的 "fw" 当成指令，所以只认两种写法：
+#   fw + 合法去向     出现在任何位置
+#   单独的 fw         只在消息末尾
+_FW_TARGET = (r"@[A-Za-z0-9_]{4,32}|-?\d{5,}"
+              r"|(?:https?://)?t\.me/[A-Za-z0-9_+/]+")
+FW_RE = re.compile(
+    rf"(?:^|\s)fw(?:\s+({_FW_TARGET})(?=\s|$)|\s*$)",
+    re.IGNORECASE,
+)
+
+
+def parse_forward(text: str) -> tuple[bool, Optional[str], str]:
+    """从消息里剥出 fw 指令。
+
+    返回 (是否要转发, 去向或 None, 剥掉指令后的文本)。
+
+    必须在识别链接和抓取目标**之前**调用：`fw t.me/mychannel` 里的
+    t.me/mychannel 是去向，不是「抓取该对话最近 1 条」。
+    """
+    m = FW_RE.search(text or "")
+    if not m:
+        return False, None, text or ""
+    rest = (text[:m.start()] + " " + text[m.end():]).strip()
+    return True, m.group(1), rest
+
+
 def _has_nosp_query(url: str) -> bool:
     q = url.split("?", 1)[1] if "?" in url else ""
     return any(p.split("=", 1)[0].lower() == "nosp" for p in q.split("&") if p)

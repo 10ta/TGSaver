@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS users (
     added_at         INTEGER NOT NULL,
     last_active      INTEGER,
     task_count       INTEGER NOT NULL DEFAULT 0,
-    bytes_total      INTEGER NOT NULL DEFAULT 0
+    bytes_total      INTEGER NOT NULL DEFAULT 0,
+    last_forward     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -53,6 +54,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 非 Telegram 来源（如推文）的呈现方式，JSON。投递失败重试时
     -- 凭它重组消息和按钮，不必重新请求外部 API。
     extra           TEXT,
+    -- fw 的去向，跟着任务走，重启后仍然有效
+    forward_to      TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -97,6 +100,10 @@ async def init() -> None:
 
 async def _migrate() -> None:
     """给早于当前版本的数据库补列。CREATE TABLE IF NOT EXISTS 不会改已有表。"""
+    cur = await _db.execute("PRAGMA table_info(users)")
+    if "last_forward" not in {r["name"] for r in await cur.fetchall()}:
+        await _db.execute("ALTER TABLE users ADD COLUMN last_forward TEXT")
+
     cur = await _db.execute("PRAGMA table_info(tasks)")
     have = {r["name"] for r in await cur.fetchall()}
     additions = {
@@ -104,6 +111,7 @@ async def _migrate() -> None:
         "relay_ids": "TEXT",
         "relay_is_album": "INTEGER NOT NULL DEFAULT 0",
         "extra": "TEXT",
+        "forward_to": "TEXT",
     }
     for col, decl in additions.items():
         if col not in have:
@@ -222,14 +230,16 @@ async def clear_session(user_id: int) -> None:
 # ------------------------------------------------------------------ tasks
 
 async def add_task(owner_id: int, link: str, request_chat_id: int,
-                   request_msg_id: int, status_msg_id: Optional[int] = None) -> int:
+                   request_msg_id: int, status_msg_id: Optional[int] = None,
+                   forward_to: Optional[str] = None) -> int:
     t = now()
     cur = await conn().execute(
         """INSERT INTO tasks
            (owner_id, link, request_chat_id, request_msg_id, status_msg_id,
-            created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?)""",
-        (owner_id, link, request_chat_id, request_msg_id, status_msg_id, t, t),
+            forward_to, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (owner_id, link, request_chat_id, request_msg_id, status_msg_id,
+         forward_to, t, t),
     )
     await conn().commit()
     return cur.lastrowid

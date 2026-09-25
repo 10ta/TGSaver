@@ -28,6 +28,7 @@ from telethon.errors import FloodWaitError
 import acl
 import db
 import fetcher
+import forward
 import sender
 import streamer
 import tweet
@@ -39,7 +40,7 @@ log = logging.getLogger("queue")
 
 # 这些错误是确定性的，重试没有意义
 FATAL = (fetcher.FetchError, ParseError, NoSession, streamer.TransferError,
-         tweet.TweetError)
+         tweet.TweetError, forward.ForwardError)
 
 # 投递阶段的确定性错误：bot 不在频道里、被踢、频道不存在等。
 # 这类错误重试 3 次只会把已经搬完的大文件重传 3 遍，必须当场判死。
@@ -86,6 +87,7 @@ class Job:
     relay_ids: Optional[list[int]] = None
     relay_is_album: bool = False
     extra: Optional[dict] = None   # 推文等非 Telegram 来源的呈现方式
+    forward_to: Optional[str] = None   # fw 的去向；有值时结果不发给本人
     tweet: Any = None              # 进程内缓存的推文数据，快通道转慢通道时复用
     lane: str = "fast"          # 当前所在通道，killall 重新排队时要用
     last_edit: float = field(default=0.0)
@@ -137,6 +139,7 @@ class Runner:
                 relay_ids=json.loads(r["relay_ids"]) if r["relay_ids"] else None,
                 relay_is_album=bool(r["relay_is_album"]),
                 extra=json.loads(r["extra"]) if r["extra"] else None,
+                forward_to=r["forward_to"],
             )
             job.lane = r["lane"] or "fast"
             (self.slow if job.lane == "slow" else self.fast).put_nowait(job)
@@ -209,9 +212,11 @@ class Runner:
     # ------------------------------------------------------------ 提交
 
     async def submit(self, owner_id: int, link: str, chat_id: int,
-                     msg_id: int) -> int:
-        task_id = await db.add_task(owner_id, link, chat_id, msg_id)
-        job = Job(task_id, owner_id, link, chat_id, msg_id)
+                     msg_id: int, forward_to: Optional[str] = None) -> int:
+        task_id = await db.add_task(owner_id, link, chat_id, msg_id,
+                                    forward_to=forward_to)
+        job = Job(task_id, owner_id, link, chat_id, msg_id,
+                  forward_to=forward_to)
 
         # 推文走 URL 直发时通常不到一秒就完成，先发一条「已排队」再删掉
         # 反而让结果出现得更慢。只有回退到中转时才显示进度。
@@ -371,9 +376,54 @@ class Runner:
             await self._check_preview(job, tw)
         await self._send_tweet_media(job, lane)
 
+    async def _send_tweet_relay(self, job: Job) -> None:
+        """带 fw 时，由 user 账号把消息生成在中转频道里，再从那儿转出去。
+
+        bot 发的东西转不了（那会露出 bot），所以这条路不经过 bot。
+        媒体优先把 URL 交给 Telegram 自己拉，本机零流量；拉不动才下载上传。
+        """
+        tw, extra = job.tweet, job.extra
+        suid = acl.session_user(job.owner_id)
+        client = await POOL.acquire(suid)
+        relay_ch = await acl.relay_channel_for(job.owner_id)
+        nbytes = 0
+
+        async def register_tmp(path: Optional[str]) -> None:
+            await db.update_task(job.task_id, tmp_path=path)
+
+        async with POOL.lock_for(suid):
+            if extra["mode"] in ("text", "preview"):
+                ids = await streamer.send_text_message(
+                    client, relay_ch, extra["html"],
+                    extra["preview_url"] if extra["mode"] == "preview" else None)
+            else:
+                cap = extra["html"] if extra.get("caption") else None
+                try:
+                    ids = await streamer.send_external_media(
+                        client, tw.media, relay_ch, cap)
+                except Exception as e:  # noqa: BLE001
+                    log.info("task=%s Telegram 拉不动，改为本机中转: %s",
+                             job.task_id, e)
+                    await self._say(job, "媒体较大，改为服务器中转…")
+                    ids, nbytes, note = await streamer.relay_web_media(
+                        client, tw.media, relay_ch, caption_html=cap,
+                        on_progress=lambda *a: self._progress(job, *a),
+                        task_id=job.task_id, register_tmp=register_tmp)
+                    if note:
+                        extra["split"] = True
+                if extra["mode"] == "media_long":
+                    ids += await streamer.send_text_message(
+                        client, relay_ch, extra["html"])
+
+        await self._finish(job, fetcher.Relayed(
+            sorted(ids), len(ids) > 1 and not extra.get("split"), "B", nbytes))
+
     async def _send_tweet_media(self, job: Job, lane: str) -> None:
         """推文的发送环节。单条和合并共用。"""
         tw = job.tweet
+        if job.forward_to:
+            await self._send_tweet_relay(job)
+            return
         if lane == "fast":
             if job.extra["mode"] in ("media", "media_long"):
                 # 大小未知的先 HEAD 一下，超限的直接走中转，
@@ -456,7 +506,8 @@ class Runner:
             if rest:
                 # 剩下的另起一个任务：多条继续合并，单条走 auto
                 await self.submit(job.owner_id, " ".join(l for l, _ in rest),
-                                  job.request_chat_id, job.request_msg_id)
+                                  job.request_chat_id, job.request_msg_id,
+                                  forward_to=job.forward_to)
 
             job.extra, media = tweet.plan_batch([t for _, t in take], skipped)
             job.tweet = tweet.Tweet(
@@ -512,7 +563,22 @@ class Runner:
         await self._deliver(job, note=res.note)
 
     async def _deliver(self, job: Job, note: str = "") -> None:
-        """把中转频道里的结果复制给用户。可独立重跑。"""
+        """把结果送出去。可独立重跑。
+
+        带 fw 时用 user 账号从中转频道转到去向（隐藏来源），本人不再收到。
+        """
+        if job.forward_to:
+            suid = acl.session_user(job.owner_id)
+            client = await POOL.acquire(suid)
+            async with POOL.lock_for(suid):
+                await forward.send(client, job.forward_to,
+                                   job.relay_chat_id, job.relay_ids or [])
+            row = await db.get_task(job.task_id)
+            await db.update_task(job.task_id, state="done", error=None)
+            await db.bump_usage(job.owner_id, row["bytes_moved"] if row else 0)
+            await self._drop_status(job)
+            return
+
         if job.extra and job.extra.get("kind") == "tweet":
             await sender.deliver_tweet(
                 self.bot, job.relay_chat_id, job.relay_ids, job.extra,

@@ -340,6 +340,61 @@ async def _maybe_await(v: Any) -> None:
         await v
 
 
+# --------------------------------------------------------------- 由 user 账号生成
+
+async def send_text_message(client: TelegramClient, peer: int, html_text: str,
+                            preview_url: Optional[str] = None) -> list[int]:
+    """用 user 账号发一条文字消息，可带大图置顶的链接预览。
+
+    等价于 bot 那边的 link_preview_options(prefer_large_media, show_above_text)：
+    invert_media 把媒体放到正文上方，force_large_media 要大图。
+    """
+    from telethon.extensions import html as tl_html
+    from telethon.tl.functions.messages import SendMessageRequest
+    from telethon.tl.types import InputMediaWebPage
+
+    text, ents = tl_html.parse(html_text)
+    if preview_url:
+        res = await client(SendMessageRequest(
+            peer=peer, message=text, random_id=helpers.generate_random_long(),
+            entities=ents or None, invert_media=True,
+            media=InputMediaWebPage(url=preview_url, force_large_media=True),
+        ))
+        ids = _ids_from_updates(res)
+        if ids:
+            return ids
+        raise TransferError("预览消息已发出但未能读回消息 id")
+
+    sent = await client.send_message(
+        peer, text, formatting_entities=ents or None, link_preview=False)
+    return [sent.id]
+
+
+async def send_external_media(client: TelegramClient, items: list[WebMedia],
+                              peer: int,
+                              caption_html: Optional[str] = None) -> list[int]:
+    """把媒体的 URL 交给 Telegram 服务器去拉，本机零流量。
+
+    这是 user 账号版的「URL 直发」。Telegram 拉不动（太大、拉不到）时抛错，
+    调用方回退到本机下载上传。
+    """
+    from telethon.extensions import html as tl_html
+
+    caption, ents = tl_html.parse(caption_html) if caption_html else (None, None)
+    urls = [m.url for m in items]
+    if len(urls) == 1:
+        sent = await client.send_file(peer, urls[0], caption=caption,
+                                      formatting_entities=ents or None)
+        return [sent.id]
+
+    sent = await client.send_file(
+        peer, urls,
+        caption=[caption or ""] + [""] * (len(urls) - 1) if caption else None,
+        formatting_entities=ents or None)
+    msgs = sent if isinstance(sent, list) else [sent]
+    return sorted(m.id for m in msgs)
+
+
 # --------------------------------------------------------------- 相册整组
 
 async def _upload_one(client: TelegramClient, msg: Message, spec: MediaSpec,
