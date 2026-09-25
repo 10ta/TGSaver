@@ -346,19 +346,26 @@ async def send_text_message(client: TelegramClient, peer: int, html_text: str,
                             preview_url: Optional[str] = None) -> list[int]:
     """用 user 账号发一条文字消息，可带大图置顶的链接预览。
 
-    等价于 bot 那边的 link_preview_options(prefer_large_media, show_above_text)：
-    invert_media 把媒体放到正文上方，force_large_media 要大图。
+    等价于 bot 那边的 link_preview_options(prefer_large_media, show_above_text)。
+
+    注意用的是 sendMedia 而不是 sendMessage：MTProto 的 sendMessage 只发纯文字，
+    预览只能从正文里的链接自动生成；要指定一个正文里没有的预览地址、
+    还要大图，得把 InputMediaWebPage 当作媒体用 sendMedia 发。
+    invert_media 把预览放到正文上方。
     """
     from telethon.extensions import html as tl_html
-    from telethon.tl.functions.messages import SendMessageRequest
+    from telethon.tl.functions.messages import SendMediaRequest
     from telethon.tl.types import InputMediaWebPage
 
     text, ents = tl_html.parse(html_text)
     if preview_url:
-        res = await client(SendMessageRequest(
-            peer=peer, message=text, random_id=helpers.generate_random_long(),
-            entities=ents or None, invert_media=True,
+        res = await client(SendMediaRequest(
+            peer=peer,
             media=InputMediaWebPage(url=preview_url, force_large_media=True),
+            message=text,
+            random_id=helpers.generate_random_long(),
+            entities=ents or None,
+            invert_media=True,
         ))
         ids = _ids_from_updates(res)
         if ids:
@@ -377,20 +384,24 @@ async def send_external_media(client: TelegramClient, items: list[WebMedia],
 
     这是 user 账号版的「URL 直发」。Telegram 拉不动（太大、拉不到）时抛错，
     调用方回退到本机下载上传。
+
+    相册时说明和格式实体都按「每项一份」给齐：只给一份扁平的实体列表的话，
+    Telethon 会把它当成第 1 项的，其余各项拿到 None，内部 `for ent in None` 崩掉。
     """
     from telethon.extensions import html as tl_html
 
-    caption, ents = tl_html.parse(caption_html) if caption_html else (None, None)
+    caption, ents = tl_html.parse(caption_html) if caption_html else ("", [])
     urls = [m.url for m in items]
     if len(urls) == 1:
         sent = await client.send_file(peer, urls[0], caption=caption,
-                                      formatting_entities=ents or None)
+                                      formatting_entities=ents)
         return [sent.id]
 
+    rest = len(urls) - 1
     sent = await client.send_file(
         peer, urls,
-        caption=[caption or ""] + [""] * (len(urls) - 1) if caption else None,
-        formatting_entities=ents or None)
+        caption=[caption] + [""] * rest,
+        formatting_entities=[ents] + [[] for _ in range(rest)])
     msgs = sent if isinstance(sent, list) else [sent]
     return sorted(m.id for m in msgs)
 

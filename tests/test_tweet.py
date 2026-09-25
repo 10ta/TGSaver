@@ -1707,3 +1707,33 @@ def test_status_id_needs_at_least_two_digits():
     测试数据当成有效链接，掩盖问题。"""
     assert tweet.find_links("https://x.com/u/status/1") == []
     assert tweet.find_links("https://x.com/u/status/12") == ["https://x.com/u/status/12"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("media_mode")
+async def test_batch_remainder_inherits_forward_target(qdb, monkeypatch):
+    """8 条链接 11 个媒体 + fw：切出来的剩余部分重新入队时必须带上去向。"""
+    async def fake_fetch(ref):
+        return _tw_with(4, "A", "a", "x", ref.id)
+    monkeypatch.setattr(tweet, "fetch", fake_fetch)
+
+    import taskqueue
+    r = _runner()
+    submitted = []
+
+    async def fake_submit(owner, link, chat, msg, forward_to=None):
+        submitted.append((link, forward_to))
+        return 999
+    r.submit = fake_submit
+
+    async def no_forward(job):
+        pass
+    r._forward_tweet = no_forward
+
+    link = " ".join(f"https://x.com/u/status/{i}" for i in (11, 22, 33))
+    tid = await qdb.add_task(42, link, 9, 5, forward_to="@mychan")
+    job = taskqueue.Job(tid, 42, link, 9, 5, forward_to="@mychan")
+    await r._run_tweet(job, "fast")
+
+    assert submitted == [("https://x.com/u/status/33", "@mychan")], \
+        "剩余部分丢了 fw 去向"
