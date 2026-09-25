@@ -376,7 +376,35 @@ class Runner:
             await self._check_preview(job, tw)
         await self._send_tweet_media(job, lane)
 
-    async def _send_tweet_relay(self, job: Job) -> None:
+    async def _forward(self, job: Job, from_peer: int, ids: list[int]) -> None:
+        """用 user 账号把中转频道里的消息转到去向，隐藏来源。
+
+        内容已经送到用户手里了，所以转发失败只报错，不让整个任务失败。
+        """
+        try:
+            suid = acl.session_user(job.owner_id)
+            client = await POOL.acquire(suid)
+            async with POOL.lock_for(suid):
+                await forward.send(client, job.forward_to, from_peer, ids)
+        except Exception as e:  # noqa: BLE001
+            log.warning("task=%s 转发失败: %s", job.task_id, e)
+            await self._say(job, f"⚠️ 转发失败：{e}")
+            return
+        await self._drop_status(job)
+
+    async def _forward_from_relay(self, job: Job) -> None:
+        if job.relay_chat_id and job.relay_ids:
+            await self._forward(job, job.relay_chat_id, job.relay_ids)
+        else:
+            await self._say(job, "⚠️ 转发失败：中转频道里没有可转发的消息。")
+
+    async def _forward_tweet(self, job: Job) -> None:
+        """快通道下 bot 直接发给了用户，中转频道里没有副本。
+
+        bot 发的东西转不走（一转就露出 bot），所以这里用 user 账号
+        在中转频道另做一份再转出去。媒体仍然把 URL 交给 Telegram 自己拉，
+        本机零流量。
+        """
         """带 fw 时，由 user 账号把消息生成在中转频道里，再从那儿转出去。
 
         bot 发的东西转不了（那会露出 bot），所以这条路不经过 bot。
@@ -384,46 +412,42 @@ class Runner:
         """
         tw, extra = job.tweet, job.extra
         suid = acl.session_user(job.owner_id)
-        client = await POOL.acquire(suid)
         relay_ch = await acl.relay_channel_for(job.owner_id)
-        nbytes = 0
 
         async def register_tmp(path: Optional[str]) -> None:
             await db.update_task(job.task_id, tmp_path=path)
 
-        async with POOL.lock_for(suid):
-            if extra["mode"] in ("text", "preview"):
-                ids = await streamer.send_text_message(
-                    client, relay_ch, extra["html"],
-                    extra["preview_url"] if extra["mode"] == "preview" else None)
-            else:
-                cap = extra["html"] if extra.get("caption") else None
-                try:
-                    ids = await streamer.send_external_media(
-                        client, tw.media, relay_ch, cap)
-                except Exception as e:  # noqa: BLE001
-                    log.info("task=%s Telegram 拉不动，改为本机中转: %s",
-                             job.task_id, e)
-                    await self._say(job, "媒体较大，改为服务器中转…")
-                    ids, nbytes, note = await streamer.relay_web_media(
-                        client, tw.media, relay_ch, caption_html=cap,
-                        on_progress=lambda *a: self._progress(job, *a),
-                        task_id=job.task_id, register_tmp=register_tmp)
-                    if note:
-                        extra["split"] = True
-                if extra["mode"] == "media_long":
-                    ids += await streamer.send_text_message(
-                        client, relay_ch, extra["html"])
+        try:
+            client = await POOL.acquire(suid)
+            async with POOL.lock_for(suid):
+                if extra["mode"] in ("text", "preview"):
+                    ids = await streamer.send_text_message(
+                        client, relay_ch, extra["html"],
+                        extra["preview_url"] if extra["mode"] == "preview" else None)
+                else:
+                    cap = extra["html"] if extra.get("caption") else None
+                    try:
+                        ids = await streamer.send_external_media(
+                            client, tw.media, relay_ch, cap)
+                    except Exception as e:  # noqa: BLE001
+                        log.info("task=%s Telegram 拉不动，改为本机中转: %s",
+                                 job.task_id, e)
+                        ids, _, _ = await streamer.relay_web_media(
+                            client, tw.media, relay_ch, caption_html=cap,
+                            task_id=job.task_id, register_tmp=register_tmp)
+                    if extra["mode"] == "media_long":
+                        ids += await streamer.send_text_message(
+                            client, relay_ch, extra["html"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("task=%s 转发前的副本制作失败: %s", job.task_id, e)
+            await self._say(job, f"⚠️ 转发失败：{e}")
+            return
 
-        await self._finish(job, fetcher.Relayed(
-            sorted(ids), len(ids) > 1 and not extra.get("split"), "B", nbytes))
+        await self._forward(job, relay_ch, sorted(ids))
 
     async def _send_tweet_media(self, job: Job, lane: str) -> None:
         """推文的发送环节。单条和合并共用。"""
         tw = job.tweet
-        if job.forward_to:
-            await self._send_tweet_relay(job)
-            return
         if lane == "fast":
             if job.extra["mode"] in ("media", "media_long"):
                 # 大小未知的先 HEAD 一下，超限的直接走中转，
@@ -442,7 +466,10 @@ class Runner:
                     await db.update_task(job.task_id, state="done", error=None,
                                          extra=json.dumps(job.extra))
                     await db.bump_usage(job.owner_id, 0)
-                    await self._drop_status(job)
+                    if job.forward_to:
+                        await self._forward_tweet(job)
+                    else:
+                        await self._drop_status(job)
                     return
 
             job.lane = "slow"
@@ -563,22 +590,11 @@ class Runner:
         await self._deliver(job, note=res.note)
 
     async def _deliver(self, job: Job, note: str = "") -> None:
-        """把结果送出去。可独立重跑。
+        """把结果送给用户。可独立重跑。
 
-        带 fw 时用 user 账号从中转频道转到去向（隐藏来源），本人不再收到。
+        带 fw 时，这一步照常执行 —— 你该收到的一份不会少 ——
+        之后再额外转发一份到去向。
         """
-        if job.forward_to:
-            suid = acl.session_user(job.owner_id)
-            client = await POOL.acquire(suid)
-            async with POOL.lock_for(suid):
-                await forward.send(client, job.forward_to,
-                                   job.relay_chat_id, job.relay_ids or [])
-            row = await db.get_task(job.task_id)
-            await db.update_task(job.task_id, state="done", error=None)
-            await db.bump_usage(job.owner_id, row["bytes_moved"] if row else 0)
-            await self._drop_status(job)
-            return
-
         if job.extra and job.extra.get("kind") == "tweet":
             await sender.deliver_tweet(
                 self.bot, job.relay_chat_id, job.relay_ids, job.extra,
@@ -594,9 +610,12 @@ class Runner:
         await db.update_task(job.task_id, state="done", error=None)
         await db.bump_usage(job.owner_id, moved)
 
+        if job.forward_to:
+            await self._forward_from_relay(job)
+
         if note:
             await self._say(job, "⚠️ " + note)
-        else:
+        elif not job.forward_to:
             await self._drop_status(job)
 
     async def _fail(self, job: Job, reason: str) -> None:

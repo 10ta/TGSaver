@@ -319,8 +319,8 @@ def _runner(bot=None):
 
 
 @pytest.mark.asyncio
-async def test_fw_delivers_only_to_target(fresh, monkeypatch):
-    """带 fw 时结果只到去向，本人不再收到，bot 完全不参与投递。"""
+async def test_fw_is_additive_not_a_replacement(fresh, monkeypatch):
+    """fw 是附加步骤：本人该收到的一份不能少，之后再额外转一份。"""
     import taskqueue
     client = RelayClient()
 
@@ -335,7 +335,7 @@ async def test_fw_delivers_only_to_target(fresh, monkeypatch):
                         relay_ids=[11, 12], relay_is_album=True)
     await r._deliver(job)
 
-    assert r.bot.calls == [], "bot 不该发任何东西给本人"
+    assert [c[0] for c in r.bot.calls] == ["copies"], "本人那一份不能少"
     entity, ids, from_peer, drop = client.forwarded[0]
     assert ids == [11, 12] and from_peer == -100999 and drop is True
     assert (await db.get_task(tid))["state"] == "done"
@@ -354,7 +354,8 @@ async def test_without_fw_still_delivers_to_user(fresh):
 
 @pytest.mark.asyncio
 async def test_fw_tweet_built_by_user_account(fresh, monkeypatch):
-    """推文带 fw 时，消息由 user 账号生成在中转频道，不能由 bot 发。"""
+    """快通道下 bot 已经发给用户了，中转频道没有副本，
+    所以要用 user 账号另做一份再转 —— bot 发的东西转不走。"""
     import taskqueue
     import tweet
     from streamer import WebMedia
@@ -373,9 +374,8 @@ async def test_fw_tweet_built_by_user_account(fresh, monkeypatch):
                         tweet=tw, forward_to="@mychan")
     job.extra = tweet.plan(tw, mode="media")
 
-    await r._send_tweet_media(job, "fast")
+    await r._forward_tweet(job)
 
-    assert r.bot.calls == [], "bot 不参与"
     assert client.sent and client.sent[0][0] == "file"
     assert client.sent[0][1] == ["https://a.jpg"] or \
         client.sent[0][1] == "https://a.jpg", "URL 交给 Telegram 自己拉"
@@ -384,7 +384,7 @@ async def test_fw_tweet_built_by_user_account(fresh, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fw_preview_built_by_user_account(fresh, monkeypatch):
-    """预览形态同理：bot 发的预览转不走，必须 user 账号自己发。"""
+    """预览形态同理：bot 发的预览转不走，副本要 user 账号自己发。"""
     import taskqueue
     import tweet
     from streamer import WebMedia
@@ -411,16 +411,15 @@ async def test_fw_preview_built_by_user_account(fresh, monkeypatch):
                         tweet=tw, forward_to="@mychan")
     job.extra = tweet.plan(tw, mode="preview")
 
-    await r._send_tweet_media(job, "fast")
+    await r._forward_tweet(job)
 
     assert calls and calls[0][1] == tw.preview_url, "预览地址要带上"
-    assert r.bot.calls == []
     assert client.forwarded[0][1] == [777]
 
 
 @pytest.mark.asyncio
 async def test_fw_falls_back_to_relay_when_telegram_cannot_fetch(fresh, monkeypatch):
-    """Telegram 拉不动就本机中转，仍然由 user 账号发，仍然转发。"""
+    """Telegram 拉不动就本机下载上传，仍然由 user 账号发，仍然转发。"""
     import taskqueue
     import tweet
     import streamer
@@ -448,9 +447,8 @@ async def test_fw_falls_back_to_relay_when_telegram_cannot_fetch(fresh, monkeypa
                         tweet=tw, forward_to="@mychan")
     job.extra = tweet.plan(tw, mode="media")
 
-    await r._send_tweet_media(job, "fast")
+    await r._forward_tweet(job)
     assert client.forwarded[0][1] == [901]
-    assert any("中转" in x for x in r.said)
 
 
 @pytest.mark.asyncio
@@ -466,3 +464,48 @@ async def test_fw_target_persisted_on_task(fresh):
         request_chat_id=1, request_msg_id=1,
         forward_to=rows[0]["forward_to"])
     assert job.forward_to == "@mychan"
+
+
+@pytest.mark.asyncio
+async def test_fw_failure_does_not_lose_delivered_copy(fresh, monkeypatch):
+    """转发失败只提示，不能让整个任务失败 —— 内容已经在用户手里了。"""
+    import taskqueue
+
+    class Boom(RelayClient):
+        async def forward_messages(self, *a, **kw):
+            raise RuntimeError("CHAT_WRITE_FORBIDDEN")
+
+    async def acquire(uid):
+        return Boom()
+    monkeypatch.setattr(taskqueue.POOL, "acquire", acquire)
+
+    r = _runner()
+    tid = await db.add_task(42, "l", 9, 5, forward_to="@mychan")
+    job = taskqueue.Job(tid, 42, "l", 9, 5, forward_to="@mychan",
+                        relay_chat_id=-100999, relay_ids=[11])
+    await r._deliver(job)
+
+    assert [c[0] for c in r.bot.calls] == ["copy"], "本人那一份照常送达"
+    assert any("转发失败" in x for x in r.said)
+    assert (await db.get_task(tid))["state"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_fw_without_relay_copy_reports_clearly(fresh):
+    import taskqueue
+    r = _runner()
+    tid = await db.add_task(42, "l", 9, 5, forward_to="@mychan")
+    job = taskqueue.Job(tid, 42, "l", 9, 5, forward_to="@mychan")
+    await r._forward_from_relay(job)
+    assert any("没有可转发" in x for x in r.said)
+
+
+def test_credential_check_looks_at_session_owner():
+    """凭据属于机主。查发起人自己的话，授权用户永远是「未登录」。"""
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
+    block = src[src.index("async def _resolve_forward"):src.index("async def _allowed")]
+    import re
+    assert "db.get_user(acl.session_user(uid))" in block
+    # owner_row["session_status"] 是对的，裸 row["session_status"] 不是
+    assert not re.search(r'(?<!owner_)row\["session_status"\]', block), \
+        "不能查发起人自己的登录状态"

@@ -87,7 +87,8 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 <code>t.me/频道/456 fw -1001234567890</code>
 <code>x.com/用户/status/123 fw</code>  用上次的去向
 
-用你的账号转发并隐藏来源，看不到 bot。成功时没有回复，失败才提示。
+你照常收到那一份，之后额外转一份过去。
+用账号转发并隐藏来源，看不到 bot；转发失败只提示，不影响已收到的内容。
 
 <b>⑤ 抓私聊内容</b>
 私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），
@@ -425,8 +426,11 @@ async def _resolve_forward(m: Message, spec: str | None) -> str | None:
         return None
 
     if target != (row["last_forward"] if row else None):
-        # 换了去向就当场验一次，别等任务跑完才发现发不出去
-        if not row or row["session_status"] != "ok":
+        # 换了去向就当场验一次，别等任务跑完才发现发不出去。
+        # 凭据属于机主，所以要查机主那条记录 —— 查发起人自己的话，
+        # 授权用户永远是"未登录"。
+        owner_row = await db.get_user(acl.session_user(uid))
+        if not owner_row or owner_row["session_status"] != "ok":
             await m.reply("还没有可用的登录凭据，请联系机主。")
             return None
         try:
