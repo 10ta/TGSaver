@@ -122,7 +122,6 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 cp .env.example .env && ./venv/bin/python genkey.py   # 粘进 SECRET_KEY
 nano .env && chmod 600 .env
 adduser --system --group --home /opt/tgsaver tgsaver
-mkdir -p /tmp/tgsaver && chown tgsaver:tgsaver /tmp/tgsaver
 chown -R tgsaver:tgsaver /opt/tgsaver
 sudo -u tgsaver ./venv/bin/python login.py    # 必须用 tgsaver 身份
 ```
@@ -156,7 +155,7 @@ journalctl -u tgsaver -f
 |---|---|---|
 | `MAX_UPLOAD_SIZE` | 2 GB | 账号上传上限。Premium 可改 `4294967296` |
 | `STREAM_MAX_SIZE` | 1 GB | 超过则走落盘路径，`0` = 全部流式 |
-| `TMP_DIR` | `/tmp/tgsaver` | 落盘路径用的临时目录 |
+| `TMP_DIR` | `/var/cache/tgsaver` | 落盘路径用的临时目录 |
 | `FAST_CONCURRENCY` | 4 | 快通道并发 |
 | `SLOW_CONCURRENCY` | 2 | 慢通道并发 |
 | `DISK_CONCURRENCY` | 1 | 同时走落盘路径的任务数 |
@@ -563,7 +562,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-417 项，覆盖：
+423 项，覆盖：
 
 - **链接解析**的全部形态，含论坛话题三段式（中间那个数字是话题 id 不是消息 id，
   这是最容易写错的地方）、`?single`、`tg://` 协议、各类非法输入
@@ -591,6 +590,8 @@ pytest -q
   让 Telethon 自己的参数校验和请求构造真实执行。之前这几个函数的测试把函数
   本身替换掉了，结果漏掉了两个错（带预览的消息要用 sendMedia 而非 sendMessage；
   带说明的相册实体必须每项一份）
+- **部署配置**：服务文件不能把可写路径放在 `/tmp` 下（重启后消失，服务起不来）、
+  临时目录由 systemd 管理、代码默认值 / `.env.example` / 服务文件三处一致
 - **命令菜单**：命令名与描述符合 Telegram 格式、无重复、管理命令不外泄、
   菜单里列出的每个命令都真的有处理函数
 - **授权模型**：准入判定、身份只有两种（残留的 admin 角色不获得特权、

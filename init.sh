@@ -17,7 +17,7 @@ set -euo pipefail
 
 APP_USER="tgsaver"
 APP_DIR="/opt/tgsaver"
-TMP_DIR="/tmp/tgsaver"
+TMP_DIR="/var/cache/tgsaver"
 SERVICE="tgsaver"
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; RST=$'\033[0m'
@@ -157,6 +157,12 @@ done
 step "目录与权限"
 mkdir -p "$TMP_DIR"
 chown "$APP_USER:$APP_USER" "$TMP_DIR"
+# 老配置里的 /tmp/tgsaver 会在系统重启后消失，导致服务起不来，迁走
+if grep -q '^TMP_DIR=/tmp/tgsaver$' "$APP_DIR/.env" 2>/dev/null; then
+  sed -i 's|^TMP_DIR=/tmp/tgsaver$|TMP_DIR=/var/cache/tgsaver|' "$APP_DIR/.env"
+  ok ".env 里的 TMP_DIR 已从 /tmp/tgsaver 迁到 /var/cache/tgsaver"
+fi
+rm -rf /tmp/tgsaver 2>/dev/null || true
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 chmod 600 "$APP_DIR/.env"
 [ -f "$APP_DIR/tgsaver.db" ] && chmod 600 "$APP_DIR/tgsaver.db"
@@ -266,7 +272,8 @@ fi
 #  4. 目录搬家后 venv 失效                    -> 检测并重建
 #  5. root 跑 login.py 导致数据库属主错误      -> 强制用 tgsaver 身份
 #  6. Unit tgsaver.service not found         -> 自动安装单元文件
-#  7. /tmp/tgsaver 不存在导致 systemd 启动失败 -> 自动创建并改属主
+#  7. 系统重启后 /tmp 清空，/tmp/tgsaver 不存在导致服务起不来
+#     -> 临时目录改为 systemd 管理的 /var/cache/tgsaver（CacheDirectory）
 #  8. .env / 数据库权限过宽                    -> 统一 chmod 600
 #  9. 把 bot token 填进 login.py 的手机号提示  -> 启动前明确提示
 # ============================================================
