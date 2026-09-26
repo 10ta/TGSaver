@@ -46,10 +46,12 @@ def normalize(spec: str) -> str:
         if not re.fullmatch(r"@[A-Za-z0-9_]{4,32}", spec):
             raise ForwardError(f"用户名格式不对：{spec}")
         return spec
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", spec):
+        return "@" + spec                   # 不带 @ 的用户名
     if re.fullmatch(r"-?\d{5,}", spec):
         return spec
     raise ForwardError(
-        f"看不懂的去向：{spec}\n请用 @用户名、数字 id 或 t.me 链接。")
+        f"看不懂的去向：{spec}\n请用用户名、数字 id 或 t.me 链接。")
 
 
 async def resolve(client: Any, target: str) -> Any:

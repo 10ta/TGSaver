@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import signal
@@ -30,7 +31,7 @@ import tweet
 from config import CFG
 from parser import (
     ParseError, find_links, make_internal, parse_forward, parse_link,
-    wants_nosp, with_nosp,
+    unrecognized_forward, wants_nosp, with_nosp,
 )
 from session_pool import POOL, NoSession
 from taskqueue import Runner
@@ -83,7 +84,7 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 <b>④ 转发到别处</b>
 消息末尾加 <code>fw</code> 和去向，结果不发给你，直接进那个频道 / 群：
 
-<code>x.com/用户/status/123 fw @我的频道</code>
+<code>x.com/用户/status/123 fw 我的频道</code>
 <code>t.me/频道/456 fw -1001234567890</code>
 <code>x.com/用户/status/123 fw</code>  用上次的去向
 
@@ -346,6 +347,7 @@ async def on_text(m: Message) -> None:
     # 不是"抓取该对话最近 1 条"。
     has_fw, fw_spec, text = parse_forward(text)
     fw_to = None
+    fw_bad = None if has_fw else unrecognized_forward(text)
     if has_fw:
         fw_to = await _resolve_forward(m, fw_spec)
         if fw_to is None:
@@ -375,6 +377,15 @@ async def on_text(m: Message) -> None:
     if not row or row["session_status"] != "ok":
         await m.reply("还没有可用的登录凭据，请联系机主。")
         return
+
+    if fw_bad:
+        # 写了 fw 但去向看不懂：链接照常处理，只是不转发。
+        # 明确说出来，免得以为转发了。只在有链接时提示，普通句子里的 fw 不打扰。
+        await m.reply(
+            f"fw 后面的 <code>{html.escape(fw_bad)}</code> 不像转发去向，"
+            f"这次不转发。\n"
+            f"去向可以写 <code>optv4</code>、<code>@optv4</code>、"
+            f"<code>t.me/optv4</code> 或数字 id。")
 
     # 推文：多条合并成一个任务，拼成一条消息返回
     if tweets:

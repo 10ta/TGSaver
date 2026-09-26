@@ -108,13 +108,20 @@ def with_nosp(url: str) -> str:
 # 消息里出现 fw 就把结果转发到指定去向。去向可以省略（用上次的），
 # 但不能因此把普通句子里的 "fw" 当成指令，所以只认两种写法：
 #   fw + 合法去向     出现在任何位置
-#   单独的 fw         只在消息末尾
+#   单独的 fw         在消息末尾，或后面紧跟 nosp（"fw nosp" = 用上次的去向 + 去剧透）
+#
+# 合法去向：@用户名、不带 @ 的用户名、数字 id、t.me 链接。
+# 裸用户名按 Telegram 的规则限定为字母开头、5 到 32 位，这样 nosp 这类
+# 4 个字母的关键词不会被误认成去向。
 _FW_TARGET = (r"@[A-Za-z0-9_]{4,32}|-?\d{5,}"
-              r"|(?:https?://)?t\.me/[A-Za-z0-9_+/]+")
+              r"|(?:https?://)?t\.me/[A-Za-z0-9_+/]+"
+              r"|[A-Za-z][A-Za-z0-9_]{4,31}")
 FW_RE = re.compile(
-    rf"(?:^|\s)fw(?:\s+({_FW_TARGET})(?=\s|$)|\s*$)",
+    rf"(?:^|\s)fw(?:\s+({_FW_TARGET})(?=\s|$)|(?=\s+nosp(?:\s|$))|\s*$)",
     re.IGNORECASE,
 )
+# 用来发现「写了 fw 但后面的去向看不懂」，好提示用户而不是悄悄忽略
+_FW_LOOSE = re.compile(r"(?:^|\s)fw\s+(\S+)", re.IGNORECASE)
 
 
 def parse_forward(text: str) -> tuple[bool, Optional[str], str]:
@@ -130,6 +137,16 @@ def parse_forward(text: str) -> tuple[bool, Optional[str], str]:
         return False, None, text or ""
     rest = (text[:m.start()] + " " + text[m.end():]).strip()
     return True, m.group(1), rest
+
+
+def unrecognized_forward(text: str) -> Optional[str]:
+    """写了 fw、后面也跟了东西，但那个东西不像去向。返回它，否则 None。
+
+    只在 parse_forward 没认出指令时调用。用于提示用户，
+    避免「以为转发了，其实什么都没发生」。
+    """
+    m = _FW_LOOSE.search(text or "")
+    return m.group(1) if m else None
 
 
 def _has_nosp_query(url: str) -> bool:

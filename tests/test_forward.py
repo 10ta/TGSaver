@@ -509,3 +509,64 @@ def test_credential_check_looks_at_session_owner():
     # owner_row["session_status"] 是对的，裸 row["session_status"] 不是
     assert not re.search(r'(?<!owner_)row\["session_status"\]', block), \
         "不能查发起人自己的登录状态"
+
+
+# ================================================================ 裸用户名与提示
+
+@pytest.mark.parametrize("text,target", [
+    ("https://x.com/a/status/123 fw optv4", "optv4"),
+    ("https://x.com/a/status/123 FW optv4", "optv4"),
+    ("fw optv4", "optv4"),
+    ("link fw my_channel_01 nosp", "my_channel_01"),
+])
+def test_bare_username_target(text, target):
+    """用户最自然的写法 `fw optv4`，以前根本不被当成指令，静默不转发。"""
+    has, got, _ = parse_forward(text)
+    assert has and got == target
+
+
+def test_bare_username_normalized_with_at():
+    assert forward.normalize("optv4") == "@optv4"
+    assert forward.normalize("My_Chan") == "@My_Chan"
+
+
+@pytest.mark.parametrize("word", ["nosp", "abcd", "1abcd", "_abcd"])
+def test_bare_word_that_is_not_a_username(word):
+    """nosp 这类 4 字母关键词、数字或下划线开头的，都不算用户名。"""
+    has, got, _ = parse_forward(f"link fw {word}")
+    assert got is None
+
+
+def test_fw_followed_by_nosp_means_last_target():
+    """「fw nosp」= 用上次的去向 + 去剧透，不能把 nosp 当成去向。"""
+    from parser import wants_nosp
+    has, target, rest = parse_forward("https://t.me/c/1234567890/5 fw nosp")
+    assert has and target is None
+    assert wants_nosp(rest)
+
+
+@pytest.mark.parametrize("text,bad", [
+    ("link fw @ab", "@ab"),
+    ("link fw 在吗", "在吗"),
+])
+def test_unrecognized_target_is_reported(text, bad):
+    """写了 fw 但去向看不懂，要能被发现并提示，而不是悄悄忽略。"""
+    from parser import unrecognized_forward
+    has, _, rest = parse_forward(text)
+    assert not has
+    assert unrecognized_forward(rest) == bad
+
+
+def test_recognized_fw_is_not_reported():
+    from parser import unrecognized_forward
+    for t in ("link fw optv4", "link fw", "link fw nosp", "link"):
+        has, _, rest = parse_forward(t)
+        assert has or unrecognized_forward(rest) is None, t
+
+
+def test_warning_only_when_message_has_links():
+    """普通句子里的 fw 不打扰：没有链接时 bot 本来就会回「没看到消息链接」，
+    再加一条去向提示就成了两条回复。所以提示必须排在「没有链接就返回」之后。"""
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
+    body = src[src.index("async def on_text"):]
+    assert body.index("没看到消息链接") < body.index("if fw_bad:")
