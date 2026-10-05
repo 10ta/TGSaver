@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Optional
+from dataclasses import dataclass
 import html
 import logging
 import re
@@ -93,20 +95,20 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 
 <b>⑤ 抓私聊内容</b>
 私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），
-所以改发<b>对话地址</b>，后面跟要抓几条：
+所以改发<b>对话地址</b>，后面跟数字：
 
-<code>t.me/some_bot 5</code>  抓最近 5 条媒体
-<code>t.me/some_bot</code>  不写数字就抓 1 条
-<code>https://t.me/some_bot 3</code>  完整 URL 也行
-<code>t.me/c/1234567890 3</code>  私有频道，自动补 -100 前缀
-<code>.some_bot 5</code>  点号简写，手机上打字更快
+<code>t.me/some_bot 5</code>  最近 5 条，各发各的
+<code>some_bot 5</code>  以 bot 结尾的用户名可以不加前缀
+<code>t.me/some_bot 1 3 5</code>  第 1、3、5 条，拼成一个相册
+<code>t.me/some_bot 1-3 7</code>  区间也行
+<code>.a_bot 1-2 .b_bot 3</code>  一次写多个对话，一起拼
+<code>t.me/c/1234567890 3</code>  私有频道
 <code>123456789 3</code>  数字 id
 
-<code>@some_bot 5</code> 这种写法代码里也认，但<b>不推荐</b>——
-Telegram 客户端看到消息以 @某bot 开头，会拦成对那个 bot 的 inline 查询，
-消息根本发不出来。
+一个相册算一条。拼相册时各条原来的说明文字保留在对应那一项上；
+图片视频、文件、音频按 Telegram 的规则分开成组，超过 10 个自动拆成多条。
 
-单次最多 20 条，会往回翻 200 条消息找媒体。
+<code>@some_bot 5</code> 不推荐：Telegram 会把它拦成 inline 查询，发不出去。
 
 <b>命令</b>
 /status — 登录状态、流量与消息统计
@@ -163,121 +165,248 @@ async def cmd_status(m: Message) -> None:
 # 为什么不能只用 @name：Telegram 客户端看到消息以 "@botname " 开头
 # 会拦截成对该 bot 的 inline 查询，消息根本发不出去。所以主推链接形式，
 # 它既不触发 inline，也不用记语法 —— 从对话资料页直接复制就有。
-GRAB_LINK_RE = re.compile(
-    r"^(?:https?://)?(?:www\.)?t\.me/(c/)?(@?[A-Za-z0-9_]{4,32}|-?\d{4,})/?"
-    r"(?:\s+(\d{1,3}))?$", re.IGNORECASE)
-# 前缀点号：.some_bot 5  —— 手机上比打链接快
-GRAB_DOT_RE = re.compile(
-    r"^[.>]\s*@?([A-Za-z][A-Za-z0-9_]{3,31})(?:\s+(\d{1,3}))?$")
-# @name 仍然保留：用在 /grab 后面、或那个 bot 不支持 inline 时可以直接发
-GRAB_USERNAME_RE = re.compile(
-    r"^@([A-Za-z][A-Za-z0-9_]{3,31})(?:\s+(\d{1,3}))?$")
-# 数字 id 至少 6 位。太短的数字更可能是用户随手打的东西，
-# 当成对话 id 去解析只会得到一句莫名其妙的报错。
-GRAB_NUMERIC_RE = re.compile(r"^(-?\d{6,})(?:\s+(\d{1,3}))?$")
+#
+# 整条消息按空格切成词，逐个识别：目标词开启一组，后面跟的数字和区间
+# 归这一组。所以一条消息里可以写多个对话：.a 1 .b 2-4
+_T_TME = re.compile(
+    r"^(?:https?://)?(?:www\.)?t\.me/(c/)?(@?[A-Za-z0-9_]{4,32}|-?\d{4,})/?$",
+    re.IGNORECASE)
+_T_DOT = re.compile(r"^[.>]@?([A-Za-z][A-Za-z0-9_]{3,31})$")   # .some_bot 手机上打得快
+_T_AT = re.compile(r"^@([A-Za-z][A-Za-z0-9_]{3,31})$")         # 可能被 inline 拦截
+# 数字 id 至少 6 位，和「第几条」的 1~3 位数字不会混淆
+_T_NUMID = re.compile(r"^(-?\d{6,})$")
+# 不带任何前缀的用户名只认以 bot 结尾的 —— Telegram 规定 bot 用户名必须
+# 以 bot 结尾，所以 "hello 5" 这种普通文字不会被误判成抓取指令。
+_T_BOT = re.compile(r"^(?=.{5,32}$)([A-Za-z][A-Za-z0-9_]*bot)$", re.IGNORECASE)
+
+_N_ONE = re.compile(r"^(\d{1,3})$")
+_N_RANGE = re.compile(r"^(\d{1,3})-(\d{1,3})$")
+POS_MAX = 50        # 单个对话最多挑这么多条，防止写成 1-999
+
+
+@dataclass
+class GrabSpec:
+    """一个对话要抓什么。count 和 positions 二选一。"""
+    target: str
+    count: Optional[int] = None             # 单个数字：最近 N 条（原有逻辑）
+    positions: Optional[list[int]] = None   # 多个数字或区间：第几条，按写的顺序
+
+    @property
+    def is_legacy(self) -> bool:
+        return self.positions is None
 
 
 def _clamp(n: str | None) -> int:
     return max(1, min(int(n), GRAB_MAX)) if n else 1
 
 
-def parse_grab_target(text: str):
-    """从一行裸文本里认出抓取目标，认不出返回 None。
-
-    接受：
-        t.me/some_bot        -> ("some_bot", 1)     推荐，不触发 inline
-        t.me/some_bot 5      -> ("some_bot", 5)
-        t.me/c/1234567890 3  -> ("-1001234567890", 3)
-        .some_bot 5          -> ("some_bot", 5)
-        @some_bot 5          -> ("some_bot", 5)     bot 支持 inline 时发不出去
-        123456789 3          -> ("123456789", 3)
-    """
-    t = (text or "").strip()
-
-    mm = GRAB_LINK_RE.match(t)
+def _grab_target(tok: str) -> Optional[str]:
+    """一个词是不是抓取目标，是就返回规整后的对话标识。"""
+    mm = _T_TME.match(tok)
     if mm:
-        is_channel, peer, n = mm.group(1), mm.group(2).lstrip("@"), mm.group(3)
+        is_channel, peer = mm.group(1), mm.group(2).lstrip("@")
         if is_channel:
             # t.me/c/ 里的数字是频道 id，要补回 -100 前缀
             if not peer.lstrip("-").isdigit():
                 return None
-            peer = peer if peer.startswith("-100") else f"-100{peer.lstrip('-')}"
-        return peer, _clamp(n)
-
-    for rx in (GRAB_DOT_RE, GRAB_USERNAME_RE, GRAB_NUMERIC_RE):
-        mm = rx.match(t)
+            return peer if peer.startswith("-100") else f"-100{peer.lstrip('-')}"
+        return peer
+    for rx in (_T_DOT, _T_AT, _T_NUMID, _T_BOT):
+        mm = rx.match(tok)
         if mm:
-            return mm.group(1), _clamp(mm.group(2))
+            return mm.group(1)
+    return None
+
+
+def _finish_spec(target: str, nums: list,
+                 as_positions: bool = False) -> Optional[GrabSpec]:
+    """nums 里每项是 int（单个数字）或 (a, b)（区间）。
+
+    as_positions=True 时即便只有一个数字也按位置理解。
+    """
+    if not nums and not as_positions:
+        return GrabSpec(target, count=1)
+    if not as_positions and len(nums) == 1 and isinstance(nums[0], int):
+        return GrabSpec(target, count=max(1, min(nums[0], GRAB_MAX)))
+    nums = nums or [1]
+    pos: list[int] = []
+    for n in nums:
+        seq = [n] if isinstance(n, int) else range(min(n), max(n) + 1)
+        for k in seq:
+            if k >= 1 and k not in pos:
+                pos.append(k)
+    if not pos:
+        return None
+    return GrabSpec(target, positions=pos[:POS_MAX])
+
+
+def parse_grab_command(text: str) -> Optional[list[GrabSpec]]:
+    """认出一条消息里的所有抓取目标，认不出返回 None。
+
+        t.me/some_bot            最近 1 条
+        t.me/some_bot 5          最近 5 条              （原有逻辑，各发各的）
+        t.me/some_bot 1 3 5      第 1、3、5 条          （组装成相册）
+        t.me/some_bot 1-3 7      第 1、2、3、7 条
+        .a 1 .b 2-4              两个对话，一起组装
+        some_bot 2               不带前缀只认以 bot 结尾的
+
+    有任何一个词认不出来，整条都不算抓取指令 —— 宁可不认，也别猜错。
+    """
+    toks = (text or "").split()
+    if not toks:
+        return None
+    groups: list[tuple[str, list]] = []
+    for tok in toks:
+        t = _grab_target(tok)
+        if t is not None:
+            groups.append((t, []))
+            continue
+        if not groups:
+            return None
+        mm = _N_RANGE.match(tok)
+        if mm:
+            groups[-1][1].append((int(mm.group(1)), int(mm.group(2))))
+            continue
+        mm = _N_ONE.match(tok)
+        if mm:
+            groups[-1][1].append(int(mm.group(1)))
+            continue
+        return None
+
+    # 同一个对话出现多次（.a 1 .a 2），意图是「第 1 条和第 2 条」而不是
+    # 「最近 1 条 + 最近 2 条」（会重叠）。合并起来，数字一律按位置理解。
+    order: list[str] = []
+    merged: dict[str, list] = {}
+    seen_twice: set[str] = set()
+    for t, nums in groups:
+        if t in merged:
+            seen_twice.add(t)
+            merged[t].extend(nums or [1])
+        else:
+            order.append(t)
+            merged[t] = list(nums)
+
+    specs: list[GrabSpec] = []
+    for t in order:
+        sp = _finish_spec(t, merged[t], as_positions=t in seen_twice)
+        if sp is None:
+            return None
+        specs.append(sp)
+    return specs
+
+
+def parse_grab_target(text: str):
+    """兼容旧接口：只有「单个对话 + 单个数字」时返回 (对话, 条数)，否则 None。"""
+    specs = parse_grab_command(text)
+    if specs and len(specs) == 1 and specs[0].is_legacy:
+        return specs[0].target, specs[0].count
     return None
 
 
 GRAB_HELP = (
     "抓私聊内容，直接发对话地址就行，不用带命令：\n\n"
-    "<code>t.me/some_bot 5</code>  抓最近 5 条媒体\n"
-    "<code>t.me/some_bot</code>  不写数字就抓 1 条\n"
-    "<code>https://t.me/some_bot 3</code>  完整 URL 也行\n"
-    "<code>t.me/c/1234567890 3</code>  私有频道，自动补 -100 前缀\n"
-    "<code>.some_bot 5</code>  点号简写，手机上打字更快\n"
-    "<code>123456789 3</code>  数字 id\n\n"
-    "<code>@some_bot 5</code> 也认，但 Telegram 常把它拦成 inline 查询，"
-    "消息发不出来，不推荐。\n\n"
-    "单次最多 20 条，会往回翻 200 条消息找媒体。"
+    "<code>t.me/some_bot 5</code>  最近 5 条，各发各的\n"
+    "<code>some_bot 5</code>  以 bot 结尾的可以不加前缀\n"
+    "<code>t.me/some_bot 1 3 5</code>  第 1、3、5 条，拼成相册\n"
+    "<code>t.me/some_bot 1-3 7</code>  区间也行\n"
+    "<code>.a_bot 1-2 .b_bot 3</code>  多个对话一起拼\n\n"
+    "一个相册算一条，会往回翻 200 条消息找媒体。"
 )
 
 
-async def do_grab(m: Message, target: str, count: int) -> None:
+async def _scan_items(client, entity, need: int) -> list:
+    """从新到旧列出带媒体的消息，相册只算一条。最多翻 GRAB_SCAN 条。"""
+    picked, seen_groups = [], set()
+    async for msg in client.iter_messages(entity, limit=GRAB_SCAN):
+        if msg.media is None or isinstance(msg, MessageService):
+            continue
+        gid = getattr(msg, "grouped_id", None)
+        if gid is not None:
+            if gid in seen_groups:
+                continue          # 相册只取一条，下游会自动凑齐整组
+            seen_groups.add(gid)
+        picked.append(msg)
+        if len(picked) >= need:
+            break
+    return picked
+
+
+async def do_grab(m: Message, specs: list, fw_to: Optional[str] = None) -> None:
     """按对话直接寻址抓取。
 
     私聊没有 t.me 链接 —— Telegram 只为公开频道和超级群生成链接。
     这里把找到的消息合成内部伪链接丢进同一套队列，
     下游的传输和投递逻辑完全复用。
+
+    单个对话 + 单个数字：原有逻辑，最近 N 条各发各的。
+    其余情况（多个数字、区间、多个对话）：挑出来的内容组装成相册。
     """
-    row = await db.get_user(acl.session_user(m.from_user.id))
+    uid = m.from_user.id
+    row = await db.get_user(acl.session_user(uid))
     if not row or row["session_status"] != "ok":
         await m.reply("还没有可用的登录凭据，请联系机主。")
         return
 
-    status = await m.reply(f"正在查找 {target} 最近的内容…")
+    legacy = len(specs) == 1 and specs[0].is_legacy
+    names = "、".join(sp.target for sp in specs)
+    status = await m.reply(f"正在查找 {names} 的内容…")
+
+    chosen: list[tuple[int, int]] = []       # (peer, msg_id)，按最终顺序
+    notes: list[str] = []
     try:
-        client = await POOL.acquire(acl.session_user(m.from_user.id))
-        async with POOL.lock_for(acl.session_user(m.from_user.id)):
-            try:
-                entity = await client.get_entity(
-                    int(target) if target.lstrip("-").isdigit() else target)
-            except Exception as e:  # noqa: BLE001
-                await status.edit_text(
-                    f"找不到对话 {target}。\n"
-                    f"请确认你和它有过对话，用户名或 id 拼写正确。\n"
-                    f"（{type(e).__name__}）")
-                return
-
-            picked, seen_groups = [], set()
-            async for msg in client.iter_messages(entity, limit=GRAB_SCAN):
-                if msg.media is None or isinstance(msg, MessageService):
+        client = await POOL.acquire(acl.session_user(uid))
+        async with POOL.lock_for(acl.session_user(uid)):
+            for sp in specs:
+                try:
+                    entity = await client.get_entity(
+                        int(sp.target) if sp.target.lstrip("-").isdigit()
+                        else sp.target)
+                except Exception as e:  # noqa: BLE001
+                    notes.append(f"找不到对话 {sp.target}（{type(e).__name__}）")
                     continue
-                gid = getattr(msg, "grouped_id", None)
-                if gid is not None:
-                    if gid in seen_groups:
-                        continue          # 相册只取一条，下游会自动凑齐整组
-                    seen_groups.add(gid)
-                picked.append(msg)
-                if len(picked) >= count:
-                    break
+                peer = utils.get_peer_id(entity)
+
+                if sp.is_legacy:
+                    items = await _scan_items(client, entity, sp.count)
+                    picks = list(reversed(items))   # 由旧到新，保持原顺序
+                else:
+                    items = await _scan_items(client, entity, max(sp.positions))
+                    picks, missing = [], []
+                    for k in sp.positions:          # 按写的顺序
+                        if k <= len(items):
+                            picks.append(items[k - 1])
+                        else:
+                            missing.append(k)
+                    if missing:
+                        notes.append(f"{sp.target} 没有第 "
+                                     f"{'、'.join(map(str, missing))} 条")
+                if not picks:
+                    notes.append(f"{sp.target} 最近 {GRAB_SCAN} 条消息里没找到媒体")
+                for msg in picks:
+                    key = (peer, msg.id)
+                    if key not in chosen:
+                        chosen.append(key)
     except NoSession:
-        await status.edit_text("登录凭据已失效，请重新运行 login.py。")
+        await status.edit_text("登录凭据已失效，请联系机主。")
         return
 
-    if not picked:
-        await status.edit_text(
-            f"在 {target} 最近 {GRAB_SCAN} 条消息里没找到媒体内容。")
+    note = ("\n⚠️ " + "；".join(notes)) if notes else ""
+    if not chosen:
+        await status.edit_text("没有抓到任何内容。" + note)
         return
 
-    peer = utils.get_peer_id(entity)
-    for msg in reversed(picked):          # 由旧到新，保持原顺序
-        await RUNNER.submit(m.from_user.id, make_internal(peer, msg.id),
-                            m.chat.id, m.message_id)
+    links = [make_internal(peer, mid) for peer, mid in chosen]
+    if legacy or len(links) == 1:
+        for link in links:
+            await RUNNER.submit(uid, link, m.chat.id, m.message_id,
+                                forward_to=fw_to)
+        await status.edit_text(f"已找到 {len(links)} 条，正在处理…" + note)
+        return
 
-    await status.edit_text(f"已找到 {len(picked)} 条，正在处理…")
+    # 多条组装：一个任务、一次投递
+    await RUNNER.submit(uid, " ".join(links), m.chat.id, m.message_id,
+                        forward_to=fw_to)
+    await status.edit_text(f"已找到 {len(links)} 条，正在组装…" + note)
 
 
 @router.message(Command("grab"))
@@ -285,11 +414,11 @@ async def cmd_grab(m: Message, command: CommandObject) -> None:
     """/grab 保留作为别名，但直接发 `@对话 条数` 更省事。"""
     if not await _allowed(m):
         return
-    parsed = parse_grab_target(command.args or "")
-    if parsed is None:
+    specs = parse_grab_command(command.args or "")
+    if specs is None:
         await m.reply(GRAB_HELP)
         return
-    await do_grab(m, *parsed)
+    await do_grab(m, specs)
 
 
 @router.message(Command("killall"))
@@ -358,9 +487,9 @@ async def on_text(m: Message) -> None:
     # 抓取判断必须排在 find_links 前面：t.me/some_bot 这种"只有对话名、
     # 没有消息 id"的地址也会被 find_links 抓到，然后在 parse_link 那里
     # 报一句"缺少消息 id"，用户就看不到抓取效果了。
-    parsed = parse_grab_target(text)
-    if parsed:
-        await do_grab(m, *parsed)
+    specs = parse_grab_command(text)
+    if specs:
+        await do_grab(m, specs, fw_to)
         return
 
     tweets = tweet.find_links(text)

@@ -107,13 +107,82 @@ def test_not_recognized(text):
 
 
 def test_bare_word_requires_marker():
-    """裸用户名一律不认，必须带 t.me/ 、@ 或点号，否则普通词会误触发。"""
-    assert P("some_bot") is None
-    assert P("@some_bot") == ("some_bot", 1)
-    assert P(".some_bot") == ("some_bot", 1)
-    assert P("t.me/some_bot") == ("some_bot", 1)
+    """裸用户名只认以 bot 结尾的：Telegram 规定 bot 用户名必须以 bot 结尾，
+    所以 "hello" 这种普通词不会被误判。其他对话仍需 t.me/、@ 或点号。"""
+    assert P("some_bot") == ("some_bot", 1)
+    assert P("SomeBot 3") == ("SomeBot", 3)
+    assert P("some_user") is None
+    assert P("hello") is None
+    assert P("@some_user") == ("some_user", 1)
+    assert P(".some_user") == ("some_user", 1)
+    assert P("t.me/some_user") == ("some_user", 1)
 
 
 def test_numeric_needs_six_digits():
     assert P("12345") is None
     assert P("123456") == ("123456", 1)
+
+
+# ================================================================ 多对话、多数字、区间
+
+from bot import parse_grab_command as C  # noqa: E402
+
+
+def _s(specs):
+    return [(x.target, x.count, x.positions) for x in specs]
+
+
+@pytest.mark.parametrize("text,want", [
+    # 单个对话 + 单个数字：原有逻辑不变
+    ("t.me/ym_ss_bot 2",          [("ym_ss_bot", 2, None)]),
+    ("ym_ss_bot 2",               [("ym_ss_bot", 2, None)]),
+    ("ym_ss_bot",                 [("ym_ss_bot", 1, None)]),
+    # 多个数字、区间：按位置
+    ("t.me/a_bot 1 3 5",          [("a_bot", None, [1, 3, 5])]),
+    ("t.me/a_bot 1-3 7",          [("a_bot", None, [1, 2, 3, 7])]),
+    ("t.me/a_bot 1-3",            [("a_bot", None, [1, 2, 3])]),
+    ("t.me/a_bot 3-1",            [("a_bot", None, [1, 2, 3])]),
+    ("t.me/a_bot 2 1",            [("a_bot", None, [2, 1])]),       # 按写的顺序
+    ("t.me/a_bot 1 1 2",          [("a_bot", None, [1, 2])]),       # 去重
+    # 多个对话
+    (".a_bot 3 .b_bot 1-2",       [("a_bot", 3, None), ("b_bot", None, [1, 2])]),
+    ("t.me/a_bot 1 t.me/c/1234567890 2 5",
+                                  [("a_bot", 1, None), ("-1001234567890", None, [2, 5])]),
+    # 同一对话出现多次：合并，按位置
+    (".ym_ss_bot 1 .ym_ss_bot 2", [("ym_ss_bot", None, [1, 2])]),
+    (".x_bot .x_bot",             [("x_bot", None, [1])]),
+    (".x_bot 3 .x_bot 5-6",       [("x_bot", None, [3, 5, 6])]),
+])
+def test_grab_command(text, want):
+    assert _s(C(text)) == want
+
+
+@pytest.mark.parametrize("text", [
+    "hello 5", "ok 5", "1 3 5", "a_bot 1 hello", "t.me/a_bot 1-x",
+    "t.me/a_bot 1 3 abc", "t.me/durov/1", "some_user 2", "",
+])
+def test_grab_command_rejects(text):
+    """有任何一个词认不出来，整条都不算抓取指令。"""
+    assert C(text) is None
+
+
+def test_positions_capped():
+    assert len(C("t.me/a_bot 1-999")[0].positions) == 50
+
+
+def test_position_zero_dropped():
+    assert C("t.me/a_bot 0 2")[0].positions == [2]
+
+
+def test_numeric_id_not_confused_with_position():
+    """6 位以上是对话 id，1~3 位是第几条，不会混。"""
+    assert _s(C("123456789 2 3")) == [("123456789", None, [2, 3])]
+    assert C("t.me/a_bot 1234") is None, "4 位数既不是 id 也不是位置"
+
+
+def test_do_grab_passes_forward_target():
+    """抓取时写的 fw 必须传下去 —— 以前漏了，导致静默不转发。"""
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
+    body = src[src.index("async def do_grab"):src.index('@router.message(Command("grab"))')]
+    calls = body.count("RUNNER.submit(")
+    assert calls >= 1 and body.count("forward_to=fw_to") == calls

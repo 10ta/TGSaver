@@ -989,12 +989,21 @@ async def test_known_oversize_skips_direct_attempt(qdb):
     assert any("20MB" in x for x in r.said)
 
 
-def test_tweets_start_in_fast_lane_without_status_message():
-    src = (Path(__file__).resolve().parent.parent / "taskqueue.py").read_text()
-    sub = src[src.index("    async def submit(self"):src.index("        return task_id\n")]
-    assert "if not tweet.is_tweet(link):" in sub, "推文不该先发「已排队」"
-    assert "await self.fast.put(job)" in sub
-    assert "self.slow.put" not in sub
+@pytest.mark.asyncio
+async def test_tweets_start_in_fast_lane_without_status_message(qdb):
+    """推文进快通道，且不先发「已排队」—— 直发通常不到一秒就完成。"""
+    r = _runner()
+    await r.submit(42, "https://x.com/j/status/12", 9, 5)
+    assert r.fast.qsize() == 1 and r.slow.empty()
+    assert r.said == [], "推文不该先发「已排队」"
+
+
+@pytest.mark.asyncio
+async def test_grab_batch_goes_to_slow_lane(qdb):
+    """抓取组装可能含受保护内容，直接进慢通道。"""
+    r = _runner()
+    await r.submit(42, "tgsaver://p/111/5 tgsaver://p/111/9", 9, 5)
+    assert r.slow.qsize() == 1 and r.fast.empty()
 
 
 def test_extra_persisted_for_retry():

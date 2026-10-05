@@ -275,6 +275,14 @@ def _tail(seg: list[str], thread_q: Optional[int]) -> tuple[Optional[int], int]:
     return nums[0], nums[1]
 
 
+_INTERNAL_RE = re.compile(r"tgsaver://p/\S+")
+
+
+def find_internal_links(text: str) -> list[str]:
+    """找出文本里的所有内部伪链接。多于一个说明是抓取组装任务。"""
+    return _INTERNAL_RE.findall(text or "")
+
+
 def _parse_internal(raw: str) -> MsgRef:
     """tgsaver://p/<peer>/<msg_id>
 

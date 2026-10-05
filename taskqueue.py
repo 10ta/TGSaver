@@ -26,6 +26,7 @@ from aiogram.exceptions import (
 from telethon.errors import FloodWaitError
 
 import acl
+import assemble
 import db
 import fetcher
 import forward
@@ -33,7 +34,7 @@ import sender
 import streamer
 import tweet
 from config import CFG
-from parser import MsgRef, ParseError, parse_link
+from parser import MsgRef, ParseError, find_internal_links, parse_link
 from session_pool import POOL, NoSession
 
 log = logging.getLogger("queue")
@@ -226,7 +227,14 @@ class Runner:
                 job, "已排队" + (f"（前面 {depth} 个）" if depth else "，正在处理…")
             )
             await db.update_task(task_id, status_msg_id=job.status_msg_id)
-        await self.fast.put(job)
+
+        # 抓取组装：可能含受保护内容要搬字节，直接进慢通道
+        if len(find_internal_links(link)) > 1:
+            job.lane = "slow"
+            await db.update_task(task_id, lane="slow")
+            await self.slow.put(job)
+        else:
+            await self.fast.put(job)
         return task_id
 
     def stats(self) -> dict[str, Any]:
@@ -266,7 +274,9 @@ class Runner:
                 log.info("task=%s 已搬运，跳过传输直接投递", job.task_id)
                 await self._deliver(job)
                 return
-            if tweet.is_tweet(job.link):
+            if len(find_internal_links(job.link)) > 1:
+                await self._run_grab_batch(job)
+            elif tweet.is_tweet(job.link):
                 await self._run_tweet(job, lane)
             elif lane == "fast":
                 await self._run_fast(job)
@@ -541,6 +551,60 @@ class Runner:
                 id=take[0][1].id, name="", screen_name="", text="", media=media)
 
         await self._send_tweet_media(job, lane)
+
+    async def _run_grab_batch(self, job: Job) -> None:
+        """抓取组装：逐条照常搬进中转频道，再在服务端组成相册。
+
+        每搬完一条就把它在中转频道里的 id 记进库里。中途失败重试时，
+        已经搬好的直接跳过 —— 受保护的大文件不会被重新下载上传。
+        """
+        links = find_internal_links(job.link)
+        extra = job.extra if (job.extra or {}).get("kind") == "grab_batch" else {}
+        done: dict[str, list[int]] = dict(extra.get("done", {}))
+        moved = int(extra.get("bytes", 0))
+        job.extra = {"kind": "grab_batch", "done": done, "bytes": moved}
+
+        suid = acl.session_user(job.owner_id)
+        client = await POOL.acquire(suid)
+        relay_ch = await acl.relay_channel_for(job.owner_id)
+
+        async def register_tmp(path: Optional[str]) -> None:
+            await db.update_task(job.task_id, tmp_path=path)
+
+        skipped = 0
+        for i, link in enumerate(links, 1):
+            if link in done:
+                skipped += 0 if done[link] else 1
+                continue
+            await self._say(job, f"正在搬运 {i}/{len(links)}…")
+            try:
+                async with POOL.lock_for(suid):
+                    res = await fetcher.relay(
+                        client, parse_link(link), relay_ch,
+                        on_progress=lambda *a: self._progress(job, *a),
+                        task_id=job.task_id, register_tmp=register_tmp)
+            except fetcher.FetchError as e:
+                log.info("task=%s 跳过 %s：%s", job.task_id, link, e)
+                done[link] = []
+                skipped += 1
+            else:
+                done[link] = list(res.message_ids)
+                moved += res.bytes_moved
+            job.extra = {"kind": "grab_batch", "done": done, "bytes": moved}
+            await db.update_task(job.task_id, extra=json.dumps(job.extra))
+
+        ids = [x for link in links for x in done.get(link, [])]
+        if not ids:
+            raise fetcher.FetchError(f"{len(links)} 条全部取不到。")
+
+        await self._say(job, "正在组装…")
+        async with POOL.lock_for(suid):
+            final, note = await assemble.compose(client, relay_ch, ids)
+        if skipped:
+            note = f"{note} 其中 {skipped} 条取不到。".strip()
+
+        await self._finish(job, fetcher.Relayed(
+            final, len(final) > 1, "B", moved, note))
 
     async def _check_preview(self, job: Job, tw: Any) -> None:
         """auto 模式：发送前确认预览里带齐了媒体，不齐就改成发原始媒体。
