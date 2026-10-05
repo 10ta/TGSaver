@@ -283,6 +283,22 @@ def find_internal_links(text: str) -> list[str]:
     return _INTERNAL_RE.findall(text or "")
 
 
+def batch_links(text: str) -> list[str]:
+    """组装任务里的全部链接（内部伪链接或 t.me 消息链接），按出现顺序。
+
+    多于一个就是组装任务：一条消息里贴了多个链接，或者抓取挑了多条。
+    """
+    out = []
+    for tok in (text or "").split():
+        if tok.startswith(INTERNAL_SCHEME):
+            out.append(tok)
+        else:
+            found = find_links(tok)
+            if found:
+                out.append(found[0])
+    return out
+
+
 def _parse_internal(raw: str) -> MsgRef:
     """tgsaver://p/<peer>/<msg_id>
 

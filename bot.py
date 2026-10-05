@@ -56,14 +56,19 @@ GRAB_SCAN = 200    # 往回翻多少条消息去找媒体
 HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 
 <b>① 保存消息</b>
-直接发消息链接，一条消息里可以贴多个：
+直接发消息链接：
 
 <code>t.me/频道名/123</code>
 <code>t.me/c/1234567890/123</code>  私有频道
-<code>t.me/频道名/45/123</code>  论坛话题
+<code>t.me/频道名/45/123</code>  论坛话题里的某条
 <code>t.me/频道名/181?comment=4832</code>  评论区
 
+一条消息里贴多个链接会拼成相册、汇总说明，一次返回。
 相册自动整组，禁止转存的内容也能搬，大文件不受 50MB 限制。
+
+论坛话题的链接后面加数字，抓话题里的内容：
+<code>t.me/c/1234567890/45 1-7</code>  话题里最近的第 1~7 条
+<code>t.me/c/1234567890/45 4632-4638</code>  按消息 id（4 位以上）
 
 <b>② 去掉剧透遮罩</b>
 链接后面加 <code>nosp</code>：
@@ -174,35 +179,58 @@ _T_TME = re.compile(
     re.IGNORECASE)
 _T_DOT = re.compile(r"^[.>]@?([A-Za-z][A-Za-z0-9_]{3,31})$")   # .some_bot 手机上打得快
 _T_AT = re.compile(r"^@([A-Za-z][A-Za-z0-9_]{3,31})$")         # 可能被 inline 拦截
-# 数字 id 至少 6 位，和「第几条」的 1~3 位数字不会混淆
+# 对话 id：负数（频道、群）任何位置都认；正数至少 6 位，且只能写在开头 ——
+# 后面的 4 位以上正数是消息 id，否则两者分不清。
 _T_NUMID = re.compile(r"^(-?\d{6,})$")
+# 论坛话题：t.me/c/群/话题、t.me/群名/话题。单独出现时是普通消息链接，
+# 只有后面跟着数字时才当作「话题」这个抓取目标。
+_T_TOPIC = re.compile(
+    r"^(?:https?://)?(?:www\.)?t\.me/(?:(c)/(\d{4,})|([A-Za-z][A-Za-z0-9_]{3,31}))"
+    r"/(\d+)/?$", re.IGNORECASE)
 # 不带任何前缀的用户名只认以 bot 结尾的 —— Telegram 规定 bot 用户名必须
 # 以 bot 结尾，所以 "hello 5" 这种普通文字不会被误判成抓取指令。
 _T_BOT = re.compile(r"^(?=.{5,32}$)([A-Za-z][A-Za-z0-9_]*bot)$", re.IGNORECASE)
 
-_N_ONE = re.compile(r"^(\d{1,3})$")
+_N_ONE = re.compile(r"^(\d{1,3})$")                    # 第几条
 _N_RANGE = re.compile(r"^(\d{1,3})-(\d{1,3})$")
+_ID_ONE = re.compile(r"^(\d{4,})$")                    # 消息 id
+_ID_RANGE = re.compile(r"^(\d{4,})-(\d{4,})$")
+ID_RANGE_MAX = 100      # 一个 id 区间最多展开这么多条
 POS_MAX = 50        # 单个对话最多挑这么多条，防止写成 1-999
 
 
 @dataclass
 class GrabSpec:
-    """一个对话要抓什么。count 和 positions 二选一。"""
+    """一个对话（或论坛话题）要抓什么。count 和 picks 二选一。"""
     target: str
     count: Optional[int] = None             # 单个数字：最近 N 条（原有逻辑）
-    positions: Optional[list[int]] = None   # 多个数字或区间：第几条，按写的顺序
+    picks: Optional[list[tuple[str, int]]] = None   # ("pos", 第几条) / ("id", 消息 id)，按写的顺序
+    topic: Optional[int] = None             # 论坛话题 id；None 表示整个对话
 
     @property
     def is_legacy(self) -> bool:
-        return self.positions is None
+        return self.picks is None
+
+    @property
+    def positions(self) -> Optional[list[int]]:
+        if self.picks is None:
+            return None
+        return [n for k, n in self.picks if k == "pos"]
+
+    @property
+    def ids(self) -> list[int]:
+        return [n for k, n in (self.picks or []) if k == "id"]
 
 
 def _clamp(n: str | None) -> int:
     return max(1, min(int(n), GRAB_MAX)) if n else 1
 
 
-def _grab_target(tok: str) -> Optional[str]:
-    """一个词是不是抓取目标，是就返回规整后的对话标识。"""
+def _grab_target(tok: str, first: bool = True) -> Optional[str]:
+    """一个词是不是抓取目标，是就返回规整后的对话标识。
+
+    first=False 时不认正数对话 id：那个位置上的 4 位以上正数是消息 id。
+    """
     mm = _T_TME.match(tok)
     if mm:
         is_channel, peer = mm.group(1), mm.group(2).lstrip("@")
@@ -215,30 +243,69 @@ def _grab_target(tok: str) -> Optional[str]:
     for rx in (_T_DOT, _T_AT, _T_NUMID, _T_BOT):
         mm = rx.match(tok)
         if mm:
+            if rx is _T_NUMID and not first and not mm.group(1).startswith("-"):
+                continue
             return mm.group(1)
     return None
 
 
-def _finish_spec(target: str, nums: list,
-                 as_positions: bool = False) -> Optional[GrabSpec]:
-    """nums 里每项是 int（单个数字）或 (a, b)（区间）。
+def _topic_target(tok: str) -> Optional[tuple[str, int]]:
+    """t.me/c/群/话题 或 t.me/群名/话题 -> (对话, 话题 id)。"""
+    mm = _T_TOPIC.match(tok)
+    if not mm:
+        return None
+    if mm.group(1):
+        return f"-100{mm.group(2)}", int(mm.group(4))
+    return mm.group(3), int(mm.group(4))
 
-    as_positions=True 时即便只有一个数字也按位置理解。
+
+def _number(tok: str):
+    """数字词 -> ("pos"|"id", n 或 (a, b))，不是数字返回 None。"""
+    for rx, kind in ((_N_RANGE, "pos"), (_N_ONE, "pos"),
+                     (_ID_RANGE, "id"), (_ID_ONE, "id")):
+        mm = rx.match(tok)
+        if mm:
+            if mm.lastindex == 2:
+                return kind, (int(mm.group(1)), int(mm.group(2)))
+            return kind, int(mm.group(1))
+    return None
+
+
+def _finish_spec(target: str, nums: list, as_positions: bool = False,
+                 topic: Optional[int] = None) -> Optional[GrabSpec]:
+    """nums 里每项是 ("pos"|"id", n) 或 ("pos"|"id", (a, b))。
+
+    只有一个「第几条」数字时是原有的「最近 N 条」；as_positions=True 时
+    即便只有一个数字也按位置理解。
     """
     if not nums and not as_positions:
-        return GrabSpec(target, count=1)
-    if not as_positions and len(nums) == 1 and isinstance(nums[0], int):
-        return GrabSpec(target, count=max(1, min(nums[0], GRAB_MAX)))
-    nums = nums or [1]
-    pos: list[int] = []
-    for n in nums:
-        seq = [n] if isinstance(n, int) else range(min(n), max(n) + 1)
+        return GrabSpec(target, count=1, topic=topic)
+    if (not as_positions and len(nums) == 1 and nums[0][0] == "pos"
+            and isinstance(nums[0][1], int)):
+        return GrabSpec(target, count=max(1, min(nums[0][1], GRAB_MAX)), topic=topic)
+    nums = nums or [("pos", 1)]
+    picks: list[tuple[str, int]] = []
+    for kind, n in nums:
+        if isinstance(n, int):
+            seq = [n]
+        else:
+            lo, hi = min(n), max(n)
+            cap = POS_MAX if kind == "pos" else ID_RANGE_MAX
+            seq = range(lo, min(hi, lo + cap - 1) + 1)
         for k in seq:
-            if k >= 1 and k not in pos:
-                pos.append(k)
-    if not pos:
+            if k >= 1 and (kind, k) not in picks:
+                picks.append((kind, k))
+    # 「第几条」最多 POS_MAX 个；消息 id 的上限已在展开区间时限住
+    pos_seen, kept = 0, []
+    for x in picks:
+        if x[0] == "pos":
+            pos_seen += 1
+            if pos_seen > POS_MAX:
+                continue
+        kept.append(x)
+    if not kept:
         return None
-    return GrabSpec(target, positions=pos[:POS_MAX])
+    return GrabSpec(target, picks=kept, topic=topic)
 
 
 def parse_grab_command(text: str) -> Optional[list[GrabSpec]]:
@@ -250,46 +317,51 @@ def parse_grab_command(text: str) -> Optional[list[GrabSpec]]:
         t.me/some_bot 1-3 7      第 1、2、3、7 条
         .a 1 .b 2-4              两个对话，一起组装
         some_bot 2               不带前缀只认以 bot 结尾的
+        t.me/c/123/45 1-7        论坛话题 45 里的第 1~7 条
+        t.me/c/123/45 4632-4638  消息 id（4 位以上的数字按消息 id 理解）
 
     有任何一个词认不出来，整条都不算抓取指令 —— 宁可不认，也别猜错。
     """
     toks = (text or "").split()
     if not toks:
         return None
-    groups: list[tuple[str, list]] = []
-    for tok in toks:
-        t = _grab_target(tok)
+    groups: list[tuple[tuple[str, Optional[int]], list]] = []
+    for i, tok in enumerate(toks):
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        # 话题链接单独出现时是普通消息链接，后面跟数字才是抓取目标
+        tp = _topic_target(tok) if _number(nxt) else None
+        if tp is not None:
+            groups.append(((tp[0], tp[1]), []))
+            continue
+        t = _grab_target(tok, first=(i == 0))
         if t is not None:
-            groups.append((t, []))
+            groups.append(((t, None), []))
             continue
         if not groups:
             return None
-        mm = _N_RANGE.match(tok)
-        if mm:
-            groups[-1][1].append((int(mm.group(1)), int(mm.group(2))))
-            continue
-        mm = _N_ONE.match(tok)
-        if mm:
-            groups[-1][1].append(int(mm.group(1)))
-            continue
-        return None
+        num = _number(tok)
+        if num is None:
+            return None
+        groups[-1][1].append(num)
 
     # 同一个对话出现多次（.a 1 .a 2），意图是「第 1 条和第 2 条」而不是
     # 「最近 1 条 + 最近 2 条」（会重叠）。合并起来，数字一律按位置理解。
-    order: list[str] = []
-    merged: dict[str, list] = {}
-    seen_twice: set[str] = set()
-    for t, nums in groups:
-        if t in merged:
-            seen_twice.add(t)
-            merged[t].extend(nums or [1])
+    order: list = []
+    merged: dict = {}
+    seen_twice: set = set()
+    for key, nums in groups:
+        if key in merged:
+            seen_twice.add(key)
+            merged[key].extend(nums or [("pos", 1)])
         else:
-            order.append(t)
-            merged[t] = list(nums)
+            order.append(key)
+            merged[key] = list(nums)
 
     specs: list[GrabSpec] = []
-    for t in order:
-        sp = _finish_spec(t, merged[t], as_positions=t in seen_twice)
+    for key in order:
+        target, topic = key
+        sp = _finish_spec(target, merged[key], as_positions=key in seen_twice,
+                          topic=topic)
         if sp is None:
             return None
         specs.append(sp)
@@ -315,10 +387,14 @@ GRAB_HELP = (
 )
 
 
-async def _scan_items(client, entity, need: int) -> list:
-    """从新到旧列出带媒体的消息，相册只算一条。最多翻 GRAB_SCAN 条。"""
+async def _scan_items(client, entity, need: int, topic: Optional[int] = None) -> list:
+    """从新到旧列出带媒体的消息，相册只算一条。最多翻 GRAB_SCAN 条。
+
+    topic 给了就只在那个论坛话题里翻。
+    """
     picked, seen_groups = [], set()
-    async for msg in client.iter_messages(entity, limit=GRAB_SCAN):
+    kw = {"reply_to": topic} if topic else {}
+    async for msg in client.iter_messages(entity, limit=GRAB_SCAN, **kw):
         if msg.media is None or isinstance(msg, MessageService):
             continue
         gid = getattr(msg, "grouped_id", None)
@@ -330,6 +406,44 @@ async def _scan_items(client, entity, need: int) -> list:
         if len(picked) >= need:
             break
     return picked
+
+
+async def _resolve_picks(client, entity, sp) -> tuple[list, list[str]]:
+    """按写的顺序把「第几条」和「消息 id」换成具体消息。返回 (消息, 缺失说明)。
+
+    消息 id 指到相册里的某一张时，同一个相册只取一次 —— 下游会凑齐整组，
+    否则 4632-4638 刚好覆盖一个 7 张图的相册时会把它重复搬 7 次。
+    """
+    positions = sp.positions or []
+    items = (await _scan_items(client, entity, max(positions), sp.topic)
+             if positions else [])
+    by_id = {}
+    if sp.ids:
+        got = await client.get_messages(entity, ids=sp.ids)
+        by_id = {m.id: m for m in (got or []) if m is not None}
+
+    picks, missing, seen_groups, seen_ids = [], [], set(), set()
+    for kind, n in sp.picks:
+        if kind == "pos":
+            msg = items[n - 1] if n <= len(items) else None
+            label = f"第 {n} 条"
+        else:
+            msg = by_id.get(n)
+            if msg is not None and isinstance(msg, MessageService):
+                msg = None
+            label = f"消息 {n}"
+        if msg is None:
+            missing.append(label)
+            continue
+        gid = getattr(msg, "grouped_id", None)
+        if gid is not None:
+            if gid in seen_groups:
+                continue
+            seen_groups.add(gid)
+        if msg.id not in seen_ids:
+            seen_ids.add(msg.id)
+            picks.append(msg)
+    return picks, missing
 
 
 async def do_grab(m: Message, specs: list, fw_to: Optional[str] = None) -> None:
@@ -368,20 +482,13 @@ async def do_grab(m: Message, specs: list, fw_to: Optional[str] = None) -> None:
                 peer = utils.get_peer_id(entity)
 
                 if sp.is_legacy:
-                    items = await _scan_items(client, entity, sp.count)
+                    items = await _scan_items(client, entity, sp.count, sp.topic)
                     picks = list(reversed(items))   # 由旧到新，保持原顺序
                 else:
-                    items = await _scan_items(client, entity, max(sp.positions))
-                    picks, missing = [], []
-                    for k in sp.positions:          # 按写的顺序
-                        if k <= len(items):
-                            picks.append(items[k - 1])
-                        else:
-                            missing.append(k)
+                    picks, missing = await _resolve_picks(client, entity, sp)
                     if missing:
-                        notes.append(f"{sp.target} 没有第 "
-                                     f"{'、'.join(map(str, missing))} 条")
-                if not picks:
+                        notes.append(f"{sp.target} 没有 {'、'.join(missing)}")
+                if not picks and sp.is_legacy:
                     notes.append(f"{sp.target} 最近 {GRAB_SCAN} 条消息里没找到媒体")
                 for msg in picks:
                     key = (peer, msg.id)
@@ -526,7 +633,7 @@ async def on_text(m: Message) -> None:
     # 这样它能随任务落库，重试和重启后依然有效。
     nosp = wants_nosp(text)
 
-    ok = 0
+    valid = []
     for link in links:
         if nosp:
             link = with_nosp(link)
@@ -535,13 +642,12 @@ async def on_text(m: Message) -> None:
         except ParseError as e:
             await m.reply(f"跳过 {link}\n原因：{e}")
             continue
-        await RUNNER.submit(m.from_user.id, link, m.chat.id, m.message_id,
-                            forward_to=fw_to)
-        ok += 1
+        valid.append(link)
 
-    ok += 1 if tweets else 0
-    if ok > 1:
-        await m.reply(f"已接收 {ok} 条链接，按顺序处理。")
+    # 多个消息链接和推文一样，拼成相册、汇总说明，一次返回
+    if valid:
+        await RUNNER.submit(m.from_user.id, " ".join(valid), m.chat.id,
+                            m.message_id, forward_to=fw_to)
 
 
 async def _resolve_forward(m: Message, spec: str | None) -> str | None:

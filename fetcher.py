@@ -136,6 +136,15 @@ async def load_message(client: TelegramClient, entity: Any, ref: MsgRef) -> Mess
     if msg is None:
         raise FetchError("这条消息不存在或已被删除。")
     if isinstance(msg, MessageService):
+        from telethon.tl.types import MessageActionTopicCreate
+        if isinstance(getattr(msg, "action", None), MessageActionTopicCreate):
+            # 论坛话题的 id 就是「创建话题」这条系统消息的 id，
+            # 所以把话题链接当消息链接发过来，取到的正是它
+            raise FetchError(
+                "这是论坛话题的链接，不是某一条消息。\n"
+                "要抓话题里的内容，在链接后面加数字：\n"
+                f"<code>{ref.raw.split('?')[0]} 1-5</code>  话题里最近的第 1~5 条\n"
+                f"<code>{ref.raw.split('?')[0]} 4632-4638</code>  按消息 id")
         raise FetchError("这是一条系统消息（入群/置顶提示等），无法转存。")
     return msg
 

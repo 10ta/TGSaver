@@ -177,7 +177,7 @@ def test_position_zero_dropped():
 def test_numeric_id_not_confused_with_position():
     """6 位以上是对话 id，1~3 位是第几条，不会混。"""
     assert _s(C("123456789 2 3")) == [("123456789", None, [2, 3])]
-    assert C("t.me/a_bot 1234") is None, "4 位数既不是 id 也不是位置"
+    assert C("t.me/a_bot 1234")[0].ids == [1234], "4 位以上按消息 id 理解"
 
 
 def test_do_grab_passes_forward_target():
@@ -186,3 +186,156 @@ def test_do_grab_passes_forward_target():
     body = src[src.index("async def do_grab"):src.index('@router.message(Command("grab"))')]
     calls = body.count("RUNNER.submit(")
     assert calls >= 1 and body.count("forward_to=fw_to") == calls
+
+
+# ================================================================ 论坛话题与消息 id
+
+def _p(text):
+    r = C(text)
+    return None if r is None else [(x.target, x.topic, x.count, x.picks) for x in r]
+
+
+def test_topic_with_positions():
+    assert _p("https://t.me/c/2703619907/124 1-3") == [
+        ("-1002703619907", 124, None, [("pos", 1), ("pos", 2), ("pos", 3)])]
+
+
+def test_topic_with_message_ids():
+    assert _p("https://t.me/c/2703619907/124 4632-4634") == [
+        ("-1002703619907", 124, None, [("id", 4632), ("id", 4633), ("id", 4634)])]
+
+
+def test_public_topic():
+    assert _p("t.me/somegroup/45 2") == [("somegroup", 45, 2, None)]
+
+
+def test_bare_topic_link_stays_a_message_link():
+    """单独一个话题 / 消息链接不能被吃成抓取指令，要交给普通链接流程。"""
+    assert C("https://t.me/c/2703619907/124") is None
+    assert C("https://t.me/durov/1") is None
+
+
+def test_positions_and_ids_mixed_in_written_order():
+    assert _p("t.me/c/2703619907/124 2 4635 1") == [
+        ("-1002703619907", 124, None, [("pos", 2), ("id", 4635), ("pos", 1)])]
+
+
+def test_id_range_capped():
+    r = C("t.me/c/2703619907/124 1000-9999")[0]
+    assert len(r.ids) == 100
+
+
+def test_positive_long_number_after_target_is_message_id():
+    """开头的长数字是对话 id；后面的正数长数字是消息 id；负数仍是对话 id。"""
+    assert _p("123456789 2") == [("123456789", None, 2, None)]
+    assert _p("t.me/a_bot 1 123456789") == [("a_bot", None, None,
+                                             [("pos", 1), ("id", 123456789)])]
+    assert [x.target for x in C("t.me/a_bot 1 -1001234567890 2")] == \
+        ["a_bot", "-1001234567890"]
+
+
+def test_same_topic_twice_merges():
+    assert _p("t.me/c/2703619907/124 1 t.me/c/2703619907/124 2") == [
+        ("-1002703619907", 124, None, [("pos", 1), ("pos", 2)])]
+
+
+def test_different_topics_same_group_stay_separate():
+    r = C("t.me/c/2703619907/124 1 t.me/c/2703619907/125 1")
+    assert [(x.target, x.topic) for x in r] == [
+        ("-1002703619907", 124), ("-1002703619907", 125)]
+
+
+# ---------------------------------------------------------------- 取具体消息
+
+from datetime import datetime, timezone  # noqa: E402
+
+from telethon.tl import types as TT  # noqa: E402
+
+
+def _msg(mid, gid=None, service=False):
+    if service:
+        return TT.MessageService(id=mid, peer_id=TT.PeerChannel(1), date=None,
+                                 action=TT.MessageActionTopicCreate(title="t", icon_color=0))
+    return TT.Message(id=mid, peer_id=TT.PeerChannel(1),
+                      date=datetime.now(timezone.utc), message="",
+                      media=TT.MessageMediaPhoto(photo=TT.Photo(
+                          id=mid, access_hash=1, file_reference=b"", date=None,
+                          sizes=[], dc_id=1)), grouped_id=gid)
+
+
+class ScanClient:
+    def __init__(self, recent=(), by_id=()):
+        self.recent = list(recent)
+        self.by_id = {m.id: m for m in by_id}
+        self.iter_kw = None
+
+    async def iter_messages(self, entity, limit=None, **kw):
+        self.iter_kw = kw
+        for m in self.recent:
+            yield m
+
+    async def get_messages(self, entity, ids=None):
+        return [self.by_id.get(i) for i in ids]
+
+
+@pytest.mark.asyncio
+async def test_scan_within_topic_uses_reply_to():
+    import bot
+    c = ScanClient(recent=[_msg(9), _msg(8)])
+    await bot._scan_items(c, object(), 2, topic=124)
+    assert c.iter_kw == {"reply_to": 124}
+    await bot._scan_items(c, object(), 2)
+    assert c.iter_kw == {}, "没有话题时不能带 reply_to"
+
+
+@pytest.mark.asyncio
+async def test_resolve_picks_ids_dedupe_album():
+    """id 区间正好覆盖一个相册时，相册只取一次 —— 否则会被重复搬好几次。"""
+    import bot
+    album = [_msg(i, gid=777) for i in range(4632, 4636)]
+    c = ScanClient(by_id=album + [_msg(4636), _msg(4637)])
+    sp = C("t.me/c/2703619907/124 4632-4637")[0]
+    picks, missing = await bot._resolve_picks(c, object(), sp)
+    assert [m.id for m in picks] == [4632, 4636, 4637]
+    assert missing == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_picks_missing_and_service():
+    import bot
+    c = ScanClient(recent=[_msg(9)], by_id=[_msg(4632), _msg(4633, service=True)])
+    sp = C("t.me/c/2703619907/124 1 2 4632 4633 4634")[0]
+    picks, missing = await bot._resolve_picks(c, object(), sp)
+    assert [m.id for m in picks] == [9, 4632]
+    assert missing == ["第 2 条", "消息 4633", "消息 4634"], "系统消息当作取不到"
+
+
+@pytest.mark.asyncio
+async def test_resolve_picks_keeps_written_order():
+    import bot
+    c = ScanClient(recent=[_msg(9), _msg(8)], by_id=[_msg(4632)])
+    sp = C("t.me/c/2703619907/124 2 4632 1")[0]
+    picks, _ = await bot._resolve_picks(c, object(), sp)
+    assert [m.id for m in picks] == [8, 4632, 9]
+
+
+# ---------------------------------------------------------------- 多个消息链接
+
+def test_batch_links():
+    from parser import batch_links
+    text = ("https://t.me/c/2703619907/124/4638 https://t.me/c/2703619907/124/4637 "
+            "tgsaver://p/111/5")
+    assert batch_links(text) == ["https://t.me/c/2703619907/124/4638",
+                                 "https://t.me/c/2703619907/124/4637",
+                                 "tgsaver://p/111/5"]
+    assert batch_links("https://x.com/a/status/12") == []
+    assert len(batch_links("https://t.me/c/2703619907/124/4638")) == 1
+
+
+def test_multiple_message_links_become_one_task():
+    """多个消息链接和推文一样拼成一条消息，不再各发各的。"""
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
+    body = src[src.index("    valid = []"):]
+    body = body[:body.index("\n\n\n")]
+    assert body.count("RUNNER.submit(") == 1
+    assert '" ".join(valid)' in body

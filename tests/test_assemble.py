@@ -550,3 +550,93 @@ async def test_grab_units_names_and_tags():
         ("111", "YM 闪闪", "#ym_ss_bot", [12, 13]),
         ("222", "222", "", [14]),      # 查不到：用 id 当名称，不带标签
     ], "取不到的那条不进组装"
+
+
+# ================================================================ 多个 t.me 链接组装
+
+@pytest.mark.asyncio
+async def test_multiple_tme_links_routed_to_batch(qdb):
+    r = _runner()
+    await r.submit(42, "https://t.me/c/2703619907/124/4638 "
+                       "https://t.me/c/2703619907/124/4637", 9, 5)
+    assert r.slow.qsize() == 1 and r.fast.empty()
+
+
+@pytest.mark.asyncio
+async def test_single_tme_link_unchanged(qdb):
+    r = _runner()
+    await r.submit(42, "https://t.me/c/2703619907/124/4638", 9, 5)
+    assert r.fast.qsize() == 1 and r.slow.empty()
+
+
+@pytest.mark.asyncio
+async def test_tme_batch_relays_each_link(qdb, monkeypatch):
+    import taskqueue
+    A = "https://t.me/c/2703619907/124/4638"
+    B = "https://t.me/c/2703619907/124/4637"
+
+    import fetcher
+    relayed = []
+
+    async def fake_relay(client, ref, relay_ch, **kw):
+        relayed.append(ref.msg_id)
+        return fetcher.Relayed([100 + ref.msg_id % 10], False, "A", 0)
+    monkeypatch.setattr(fetcher, "relay", fake_relay)
+
+    async def fake_resolve(client, ref):
+        return T.Channel(id=2703619907, title="某群", photo=T.ChatPhotoEmpty(),
+                         date=NOW, megagroup=True)
+    monkeypatch.setattr(fetcher, "resolve_entity", fake_resolve)
+
+    got_units = []
+
+    async def fake_compose(client, peer, units):
+        got_units.extend(units)
+        return [901, 902], ""
+    monkeypatch.setattr(assemble, "compose", fake_compose)
+
+    async def acquire(uid):
+        return object()
+    monkeypatch.setattr(taskqueue.POOL, "acquire", acquire)
+
+    r = _runner()
+    link = f"{A} {B}"
+    tid = await qdb.add_task(42, link, 9, 5)
+    await r._run(taskqueue.Job(tid, 42, link, 9, 5), "slow")
+
+    assert relayed == [4638, 4637], "按贴的顺序"
+    assert [(u.key, u.name, u.tag) for u in got_units] == [
+        ("-1002703619907", "某群", "")] * 2, "私有群没有用户名，就不带标签"
+    assert r.bot.calls == [("copies", [901, 902])]
+
+
+@pytest.mark.asyncio
+async def test_topic_link_hint():
+    """把话题链接当消息链接发，提示正确写法而不是只说「系统消息」。"""
+    import fetcher
+    from parser import parse_link
+
+    class C:
+        async def get_messages(self, entity, ids=None):
+            return T.MessageService(id=124, peer_id=T.PeerChannel(1), date=None,
+                                    action=T.MessageActionTopicCreate(title="t", icon_color=0))
+
+    ref = parse_link("https://t.me/c/2703619907/124")
+    with pytest.raises(fetcher.FetchError) as ei:
+        await fetcher.load_message(C(), object(), ref)
+    msg = str(ei.value)
+    assert "论坛话题" in msg and "https://t.me/c/2703619907/124 1-5" in msg
+
+
+@pytest.mark.asyncio
+async def test_other_service_message_unchanged():
+    import fetcher
+    from parser import parse_link
+
+    class C:
+        async def get_messages(self, entity, ids=None):
+            return T.MessageService(id=5, peer_id=T.PeerChannel(1), date=None,
+                                    action=T.MessageActionPinMessage())
+
+    with pytest.raises(fetcher.FetchError, match="系统消息"):
+        await fetcher.load_message(C(), object(), parse_link("https://t.me/c/2703619907/5"))

@@ -34,7 +34,7 @@ import sender
 import streamer
 import tweet
 from config import CFG
-from parser import MsgRef, ParseError, find_internal_links, parse_link
+from parser import MsgRef, ParseError, batch_links, parse_link
 from session_pool import POOL, NoSession
 
 log = logging.getLogger("queue")
@@ -228,8 +228,8 @@ class Runner:
             )
             await db.update_task(task_id, status_msg_id=job.status_msg_id)
 
-        # 抓取组装：可能含受保护内容要搬字节，直接进慢通道
-        if len(find_internal_links(link)) > 1:
+        # 组装（多个链接、或抓取挑了多条）：可能含受保护内容要搬字节，直接进慢通道
+        if not tweet.is_tweet(link) and len(batch_links(link)) > 1:
             job.lane = "slow"
             await db.update_task(task_id, lane="slow")
             await self.slow.put(job)
@@ -274,7 +274,7 @@ class Runner:
                 log.info("task=%s 已搬运，跳过传输直接投递", job.task_id)
                 await self._deliver(job)
                 return
-            if len(find_internal_links(job.link)) > 1:
+            if not tweet.is_tweet(job.link) and len(batch_links(job.link)) > 1:
                 await self._run_grab_batch(job)
             elif tweet.is_tweet(job.link):
                 await self._run_tweet(job, lane)
@@ -553,12 +553,14 @@ class Runner:
         await self._send_tweet_media(job, lane)
 
     async def _run_grab_batch(self, job: Job) -> None:
-        """抓取组装：逐条照常搬进中转频道，再在服务端组成相册。
+        """组装：逐条照常搬进中转频道，再在服务端组成相册。
+
+        来源可以是抓取挑出来的多条，也可以是一条消息里贴的多个 t.me 链接。
 
         每搬完一条就把它在中转频道里的 id 记进库里。中途失败重试时，
         已经搬好的直接跳过 —— 受保护的大文件不会被重新下载上传。
         """
-        links = find_internal_links(job.link)
+        links = batch_links(job.link)
         extra = job.extra if (job.extra or {}).get("kind") == "grab_batch" else {}
         done: dict[str, list[int]] = dict(extra.get("done", {}))
         moved = int(extra.get("bytes", 0))
@@ -609,32 +611,35 @@ class Runner:
     @staticmethod
     async def _grab_units(client: Any, links: list[str],
                           done: dict) -> list:
-        """每条抓取结果配上来源名称和用户名，汇总说明文字要用。
+        """每条结果配上来源名称和用户名，汇总说明文字要用。
 
         查不到来源（比如重启后实体缓存没了）就用 id 当名称、不带标签，
         不影响组装本身。
         """
         from telethon import utils as tl_utils
-        meta: dict[str, tuple[str, str]] = {}
+        meta: dict[str, tuple[str, str, str]] = {}
         units = []
         for link in links:
             ids = done.get(link) or []
             if not ids:
                 continue
-            peer = parse_link(link).direct_peer or ""
-            if peer not in meta:
+            ref = parse_link(link)
+            raw = (ref.direct_peer or (str(ref.peer_id) if ref.is_private else None)
+                   or ref.username or "")
+            if raw not in meta:
                 try:
-                    ent = await client.get_entity(int(peer))
-                    name = tl_utils.get_display_name(ent) or peer
+                    ent = await fetcher.resolve_entity(client, ref)
+                    key = str(tl_utils.get_peer_id(ent))
+                    name = tl_utils.get_display_name(ent) or raw
                     uname = getattr(ent, "username", None)
                     if not uname and getattr(ent, "usernames", None):
                         uname = ent.usernames[0].username
                 except Exception as e:  # noqa: BLE001
-                    log.debug("查来源 %s 失败: %s", peer, e)
-                    name, uname = peer, None
-                meta[peer] = (name, tweet.to_hashtag(uname) if uname else "")
-            name, tag = meta[peer]
-            units.append(assemble.Unit(key=peer, name=name, tag=tag, ids=list(ids)))
+                    log.debug("查来源 %s 失败: %s", raw, e)
+                    key, name, uname = raw, raw, None
+                meta[raw] = (key, name, tweet.to_hashtag(uname) if uname else "")
+            key, name, tag = meta[raw]
+            units.append(assemble.Unit(key=key, name=name, tag=tag, ids=list(ids)))
         return units
 
     async def _check_preview(self, job: Job, tw: Any) -> None:
