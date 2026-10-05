@@ -295,7 +295,7 @@ async def test_resolve_picks_ids_dedupe_album():
     album = [_msg(i, gid=777) for i in range(4632, 4636)]
     c = ScanClient(by_id=album + [_msg(4636), _msg(4637)])
     sp = C("t.me/c/2703619907/124 4632-4637")[0]
-    picks, missing = await bot._resolve_picks(c, object(), sp)
+    picks, missing, _ = await bot._resolve_picks(c, object(), sp)
     assert [m.id for m in picks] == [4632, 4636, 4637]
     assert missing == []
 
@@ -305,7 +305,7 @@ async def test_resolve_picks_missing_and_service():
     import bot
     c = ScanClient(recent=[_msg(9)], by_id=[_msg(4632), _msg(4633, service=True)])
     sp = C("t.me/c/2703619907/124 1 2 4632 4633 4634")[0]
-    picks, missing = await bot._resolve_picks(c, object(), sp)
+    picks, missing, _ = await bot._resolve_picks(c, object(), sp)
     assert [m.id for m in picks] == [9, 4632]
     assert missing == ["第 2 条", "消息 4633", "消息 4634"], "系统消息当作取不到"
 
@@ -315,7 +315,7 @@ async def test_resolve_picks_keeps_written_order():
     import bot
     c = ScanClient(recent=[_msg(9), _msg(8)], by_id=[_msg(4632)])
     sp = C("t.me/c/2703619907/124 2 4632 1")[0]
-    picks, _ = await bot._resolve_picks(c, object(), sp)
+    picks, _, _ = await bot._resolve_picks(c, object(), sp)
     assert [m.id for m in picks] == [8, 4632, 9]
 
 
@@ -339,3 +339,44 @@ def test_multiple_message_links_become_one_task():
     body = body[:body.index("\n\n\n")]
     assert body.count("RUNNER.submit(") == 1
     assert '" ".join(valid)' in body
+
+
+
+# ---------------------------------------------------------------- 翻找统计
+
+@pytest.mark.asyncio
+async def test_scan_counts_messages_visited():
+    import bot
+    c = ScanClient(recent=[_msg(9), _msg(8, service=True), _msg(7)])
+    r = await bot._scan_items(c, object(), 10, topic=124)
+    assert r.scanned == 3 and len(r) == 2
+
+
+@pytest.mark.asyncio
+async def test_short_positions_explain_why():
+    """话题里 1-10 只找到 2 条：要说清楚翻了多少条、其中多少带媒体。"""
+    import bot
+    c = ScanClient(recent=[_msg(9), _msg(8)])
+    sp = C("t.me/c/2703619907/124 1-10")[0]
+    picks, missing, why = await bot._resolve_picks(c, object(), sp)
+    assert len(picks) == 2 and len(missing) == 8
+    assert "这个话题一共只有 2 条消息" in why
+
+
+@pytest.mark.asyncio
+async def test_scan_note_when_limit_reached(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "GRAB_SCAN", 3)
+    c = ScanClient(recent=[_msg(9), _msg(8, service=True), _msg(7, service=True)])
+    r = await bot._scan_items(c, object(), 10)
+    assert "最近 3 条消息里只有 1 条带媒体" in bot._scan_note(r, None)
+    assert "更早的没有翻" in bot._scan_note(r, None)
+
+
+@pytest.mark.asyncio
+async def test_no_scan_note_when_enough():
+    import bot
+    c = ScanClient(recent=[_msg(9), _msg(8)])
+    sp = C("t.me/c/2703619907/124 1 2")[0]
+    _, missing, why = await bot._resolve_picks(c, object(), sp)
+    assert missing == [] and why == ""

@@ -387,14 +387,21 @@ GRAB_HELP = (
 )
 
 
-async def _scan_items(client, entity, need: int, topic: Optional[int] = None) -> list:
+class ScanResult(list):
+    """翻找结果。额外记下翻了多少条消息，抓不够数时用来解释原因。"""
+    scanned: int = 0
+
+
+async def _scan_items(client, entity, need: int,
+                      topic: Optional[int] = None) -> ScanResult:
     """从新到旧列出带媒体的消息，相册只算一条。最多翻 GRAB_SCAN 条。
 
     topic 给了就只在那个论坛话题里翻。
     """
-    picked, seen_groups = [], set()
+    picked, seen_groups = ScanResult(), set()
     kw = {"reply_to": topic} if topic else {}
     async for msg in client.iter_messages(entity, limit=GRAB_SCAN, **kw):
+        picked.scanned += 1
         if msg.media is None or isinstance(msg, MessageService):
             continue
         gid = getattr(msg, "grouped_id", None)
@@ -408,15 +415,27 @@ async def _scan_items(client, entity, need: int, topic: Optional[int] = None) ->
     return picked
 
 
-async def _resolve_picks(client, entity, sp) -> tuple[list, list[str]]:
-    """按写的顺序把「第几条」和「消息 id」换成具体消息。返回 (消息, 缺失说明)。
+def _scan_note(items: "ScanResult", topic: Optional[int]) -> str:
+    """抓不够数时的解释：到底翻了多少、找到多少。"""
+    where = "这个话题" if topic else "这个对话"
+    if items.scanned < GRAB_SCAN:
+        return (f"{where}一共只有 {items.scanned} 条消息，"
+                f"其中 {len(items)} 条带媒体（相册算一条）")
+    return (f"{where}最近 {items.scanned} 条消息里只有 {len(items)} 条带媒体"
+            f"（相册算一条），更早的没有翻")
+
+
+async def _resolve_picks(client, entity, sp) -> tuple[list, list[str], str]:
+    """按写的顺序把「第几条」和「消息 id」换成具体消息。
+
+    返回 (消息, 缺失说明, 翻找统计)。翻找统计只在「第几条」不够数时给出。
 
     消息 id 指到相册里的某一张时，同一个相册只取一次 —— 下游会凑齐整组，
     否则 4632-4638 刚好覆盖一个 7 张图的相册时会把它重复搬 7 次。
     """
     positions = sp.positions or []
     items = (await _scan_items(client, entity, max(positions), sp.topic)
-             if positions else [])
+             if positions else ScanResult())
     by_id = {}
     if sp.ids:
         got = await client.get_messages(entity, ids=sp.ids)
@@ -443,7 +462,8 @@ async def _resolve_picks(client, entity, sp) -> tuple[list, list[str]]:
         if msg.id not in seen_ids:
             seen_ids.add(msg.id)
             picks.append(msg)
-    return picks, missing
+    short = positions and max(positions) > len(items)
+    return picks, missing, (_scan_note(items, sp.topic) if short else "")
 
 
 async def do_grab(m: Message, specs: list, fw_to: Optional[str] = None) -> None:
@@ -484,10 +504,13 @@ async def do_grab(m: Message, specs: list, fw_to: Optional[str] = None) -> None:
                 if sp.is_legacy:
                     items = await _scan_items(client, entity, sp.count, sp.topic)
                     picks = list(reversed(items))   # 由旧到新，保持原顺序
+                    if len(items) < sp.count:
+                        notes.append(f"只找到 {len(items)} 条：{_scan_note(items, sp.topic)}")
                 else:
-                    picks, missing = await _resolve_picks(client, entity, sp)
+                    picks, missing, why = await _resolve_picks(client, entity, sp)
                     if missing:
-                        notes.append(f"{sp.target} 没有 {'、'.join(missing)}")
+                        notes.append(f"{sp.target} 没有 {'、'.join(missing)}"
+                                     + (f"\n{why}" if why else ""))
                 if not picks and sp.is_legacy:
                     notes.append(f"{sp.target} 最近 {GRAB_SCAN} 条消息里没找到媒体")
                 for msg in picks:

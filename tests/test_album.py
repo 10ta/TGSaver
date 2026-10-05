@@ -57,12 +57,15 @@ class FakeMsg:
 class FakeClient:
     """记录每一步调用，供断言。"""
 
-    def __init__(self, fail_multi=False):
+    def __init__(self, fail_multi=False, fail_single=()):
         self.uploaded = []
         self.input_media = []
         self.sent_individually = []
+        self.sent_by_ref = []
         self.fail_multi = fail_multi
+        self.fail_single = set(fail_single)
         self.multi_batches = []
+        self._single_n = 0
 
     def iter_download(self, media, request_size=None, **kw):
         async def gen():
@@ -71,9 +74,15 @@ class FakeClient:
 
     async def upload_file(self, f, file_size=None, file_name=None,
                           progress_callback=None):
-        if hasattr(f, "read"):
+        if hasattr(f, "read") and not hasattr(f, "getvalue"):
             data = await f.read(file_size or 0)
             self.uploaded.append((file_name, len(data)))
+        elif hasattr(f, "getvalue"):
+            # 内存里的缩略图：像真实的 Telethon 一样从当前位置读，读空就报错
+            data = f.read()
+            if not data:
+                raise RuntimeError("FilePartEmpty: The provided file part is empty")
+            self.uploaded.append(("thumb", len(data)))
         else:
             self.uploaded.append((file_name, -1))
         return f"handle:{file_name}"
@@ -82,6 +91,9 @@ class FakeClient:
         return None
 
     async def send_file(self, relay, file=None, **kw):
+        thumb = kw.get("thumb")
+        if thumb is not None:
+            await self.upload_file(thumb)       # 真实的 send_file 会上传缩略图
         self.sent_individually.append((file, kw))
         return type("S", (), {"id": 500 + len(self.sent_individually)})()
 
@@ -94,6 +106,14 @@ class FakeClient:
             if isinstance(request.media, InputMediaUploadedPhoto):
                 return MessageMediaPhoto(photo=_FakePhoto())
             return MessageMediaDocument(document=_FakeRealDoc())
+        if name == "SendMediaRequest":
+            i = self._single_n
+            self._single_n += 1
+            if i in self.fail_single:
+                raise RuntimeError("MEDIA_EMPTY")
+            self.sent_by_ref.append(request.media)
+            msg = type("M", (), {"id": 800 + i})()
+            return type("R", (), {"updates": [_FakeUpdate(msg)]})()
         if name == "SendMultiMediaRequest":
             self.multi_batches.append(request.multi_media)
             if self.fail_multi:
@@ -204,17 +224,16 @@ async def test_spoiler_always_stripped():
 
 
 @pytest.mark.asyncio
-async def test_falls_back_to_individual_on_failure():
-    """整组发送失败时退化为逐条，已上传的字节不能白费。"""
+async def test_falls_back_using_already_uploaded_media():
+    """整组发送失败时，直接用已经在服务器上的媒体逐条发，不重传、不重读缩略图。"""
     msgs = [FakeMsg(1, 100, "a.mp4"), FakeMsg(2, 100, "b.mp4")]
     c = FakeClient(fail_multi=True)
     ids, total, note = await streamer.relay_protected_album(c, msgs, -100)
 
-    assert len(c.sent_individually) == 2, "应逐条补发"
-    assert len(ids) == 2
-    assert "分组未能保持" in note
-    # 关键：没有重新上传
-    assert len(c.uploaded) == 2, f"不该重传，实际上传 {len(c.uploaded)} 次"
+    assert len(c.sent_by_ref) == 2, "应直接用服务器上的媒体逐条发"
+    assert c.sent_individually == [], "不该走重新上传"
+    assert len([u for u in c.uploaded if u[0] != "thumb"]) == 2, "文件只传过一次"
+    assert len(ids) == 2 and "分组未能保持" in note
 
 
 @pytest.mark.asyncio
@@ -268,3 +287,46 @@ async def test_photo_album_uses_photo_branch():
     assert all(isinstance(im, InputMediaUploadedPhoto) for im in c.input_media)
     assert len(ids) == 2
     assert note == ""
+
+
+
+# ================================================================ 这次线上的 bug
+
+class ThumbMsg(FakeMsg):
+    """带缩略图的视频，复现线上那条：相册被拒 -> 退回逐条 -> 缩略图读空。"""
+
+
+@pytest.mark.asyncio
+async def test_thumbnail_reusable_after_album_failure(monkeypatch):
+    """线上报错：相册整组被拒后退回逐条，缩略图在组相册时已上传过一次，
+    内存流读到了末尾；重传时读出 0 字节，Telegram 报 FilePartEmpty。"""
+    import io
+
+    async def fake_thumb(client, msg):
+        b = io.BytesIO(b"J" * 500)
+        b.name = "thumb.jpg"
+        return b
+    monkeypatch.setattr(streamer, "fetch_thumb", fake_thumb)
+
+    msgs = [FakeMsg(1, 100, "a.mp4"), FakeMsg(2, 100, "b.mp4")]
+    # 整组失败，且第 2 项单独发也失败 -> 第 2 项必须重新上传（带缩略图）
+    c = FakeClient(fail_multi=True, fail_single={1})
+    ids, _, _ = await streamer.relay_protected_album(c, msgs, -100)
+    assert len(ids) == 2
+    assert len(c.sent_individually) == 1, "只有失败的那一项重传"
+    thumbs = [u for u in c.uploaded if u[0] == "thumb"]
+    assert thumbs and all(n == 500 for _, n in thumbs), "缩略图每次都应读到完整内容"
+
+
+@pytest.mark.asyncio
+async def test_send_rewinds_thumbnail():
+    import io
+    t = io.BytesIO(b"J" * 300)
+    t.name = "thumb.jpg"
+    t.read()                                    # 模拟已经被读过一次
+    spec = streamer.MediaSpec(size=1, file_name="v.mp4", mime_type="video/mp4",
+                              attributes=[], is_photo=False, force_document=False,
+                              caption="", entities=[], thumb=t)
+    c = FakeClient()
+    await streamer._send(c, -100, "h", spec)
+    assert ("thumb", 300) in c.uploaded

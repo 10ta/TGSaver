@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 
 from telethon import TelegramClient, helpers, utils
 from telethon.tl.functions.messages import (
+    SendMediaRequest,
     SendMultiMediaRequest,
     UploadMediaRequest,
 )
@@ -321,7 +322,15 @@ async def _via_disk(client, msg, spec: MediaSpec, relay: int, prog,
             await _maybe_await(register_tmp(None))
 
 
+def _rewind(f: Any) -> None:
+    """内存里的缩略图是个流，上传一次就读到了末尾。再用之前必须倒回开头，
+    否则读出来是 0 字节，Telegram 报 FilePartEmpty。"""
+    if f is not None and hasattr(f, "seek"):
+        f.seek(0)
+
+
 async def _send(client, relay: int, handle, spec: MediaSpec):
+    _rewind(spec.thumb)
     return await client.send_file(
         relay,
         file=handle,
@@ -468,6 +477,7 @@ async def _to_input_media(client: TelegramClient, handle: Any,
     thumb = None
     if spec.thumb is not None:
         try:
+            _rewind(spec.thumb)
             thumb = await client.upload_file(spec.thumb)
         except Exception as e:  # noqa: BLE001
             log.debug("缩略图上传失败，忽略: %s", e)
@@ -718,6 +728,35 @@ async def relay_web_media(
     return ids, total, note
 
 
+async def _send_one_by_one(client: TelegramClient, peer: int, hs: list,
+                           ss: list[MediaSpec], multi: list) -> list[int]:
+    """相册发不出去时逐条补发。
+
+    组相册前，每一项都已经通过 UploadMedia 落到了 Telegram 服务器（就是
+    multi 里的那些）。所以优先直接用它们逐条发，不重传文件、不重读缩略图。
+    某一项单独发也失败，才对它重新上传 —— 并记下是哪一项，方便追查
+    整组被拒到底是哪个文件引起的。
+    """
+    ids: list[int] = []
+    for i, (h, s) in enumerate(zip(hs, ss)):
+        if i < len(multi):
+            sm = multi[i]
+            try:
+                res = await client(SendMediaRequest(
+                    peer=peer, media=sm.media, message=sm.message,
+                    entities=sm.entities, random_id=helpers.generate_random_long()))
+                got = _ids_from_updates(res)
+                if got:
+                    ids.extend(got)
+                    continue
+            except Exception as e:  # noqa: BLE001
+                log.warning("相册第 %d 项（%s, %s）单独发送也失败，改为重新上传: %s",
+                            i + 1, s.file_name, s.mime_type, e)
+        sent = await _send(client, peer, h, s)
+        ids.append(sent.id)
+    return ids
+
+
 async def send_handles_as_album(
     client: TelegramClient, relay_channel: int,
     handles: list, specs: list[MediaSpec],
@@ -733,8 +772,8 @@ async def send_handles_as_album(
     for chunk_start in range(0, len(handles), 10):
         hs = handles[chunk_start:chunk_start + 10]
         ss = specs[chunk_start:chunk_start + 10]
+        multi = []
         try:
-            multi = []
             for h, s in zip(hs, ss):
                 im = await _to_input_media(client, h, s, relay_channel)
                 multi.append(InputSingleMedia(
@@ -755,9 +794,8 @@ async def send_handles_as_album(
             # 字节已经传上去了，别浪费。退化成逐条发送，
             # 至少把内容给到用户，只是分组保不住。
             log.warning("相册整组发送失败，退化为逐条: %s", e)
-            for h, s in zip(hs, ss):
-                sent = await _send(client, relay_channel, h, s)
-                sent_ids.append(sent.id)
+            sent_ids.extend(await _send_one_by_one(
+                client, relay_channel, hs, ss, multi))
             note = "相册整组发送失败，已逐条转存，分组未能保持。"
 
     return sorted(sent_ids), note
