@@ -593,18 +593,49 @@ class Runner:
             job.extra = {"kind": "grab_batch", "done": done, "bytes": moved}
             await db.update_task(job.task_id, extra=json.dumps(job.extra))
 
-        ids = [x for link in links for x in done.get(link, [])]
-        if not ids:
+        if not any(done.get(link) for link in links):
             raise fetcher.FetchError(f"{len(links)} 条全部取不到。")
 
         await self._say(job, "正在组装…")
         async with POOL.lock_for(suid):
-            final, note = await assemble.compose(client, relay_ch, ids)
+            units = await self._grab_units(client, links, done)
+            final, note = await assemble.compose(client, relay_ch, units)
         if skipped:
             note = f"{note} 其中 {skipped} 条取不到。".strip()
 
         await self._finish(job, fetcher.Relayed(
             final, len(final) > 1, "B", moved, note))
+
+    @staticmethod
+    async def _grab_units(client: Any, links: list[str],
+                          done: dict) -> list:
+        """每条抓取结果配上来源名称和用户名，汇总说明文字要用。
+
+        查不到来源（比如重启后实体缓存没了）就用 id 当名称、不带标签，
+        不影响组装本身。
+        """
+        from telethon import utils as tl_utils
+        meta: dict[str, tuple[str, str]] = {}
+        units = []
+        for link in links:
+            ids = done.get(link) or []
+            if not ids:
+                continue
+            peer = parse_link(link).direct_peer or ""
+            if peer not in meta:
+                try:
+                    ent = await client.get_entity(int(peer))
+                    name = tl_utils.get_display_name(ent) or peer
+                    uname = getattr(ent, "username", None)
+                    if not uname and getattr(ent, "usernames", None):
+                        uname = ent.usernames[0].username
+                except Exception as e:  # noqa: BLE001
+                    log.debug("查来源 %s 失败: %s", peer, e)
+                    name, uname = peer, None
+                meta[peer] = (name, tweet.to_hashtag(uname) if uname else "")
+            name, tag = meta[peer]
+            units.append(assemble.Unit(key=peer, name=name, tag=tag, ids=list(ids)))
+        return units
 
     async def _check_preview(self, job: Job, tw: Any) -> None:
         """auto 模式：发送前确认预览里带齐了媒体，不齐就改成发原始媒体。
