@@ -143,8 +143,8 @@ async def load_message(client: TelegramClient, entity: Any, ref: MsgRef) -> Mess
             raise FetchError(
                 "这是论坛话题的链接，不是某一条消息。\n"
                 "要抓话题里的内容，在链接后面加数字：\n"
-                f"<code>{ref.raw.split('?')[0]} 1-5</code>  话题里最近的第 1~5 条\n"
-                f"<code>{ref.raw.split('?')[0]} 4632-4638</code>  按消息 id")
+                f"<code>{ref.raw.split('?')[0]} 1-5</code>  话题里的第 1~5 条\n"
+                f"<code>{ref.raw.split('?')[0]}/4632-4638</code>  按消息 id")
         raise FetchError("这是一条系统消息（入群/置顶提示等），无法转存。")
     return msg
 

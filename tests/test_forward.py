@@ -59,10 +59,10 @@ def test_not_a_directive(text):
 
 def test_stripped_before_link_parsing():
     """fw 后面的 t.me 是去向，不能被当成「抓取该对话」。"""
-    from bot import parse_grab_target
+    from bot import parse_grab_command
     has, target, rest = parse_forward("t.me/chan/123 fw t.me/mychan")
     assert has and target == "t.me/mychan"
-    assert parse_grab_target(rest) is None, "剥掉 fw 后不该再被当成抓取指令"
+    assert parse_grab_command(rest) is None, "剥掉 fw 后不该再被当成抓取指令"
 
 
 def test_works_with_nosp():

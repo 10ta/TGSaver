@@ -1,8 +1,7 @@
-"""裸文本抓取目标的识别。
+"""抓取写法的识别。只有一条规则：数字永远是「第几条」。
 
-这个解析器直接挂在「任意文本」上，所以最大的风险不是漏判而是误判：
-把普通聊天内容当成抓取指令，会让 bot 去解析一个不存在的对话，
-然后回一句莫名其妙的错误。下面的用例里反例比正例多，就是这个原因。
+这个解析器挂在「任意文本」上，所以最大的风险是误判：把普通聊天内容
+当成抓取指令，或者把普通消息链接吃掉。下面反例和正例一样多。
 """
 import os
 import sys
@@ -21,228 +20,181 @@ os.environ.setdefault("SECRET_KEY", Fernet.generate_key().decode())
 
 import pytest  # noqa: E402
 
-from bot import GRAB_MAX, parse_grab_target as P  # noqa: E402
+from bot import GrabSpec, old_syntax_hint, parse_grab_command as C  # noqa: E402
 
 
-# ------------------------------------------------- 应该识别
-
-@pytest.mark.parametrize("text,want", [
-    # 链接形式（主推：不会触发 Telegram 的 inline 查询拦截）
-    ("t.me/some_bot",              ("some_bot", 1)),
-    ("t.me/some_bot 5",            ("some_bot", 5)),
-    ("https://t.me/some_bot 3",    ("some_bot", 3)),
-    ("http://t.me/some_bot",       ("some_bot", 1)),
-    ("https://www.t.me/some_bot",  ("some_bot", 1)),
-    ("t.me/some_bot/ 2",           ("some_bot", 2)),
-    ("  t.me/some_bot 5  ",        ("some_bot", 5)),
-    # 私有频道：t.me/c/ 里的数字要补回 -100 前缀
-    ("t.me/c/1234567890 2",        ("-1001234567890", 2)),
-    ("t.me/c/1234567890",          ("-1001234567890", 1)),
-    # 点号简写
-    (".some_bot",                  ("some_bot", 1)),
-    (".some_bot 5",                ("some_bot", 5)),
-    (">some_bot 5",                ("some_bot", 5)),
-    (".@some_bot 5",               ("some_bot", 5)),
-    # @ 形式仍保留（bot 不支持 inline 时可用）
-    ("@some_bot",                  ("some_bot", 1)),
-    ("@some_bot 5",                ("some_bot", 5)),
-    ("  @some_bot 5  ",            ("some_bot", 5)),
-    # 数字 id
-    ("123456789",                  ("123456789", 1)),
-    ("123456789 3",                ("123456789", 3)),
-    ("-1001234567890 2",           ("-1001234567890", 2)),
-])
-def test_recognized(text, want):
-    assert P(text) == want
+def _p(text):
+    r = C(text)
+    return None if r is None else [(x.target, x.topic, x.picks) for x in r]
 
 
-# --------------------------------- 绝不能吞掉真正的消息链接
-
-@pytest.mark.parametrize("text", [
-    "https://t.me/durov/1",
-    "t.me/durov/1",
-    "t.me/durov/1 nosp",
-    "https://t.me/c/1234567890/123",
-    "https://t.me/c/1234567890/45/123",
-    "https://t.me/chan/181?comment=4832",
-    "https://t.me/b/botname/77",
-    "https://t.me/joinchat/AAAA",
-    "https://t.me/durov/1 https://t.me/durov/2",
-])
-def test_message_links_not_swallowed(text):
-    """带消息 id 的链接必须交给正常流程，不能被当成抓取目标。"""
-    assert P(text) is None, f"{text!r} 是消息链接，不该走抓取"
+def _pos(*ns):
+    return [("pos", n) for n in ns]
 
 
-def test_count_clamped_to_max():
-    assert P("@bot_name 999")[1] == GRAB_MAX
-    assert P("@bot_name 0")[1] == 1
+def _ids(*ns):
+    return [("id", n) for n in ns]
 
 
-# ------------------------------------------------- 绝不能误判
-
-@pytest.mark.parametrize("text", [
-    "hello",                      # 普通单词，长度正好像用户名
-    "thanks",
-    "在吗",
-    "ok 5",
-    "test 3",
-    "123",                        # 太短，更像随口一个数字
-    "2024",
-    "12345",                      # 5 位，仍不够长
-    "@ab",                        # 用户名太短
-    "@some_bot 5 extra",          # 多余内容
-    "@some_bot@other",
-    "帮我看看 @some_bot",          # 夹在句子里
-    "@some_bot 你好",
-    ".ab",                        # 点号后用户名太短
-    "",
-    "   ",
-    "/start",
-    "-",
-    "abc def",
-])
-def test_not_recognized(text):
-    assert P(text) is None, f"{text!r} 不该被当成抓取目标"
-
-
-def test_bare_word_requires_marker():
-    """裸用户名只认以 bot 结尾的：Telegram 规定 bot 用户名必须以 bot 结尾，
-    所以 "hello" 这种普通词不会被误判。其他对话仍需 t.me/、@ 或点号。"""
-    assert P("some_bot") == ("some_bot", 1)
-    assert P("SomeBot 3") == ("SomeBot", 3)
-    assert P("some_user") is None
-    assert P("hello") is None
-    assert P("@some_user") == ("some_user", 1)
-    assert P(".some_user") == ("some_user", 1)
-    assert P("t.me/some_user") == ("some_user", 1)
-
-
-def test_numeric_needs_six_digits():
-    assert P("12345") is None
-    assert P("123456") == ("123456", 1)
-
-
-# ================================================================ 多对话、多数字、区间
-
-from bot import parse_grab_command as C  # noqa: E402
-
-
-def _s(specs):
-    return [(x.target, x.count, x.positions) for x in specs]
-
+# ================================================================ 数字永远是第几条
 
 @pytest.mark.parametrize("text,want", [
-    # 单个对话 + 单个数字：原有逻辑不变
-    ("t.me/ym_ss_bot 2",          [("ym_ss_bot", 2, None)]),
-    ("ym_ss_bot 2",               [("ym_ss_bot", 2, None)]),
-    ("ym_ss_bot",                 [("ym_ss_bot", 1, None)]),
-    # 多个数字、区间：按位置
-    ("t.me/a_bot 1 3 5",          [("a_bot", None, [1, 3, 5])]),
-    ("t.me/a_bot 1-3 7",          [("a_bot", None, [1, 2, 3, 7])]),
-    ("t.me/a_bot 1-3",            [("a_bot", None, [1, 2, 3])]),
-    ("t.me/a_bot 3-1",            [("a_bot", None, [1, 2, 3])]),
-    ("t.me/a_bot 2 1",            [("a_bot", None, [2, 1])]),       # 按写的顺序
-    ("t.me/a_bot 1 1 2",          [("a_bot", None, [1, 2])]),       # 去重
-    # 多个对话
-    (".a_bot 3 .b_bot 1-2",       [("a_bot", 3, None), ("b_bot", None, [1, 2])]),
-    ("t.me/a_bot 1 t.me/c/1234567890 2 5",
-                                  [("a_bot", 1, None), ("-1001234567890", None, [2, 5])]),
-    # 同一对话出现多次：合并，按位置
-    (".ym_ss_bot 1 .ym_ss_bot 2", [("ym_ss_bot", None, [1, 2])]),
-    (".x_bot .x_bot",             [("x_bot", None, [1])]),
-    (".x_bot 3 .x_bot 5-6",       [("x_bot", None, [3, 5, 6])]),
+    ("t.me/ym_ss_bot",             [("ym_ss_bot", None, _pos(1))]),   # 不写数字 = 第 1 条
+    ("t.me/ym_ss_bot 5",           [("ym_ss_bot", None, _pos(5))]),   # 单个数字也是第几条
+    ("t.me/ym_ss_bot 1-5",         [("ym_ss_bot", None, _pos(1, 2, 3, 4, 5))]),
+    ("t.me/ym_ss_bot 1 3 7-9",     [("ym_ss_bot", None, _pos(1, 3, 7, 8, 9))]),
+    ("t.me/ym_ss_bot 2 1",         [("ym_ss_bot", None, _pos(2, 1))]),  # 按写的顺序
+    ("t.me/ym_ss_bot 3-1",         [("ym_ss_bot", None, _pos(1, 2, 3))]),  # 区间从小到大
+    ("t.me/ym_ss_bot 1 1 2",       [("ym_ss_bot", None, _pos(1, 2))]),  # 去重
+    ("https://t.me/ym_ss_bot 2",   [("ym_ss_bot", None, _pos(2))]),
+    ("t.me/ym_ss_bot/ 2",          [("ym_ss_bot", None, _pos(2))]),
 ])
-def test_grab_command(text, want):
-    assert _s(C(text)) == want
+def test_numbers_are_positions(text, want):
+    assert _p(text) == want
+
+
+def test_single_number_no_longer_means_latest_n():
+    """统一前「bot 5」是最近 5 条，「bot 5 6」是第 5、6 条 —— 同一个 5 两种意思。"""
+    assert C("t.me/a_bot 5")[0].positions == [5]
+    assert C("t.me/a_bot 5 6")[0].positions == [5, 6]
+
+
+# ================================================================ 目标只有三种写法
+
+@pytest.mark.parametrize("text,target", [
+    ("t.me/some_bot 1", "some_bot"),
+    (".some_bot 1", "some_bot"),
+    ("some_bot 1", "some_bot"),
+    ("SomeBot 1", "SomeBot"),
+    ("t.me/some_user 1", "some_user"),
+    (".some_user 1", "some_user"),
+    ("t.me/c/1234567890 1", "-1001234567890"),
+    ("-1001234567890 1", "-1001234567890"),
+])
+def test_target_forms(text, target):
+    assert C(text)[0].target == target
 
 
 @pytest.mark.parametrize("text", [
-    "hello 5", "ok 5", "1 3 5", "a_bot 1 hello", "t.me/a_bot 1-x",
-    "t.me/a_bot 1 3 abc", "t.me/durov/1", "some_user 2", "",
+    "@some_bot 1",          # 会被 Telegram 拦成 inline 查询，不再支持
+    ">some_bot 1",          # 多余的同义写法，去掉
+    "123456789 1",          # 纯正数对话 id 会和其他数字混淆，去掉
+    "some_user 1",          # 不带前缀只认以 bot 结尾的
 ])
-def test_grab_command_rejects(text):
-    """有任何一个词认不出来，整条都不算抓取指令。"""
+def test_removed_target_forms(text):
     assert C(text) is None
+
+
+# ================================================================ 多个对话
+
+def test_multiple_dialogs():
+    assert _p(".a_bot 1-2 .b_bot 3") == [("a_bot", None, _pos(1, 2)),
+                                         ("b_bot", None, _pos(3))]
+
+
+def test_same_dialog_twice_merges():
+    """统一后这不再是特例：数字都是第几条，合起来就行。"""
+    assert _p(".x_bot 1 .x_bot 2") == [("x_bot", None, _pos(1, 2))]
+    assert _p(".x_bot .x_bot") == [("x_bot", None, _pos(1))]
+
+
+# ================================================================ 论坛话题与消息 id
+
+def test_topic_positions():
+    assert _p("https://t.me/c/2703619907/124 1-3") == [
+        ("-1002703619907", 124, _pos(1, 2, 3))]
+    assert _p("t.me/somegroup/45 2") == [("somegroup", 45, _pos(2))]
+
+
+def test_message_ids_live_in_the_link():
+    """消息 id 写进链接路径里，和普通消息链接一个形状，不再靠位数区分。"""
+    assert _p("t.me/c/2703619907/124/4632-4634") == [
+        ("-1002703619907", 124, _ids(4632, 4633, 4634))]
+    assert _p("t.me/c/2703619907/4632-4633") == [
+        ("-1002703619907", None, _ids(4632, 4633))]
+    assert _p("t.me/somegroup/45/100-101") == [("somegroup", 45, _ids(100, 101))]
+
+
+def test_small_message_ids_work_now():
+    """以前 id 小于 1000 没法用（会被当成第几条），现在写在链接里就没问题。"""
+    assert _p("t.me/c/2703619907/5-7") == [("-1002703619907", None, _ids(5, 6, 7))]
+
+
+def test_id_range_and_positions_combined():
+    r = C("t.me/c/2703619907/124 1-2 t.me/c/2703619907/124/4632-4633")
+    assert len(r) == 1 and r[0].picks == _pos(1, 2) + _ids(4632, 4633)
+
+
+def test_nothing_may_follow_an_id_range():
+    """id 区间后面再跟数字，意思说不清，不认。"""
+    assert C("t.me/c/2703619907/124/4632-4634 1") is None
+
+
+def test_id_range_capped():
+    assert len(C("t.me/c/2703619907/124/1000-9999")[0].ids) == 100
 
 
 def test_positions_capped():
     assert len(C("t.me/a_bot 1-999")[0].positions) == 50
 
 
-def test_position_zero_dropped():
-    assert C("t.me/a_bot 0 2")[0].positions == [2]
+# ================================================================ 绝不能误判
+
+@pytest.mark.parametrize("text", [
+    "hello", "hello 5", "ok 5", "在吗", "1 3 5", "2024",
+    "a_bot 1 hello", "t.me/a_bot 1-x", "t.me/a_bot 1234",
+    "@ab", ".ab", "帮我看看 t.me/a_bot", "", "   ",
+])
+def test_not_a_grab_command(text):
+    assert C(text) is None
 
 
-def test_numeric_id_not_confused_with_position():
-    """6 位以上是对话 id，1~3 位是第几条，不会混。"""
-    assert _s(C("123456789 2 3")) == [("123456789", None, [2, 3])]
-    assert C("t.me/a_bot 1234")[0].ids == [1234], "4 位以上按消息 id 理解"
+@pytest.mark.parametrize("text", [
+    "https://t.me/durov/1",
+    "https://t.me/c/1234567890/123",
+    "https://t.me/c/2703619907/124",          # 单独的话题链接 = 那条消息
+    "https://t.me/c/1234567890/45/123",
+    "https://t.me/chan/181?comment=4832",
+    "https://t.me/durov/1 https://t.me/durov/2",
+    "https://t.me/joinchat/AAAA",
+])
+def test_message_links_not_swallowed(text):
+    assert C(text) is None
+
+
+# ================================================================ 旧写法提示
+
+@pytest.mark.parametrize("text,frag", [
+    ("t.me/c/2703619907/124 4632-4638", "t.me/c/2703619907/124/4632-4638"),
+    ("https://t.me/c/2703619907/124 4632", "https://t.me/c/2703619907/124/4632"),
+    ("@ym_ss_bot 5", "t.me/ym_ss_bot"),
+    (">ym_ss_bot 5", ".ym_ss_bot"),
+    ("123456789 3", "t.me/c/123456789"),
+])
+def test_old_syntax_gets_a_hint(text, frag):
+    assert frag in old_syntax_hint(text)
+
+
+@pytest.mark.parametrize("text", ["hello 2024", "2024", "在吗", "", "t.me/a_bot 1",
+                                  "https://x.com/a/status/12 2024"])
+def test_no_hint_for_normal_text(text):
+    assert old_syntax_hint(text) is None
 
 
 def test_do_grab_passes_forward_target():
-    """抓取时写的 fw 必须传下去 —— 以前漏了，导致静默不转发。"""
+    """抓取时写的 fw 必须传下去。"""
     src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
     body = src[src.index("async def do_grab"):src.index('@router.message(Command("grab"))')]
     calls = body.count("RUNNER.submit(")
     assert calls >= 1 and body.count("forward_to=fw_to") == calls
 
 
-# ================================================================ 论坛话题与消息 id
-
-def _p(text):
-    r = C(text)
-    return None if r is None else [(x.target, x.topic, x.count, x.picks) for x in r]
-
-
-def test_topic_with_positions():
-    assert _p("https://t.me/c/2703619907/124 1-3") == [
-        ("-1002703619907", 124, None, [("pos", 1), ("pos", 2), ("pos", 3)])]
-
-
-def test_topic_with_message_ids():
-    assert _p("https://t.me/c/2703619907/124 4632-4634") == [
-        ("-1002703619907", 124, None, [("id", 4632), ("id", 4633), ("id", 4634)])]
-
-
-def test_public_topic():
-    assert _p("t.me/somegroup/45 2") == [("somegroup", 45, 2, None)]
-
-
-def test_bare_topic_link_stays_a_message_link():
-    """单独一个话题 / 消息链接不能被吃成抓取指令，要交给普通链接流程。"""
-    assert C("https://t.me/c/2703619907/124") is None
-    assert C("https://t.me/durov/1") is None
-
-
-def test_positions_and_ids_mixed_in_written_order():
-    assert _p("t.me/c/2703619907/124 2 4635 1") == [
-        ("-1002703619907", 124, None, [("pos", 2), ("id", 4635), ("pos", 1)])]
-
-
-def test_id_range_capped():
-    r = C("t.me/c/2703619907/124 1000-9999")[0]
-    assert len(r.ids) == 100
-
-
-def test_positive_long_number_after_target_is_message_id():
-    """开头的长数字是对话 id；后面的正数长数字是消息 id；负数仍是对话 id。"""
-    assert _p("123456789 2") == [("123456789", None, 2, None)]
-    assert _p("t.me/a_bot 1 123456789") == [("a_bot", None, None,
-                                             [("pos", 1), ("id", 123456789)])]
-    assert [x.target for x in C("t.me/a_bot 1 -1001234567890 2")] == \
-        ["a_bot", "-1001234567890"]
-
-
-def test_same_topic_twice_merges():
-    assert _p("t.me/c/2703619907/124 1 t.me/c/2703619907/124 2") == [
-        ("-1002703619907", 124, None, [("pos", 1), ("pos", 2)])]
-
-
-def test_different_topics_same_group_stay_separate():
-    r = C("t.me/c/2703619907/124 1 t.me/c/2703619907/125 1")
-    assert [(x.target, x.topic) for x in r] == [
-        ("-1002703619907", 124), ("-1002703619907", 125)]
+def test_do_grab_has_no_separate_delivery_branch():
+    """统一后只有一种交付：一条原样发，多条拼相册，都是一个任务。"""
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
+    body = src[src.index("async def do_grab"):src.index('@router.message(Command("grab"))')]
+    assert body.count("RUNNER.submit(") == 1
+    assert "is_legacy" not in src and "GRAB_MAX" not in src
 
 
 # ---------------------------------------------------------------- 取具体消息
@@ -294,7 +246,7 @@ async def test_resolve_picks_ids_dedupe_album():
     import bot
     album = [_msg(i, gid=777) for i in range(4632, 4636)]
     c = ScanClient(by_id=album + [_msg(4636), _msg(4637)])
-    sp = C("t.me/c/2703619907/124 4632-4637")[0]
+    sp = C("t.me/c/2703619907/124/4632-4637")[0]
     picks, missing, _ = await bot._resolve_picks(c, object(), sp)
     assert [m.id for m in picks] == [4632, 4636, 4637]
     assert missing == []
@@ -304,7 +256,7 @@ async def test_resolve_picks_ids_dedupe_album():
 async def test_resolve_picks_missing_and_service():
     import bot
     c = ScanClient(recent=[_msg(9)], by_id=[_msg(4632), _msg(4633, service=True)])
-    sp = C("t.me/c/2703619907/124 1 2 4632 4633 4634")[0]
+    sp = GrabSpec("-1002703619907", [("pos", 1), ("pos", 2), ("id", 4632), ("id", 4633), ("id", 4634)], 124)
     picks, missing, _ = await bot._resolve_picks(c, object(), sp)
     assert [m.id for m in picks] == [9, 4632]
     assert missing == ["第 2 条", "消息 4633", "消息 4634"], "系统消息当作取不到"
@@ -314,7 +266,7 @@ async def test_resolve_picks_missing_and_service():
 async def test_resolve_picks_keeps_written_order():
     import bot
     c = ScanClient(recent=[_msg(9), _msg(8)], by_id=[_msg(4632)])
-    sp = C("t.me/c/2703619907/124 2 4632 1")[0]
+    sp = GrabSpec("-1002703619907", [("pos", 2), ("id", 4632), ("pos", 1)], 124)
     picks, _, _ = await bot._resolve_picks(c, object(), sp)
     assert [m.id for m in picks] == [8, 4632, 9]
 
