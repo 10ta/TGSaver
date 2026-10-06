@@ -560,7 +560,14 @@ class Runner:
         每搬完一条就把它在中转频道里的 id 记进库里。中途失败重试时，
         已经搬好的直接跳过 —— 受保护的大文件不会被重新下载上传。
         """
+        # 同一个对话里按消息 id 从旧到新排；不同对话保持写的先后
         links = batch_links(job.link)
+        first = {}
+        for l in links:
+            r = parse_link(l)
+            first.setdefault(r.direct_peer or r.channel_id or r.username, len(first))
+        links.sort(key=lambda l: (first[(r := parse_link(l)).direct_peer or r.channel_id or r.username],
+                                  r.comment_id or r.msg_id))
         extra = job.extra if (job.extra or {}).get("kind") == "grab_batch" else {}
         done: dict[str, list[int]] = dict(extra.get("done", {}))
         moved = int(extra.get("bytes", 0))

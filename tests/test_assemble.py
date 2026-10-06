@@ -604,7 +604,7 @@ async def test_tme_batch_relays_each_link(qdb, monkeypatch):
     tid = await qdb.add_task(42, link, 9, 5)
     await r._run(taskqueue.Job(tid, 42, link, 9, 5), "slow")
 
-    assert relayed == [4638, 4637], "按贴的顺序"
+    assert relayed == [4637, 4638], "同一对话里从旧到新"
     assert [(u.key, u.name, u.tag) for u in got_units] == [
         ("-1002703619907", "某群", "")] * 2, "私有群没有用户名，就不带标签"
     assert r.bot.calls == [("copies", [901, 902])]
