@@ -465,7 +465,7 @@ async def do_grab(m: Message, specs: list, fw_to: Optional[str] = None) -> None:
     notes: list[str] = []
     try:
         client = await POOL.acquire(acl.session_user(uid))
-        async with POOL.lock_for(acl.session_user(uid)):
+        async with POOL.using(acl.session_user(uid)):
             for sp in specs:
                 try:
                     entity = await client.get_entity(
@@ -670,7 +670,7 @@ async def _resolve_forward(m: Message, spec: str | None) -> str | None:
             return None
         try:
             client = await POOL.acquire(acl.session_user(uid))
-            async with POOL.lock_for(acl.session_user(uid)):
+            async with POOL.using(acl.session_user(uid)):
                 await forward.resolve(client, target)
         except forward.ForwardError as e:
             await m.reply(str(e))

@@ -301,7 +301,7 @@ class Runner:
     async def _run_fast(self, job: Job) -> None:
         ref = parse_link(job.link)
         client = await POOL.acquire(acl.session_user(job.owner_id))
-        async with POOL.lock_for(acl.session_user(job.owner_id)):
+        async with POOL.using(acl.session_user(job.owner_id)):
             entity, msg, protected = await fetcher.probe(client, ref)
 
             if protected:
@@ -331,7 +331,7 @@ class Runner:
 
         entity, msg = job.entity, job.msg
         if msg is None:
-            async with POOL.lock_for(acl.session_user(job.owner_id)):
+            async with POOL.using(acl.session_user(job.owner_id)):
                 entity, msg, _ = await fetcher.probe(client, ref)
 
         size = fetcher.media_size(msg)
@@ -342,7 +342,7 @@ class Runner:
 
         async def body() -> None:
             relay_ch = await acl.relay_channel_for(job.owner_id)
-            async with POOL.lock_for(acl.session_user(job.owner_id)):
+            async with POOL.using(acl.session_user(job.owner_id)):
                 res = await fetcher.relay(
                     client, ref, relay_ch,
                     on_progress=lambda *a: self._progress(job, *a),
@@ -394,7 +394,7 @@ class Runner:
         try:
             suid = acl.session_user(job.owner_id)
             client = await POOL.acquire(suid)
-            async with POOL.lock_for(suid):
+            async with POOL.using(suid):
                 await forward.send(client, job.forward_to, from_peer, ids)
         except Exception as e:  # noqa: BLE001
             log.warning("task=%s 转发失败: %s", job.task_id, e)
@@ -429,7 +429,7 @@ class Runner:
 
         try:
             client = await POOL.acquire(suid)
-            async with POOL.lock_for(suid):
+            async with POOL.using(suid):
                 if extra["mode"] in ("text", "preview"):
                     ids = await streamer.send_text_message(
                         client, relay_ch, extra["html"],
@@ -503,7 +503,7 @@ class Runner:
         suid = acl.session_user(job.owner_id)
         client = await POOL.acquire(suid)
         relay_ch = await acl.relay_channel_for(job.owner_id)
-        async with POOL.lock_for(suid):
+        async with POOL.using(suid):
             ids, nbytes, note = await streamer.relay_web_media(
                 client, tw.media, relay_ch,
                 caption_html=job.extra["html"] if job.extra.get("caption") else None,
@@ -587,7 +587,7 @@ class Runner:
                 continue
             await self._say(job, f"正在搬运 {i}/{len(links)}…")
             try:
-                async with POOL.lock_for(suid):
+                async with POOL.using(suid):
                     res = await fetcher.relay(
                         client, parse_link(link), relay_ch,
                         on_progress=lambda *a: self._progress(job, *a),
@@ -606,7 +606,7 @@ class Runner:
             raise fetcher.FetchError(f"{len(links)} 条全部取不到。")
 
         await self._say(job, "正在组装…")
-        async with POOL.lock_for(suid):
+        async with POOL.using(suid):
             units = await self._grab_units(client, links, done)
             final, note = await assemble.compose(client, relay_ch, units)
         if skipped:

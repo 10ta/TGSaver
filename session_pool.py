@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections import OrderedDict
@@ -46,7 +47,7 @@ class NoSession(RuntimeError):
 class _Entry:
     client: TelegramClient
     last_used: float = field(default_factory=time.monotonic)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    busy: int = 0           # 正在使用的数量；大于 0 时空闲回收要跳过
 
 
 class SessionPool:
@@ -111,13 +112,28 @@ class SessionPool:
             log.info("session 已连接 user=%s", user_id)
             return client
 
-    def lock_for(self, user_id: int) -> asyncio.Lock:
-        """同一用户的 session 串行使用，避免并发请求互相踩 FloodWait。"""
+    @contextlib.asynccontextmanager
+    async def using(self, user_id: int):
+        """标记「正在使用」，不独占。
+
+        以前这里是一把独占锁：慢通道搬一个 1GB 的受保护文件要两小时，期间
+        一直攥着锁，快通道的秒转和抓取时的翻找全被堵住。Telethon 本身支持
+        并发请求，并发量已经由快慢通道各自的上限控制，不需要再串行。
+
+        仍然要记「正在使用」：空闲回收会跳过使用中的会话，否则两小时的
+        传输到第 10 分钟会被当成空闲断开。
+        """
         entry = self._entries.get(user_id)
         if entry is None:
-            # acquire 之后一定存在；这里只是兜底
-            return asyncio.Lock()
-        return entry.lock
+            yield
+            return
+        entry.busy += 1
+        entry.last_used = time.monotonic()
+        try:
+            yield
+        finally:
+            entry.busy -= 1
+            entry.last_used = time.monotonic()
 
     async def invalidate(self, user_id: int) -> None:
         async with self._guard:
@@ -157,7 +173,7 @@ class SessionPool:
                 cutoff = time.monotonic() - CFG.session_idle_timeout
                 async with self._guard:
                     for uid in [u for u, e in self._entries.items()
-                                if e.last_used < cutoff and not e.lock.locked()]:
+                                if e.last_used < cutoff and e.busy == 0]:
                         e = self._entries.pop(uid)
                         log.info("空闲断开 session user=%s", uid)
                         await self._drop(uid, e)
