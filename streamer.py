@@ -400,19 +400,23 @@ async def send_external_media(client: TelegramClient, items: list[WebMedia],
     from telethon.extensions import html as tl_html
 
     caption, ents = tl_html.parse(caption_html) if caption_html else ("", [])
-    urls = [m.url for m in items]
-    if len(urls) == 1:
-        sent = await client.send_file(peer, urls[0], caption=caption,
-                                      formatting_entities=ents)
-        return [sent.id]
-
-    rest = len(urls) - 1
-    sent = await client.send_file(
-        peer, urls,
-        caption=[caption] + [""] * rest,
-        formatting_entities=[ents] + [[] for _ in range(rest)])
-    msgs = sent if isinstance(sent, list) else [sent]
-    return sorted(m.id for m in msgs)
+    ids: list[int] = []
+    for run in album_runs([m.kind for m in items]):
+        first = not ids                      # 说明只挂在整体的第一项上
+        cap, ent = (caption, ents) if first else ("", [])
+        if len(run) == 1:
+            sent = await client.send_file(peer, items[run[0]].url, caption=cap,
+                                          formatting_entities=ent)
+            ids.append(sent.id)
+            continue
+        rest = len(run) - 1
+        sent = await client.send_file(
+            peer, [items[i].url for i in run],
+            caption=[cap] + [""] * rest,
+            formatting_entities=[ent] + [[] for _ in range(rest)])
+        msgs = sent if isinstance(sent, list) else [sent]
+        ids.extend(sorted(m.id for m in msgs))
+    return ids
 
 
 # --------------------------------------------------------------- 相册整组
@@ -589,6 +593,39 @@ def http_session():
     )
 
 
+ALBUM_LIMIT = 10
+# 进不了相册、只能单独发的媒体。Telegram 会把含动图的相册整组拒掉
+# （MEDIA_INVALID），客户端也不允许把 GIF 放进相册。
+SOLO_KINDS = frozenset({"gif"})
+
+
+def album_runs(kinds: list[str], limit: int = ALBUM_LIMIT) -> list[list[int]]:
+    """把一串媒体按相册规则切段，返回每段的下标。顺序保持不变。
+
+    图和视频连续的拼成一个相册（最多 limit 项）；动图单独成段，
+    并把前后隔开。只有 1 项的段就是一条普通消息。
+
+    >>> album_runs(["photo", "gif", "photo", "video"])
+    [[0], [1], [2, 3]]
+    """
+    runs: list[list[int]] = []
+    cur: list[int] = []
+    for i, k in enumerate(kinds):
+        if k in SOLO_KINDS:
+            if cur:
+                runs.append(cur)
+                cur = []
+            runs.append([i])
+            continue
+        cur.append(i)
+        if len(cur) == limit:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    return runs
+
+
 def _web_spec(item: WebMedia, idx: int, size: int) -> MediaSpec:
     if item.kind == "photo":
         return MediaSpec(size=size, file_name=f"photo_{idx + 1}.jpg",
@@ -720,11 +757,19 @@ async def relay_web_media(
         from telethon.extensions import html as tl_html
         specs[0].caption, specs[0].entities = tl_html.parse(caption_html)
 
-    if len(handles) == 1:
-        sent = await _send(client, relay_channel, handles[0], specs[0])
-        return [sent.id], total, ""
-
-    ids, note = await send_handles_as_album(client, relay_channel, handles, specs)
+    # 按相册规则分段：图和视频拼相册，动图单独发。顺序不变，
+    # 多条合并时说明里的序号（1-3、4…）依然对得上。
+    ids: list[int] = []
+    note = ""
+    for run in album_runs([it.kind for it in items]):
+        if len(run) == 1:
+            sent = await _send(client, relay_channel, handles[run[0]], specs[run[0]])
+            ids.append(sent.id)
+            continue
+        got, n = await send_handles_as_album(
+            client, relay_channel, [handles[i] for i in run], [specs[i] for i in run])
+        ids.extend(got)
+        note = note or n
     return ids, total, note
 
 
@@ -793,7 +838,9 @@ async def send_handles_as_album(
         except Exception as e:  # noqa: BLE001
             # 字节已经传上去了，别浪费。退化成逐条发送，
             # 至少把内容给到用户，只是分组保不住。
-            log.warning("相册整组发送失败，退化为逐条: %s", e)
+            log.warning("相册整组发送失败，退化为逐条: %s；组内: %s", e,
+                        ", ".join(f"{s.file_name}({s.mime_type}, {_hs(s.size)})"
+                                  for s in ss))
             sent_ids.extend(await _send_one_by_one(
                 client, relay_channel, hs, ss, multi))
             note = "相册整组发送失败，已逐条转存，分组未能保持。"

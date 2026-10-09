@@ -396,7 +396,9 @@ def needs_relay(tw: Tweet, extra: dict | None = None) -> str | None:
     if extra and extra.get("mode") in ("text", "preview"):
         return None
     if len(tw.media) > 1 and any(m.kind == "gif" for m in tw.media):
-        return "动图不能放进相册"
+        # bot 直发时动图要和相册分开发，分成几条消息后，中途某条被拒就没法
+        # 干净地回退（前面的已经到了用户手里）。交给中转，那边按相册规则分段。
+        return "含动图，需与相册分开发送"
     for m in tw.media:
         if m.kind == "photo" and m.size > URL_PHOTO_MAX:
             return "图片超过 5MB"

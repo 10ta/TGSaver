@@ -177,3 +177,47 @@ async def test_album_external_uses_url_not_upload():
         for u in uploads)
     assert not rc.of(functions.upload.SaveFilePartRequest)
     assert not rc.of(functions.upload.SaveBigFilePartRequest)
+
+
+# ================================================================ 动图与相册
+
+@pytest.mark.asyncio
+async def test_external_gif_not_put_in_album():
+    """fw 路径：动图单独发，前后的图和视频各成相册，说明只挂整体第一项。"""
+    rc = RealClient()
+    ids = await streamer.send_external_media(
+        rc.client,
+        [WebMedia("photo", "https://pbs.twimg.com/a.jpg"),
+         WebMedia("video", "https://video.twimg.com/b.mp4"),
+         WebMedia("gif", "https://video.twimg.com/g.mp4"),
+         WebMedia("photo", "https://pbs.twimg.com/c.jpg"),
+         WebMedia("photo", "https://pbs.twimg.com/d.jpg")],
+        PEER, caption_html="<blockquote><b>J</b> 1-2 : hi</blockquote>")
+    sends = [r for r in rc.requests
+             if isinstance(r, (functions.messages.SendMultiMediaRequest,
+                               functions.messages.SendMediaRequest))]
+    kinds = [type(r).__name__ for r in sends]
+    assert kinds == ["SendMultiMediaRequest", "SendMediaRequest",
+                     "SendMultiMediaRequest"], "顺序：相册、动图、相册"
+    first, gif, last = sends
+    assert len(first.multi_media) == 2 and len(last.multi_media) == 2
+    assert gif.media.url.endswith("g.mp4")
+    assert first.multi_media[0].message == "J 1-2 : hi"
+    assert gif.message == ""
+    assert all(m.message == "" for m in first.multi_media[1:] + last.multi_media)
+    assert len(ids) == 5
+
+
+@pytest.mark.asyncio
+async def test_external_gif_first_takes_caption():
+    rc = RealClient()
+    await streamer.send_external_media(
+        rc.client,
+        [WebMedia("gif", "https://video.twimg.com/g.mp4"),
+         WebMedia("photo", "https://pbs.twimg.com/a.jpg"),
+         WebMedia("photo", "https://pbs.twimg.com/b.jpg")],
+        PEER, caption_html="<b>J</b> : hi")
+    single = rc.of(functions.messages.SendMediaRequest)[0]
+    multi = rc.of(functions.messages.SendMultiMediaRequest)[0].multi_media
+    assert single.message == "J : hi"
+    assert all(m.message == "" for m in multi)

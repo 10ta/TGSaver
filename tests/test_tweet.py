@@ -1746,3 +1746,143 @@ async def test_batch_remainder_inherits_forward_target(qdb, monkeypatch):
 
     assert submitted == [("https://x.com/u/status/33", "@mychan")], \
         "剩余部分丢了 fw 去向"
+
+
+# ================================================================ 动图与相册
+
+@pytest.mark.parametrize("kinds,runs", [
+    ([], []),
+    (["photo"], [[0]]),
+    (["gif"], [[0]]),
+    (["photo", "video"], [[0, 1]]),
+    (["photo", "gif"], [[0], [1]]),
+    (["gif", "photo", "photo"], [[0], [1, 2]]),
+    (["photo", "video", "gif", "photo", "photo"], [[0, 1], [2], [3, 4]]),
+    (["gif", "gif"], [[0], [1]]),
+    (["photo"] * 12, [list(range(10)), [10, 11]]),          # 相册上限 10
+    (["photo"] * 3 + ["gif"] + ["video"] * 10, [[0, 1, 2], [3], list(range(4, 14))]),
+])
+def test_album_runs(kinds, runs):
+    assert streamer.album_runs(kinds) == runs
+
+
+class StrictTg(FakeTg):
+    """像真 Telegram 一样：相册里只要有动图，整组拒收。
+
+    线上的现象：4 条推文合并 + fw，提示「相册整组发送失败，已逐条转存」。
+    逐条补发用的是同一批已上传的媒体，都成功了 —— 说明媒体本身没问题，
+    是「动图进了相册」这个组合被拒。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._animated = {}
+        self._next = 1
+
+    async def __call__(self, req):
+        from telethon.errors import MediaInvalidError
+        from telethon.tl.types import Document, MessageMediaDocument
+        name = type(req).__name__
+        if (name == "UploadMediaRequest"
+                and type(req.media).__name__ == "InputMediaUploadedDocument"):
+            did = self._next
+            self._next += 1
+            self._animated[did] = any(isinstance(a, DocumentAttributeAnimated)
+                                      for a in req.media.attributes)
+            return MessageMediaDocument(document=Document(
+                id=did, access_hash=1, file_reference=b"", date=None,
+                mime_type="video/mp4", size=1, dc_id=1, attributes=[]))
+        if name == "SendMultiMediaRequest":
+            for sm in req.multi_media:
+                did = getattr(getattr(sm.media, "id", None), "id", None)
+                if self._animated.get(did):
+                    raise MediaInvalidError(request=req)
+        return await super().__call__(req)
+
+
+def _gif_batch_http():
+    return FakeHttp({
+        "https://p1.jpg": (b"1" * 10, 200),
+        "https://v1.mp4": (b"2" * 20, 200),
+        "https://g.mp4": (b"3" * 30, 200),
+        "https://p2.jpg": (b"4" * 40, 200),
+        "https://p3.jpg": (b"5" * 50, 200),
+    })
+
+
+def _gif_batch_items():
+    return [WebMedia("photo", "https://p1.jpg"),
+            WebMedia("video", "https://v1.mp4", 640, 360, 5),
+            WebMedia("gif", "https://g.mp4", 480, 270, 3),
+            WebMedia("photo", "https://p2.jpg"),
+            WebMedia("photo", "https://p3.jpg")]
+
+
+@pytest.mark.asyncio
+async def test_gif_mixed_batch_keeps_albums(monkeypatch, cfg):
+    """多条推文合并、其中一条带动图：动图单独发，前后的图和视频仍然各成相册。"""
+    _use_http(monkeypatch, _gif_batch_http())
+    tg = StrictTg()
+    ids, total, note = await streamer.relay_web_media(
+        tg, _gif_batch_items(), -100, caption_html="<b>J</b> 1-2 : hi")
+
+    assert note == "", f"不该退化成逐条：{note}"
+    assert [len(m) for m in tg.multi] == [2, 2], "动图前后各一个相册"
+    assert len(tg.sent) == 1, "只有动图单独发"
+    gif_attrs = tg.sent[0][1]["attributes"]
+    assert any(isinstance(a, DocumentAttributeAnimated) for a in gif_attrs)
+    assert total == 150
+    assert len(ids) == 5
+
+
+@pytest.mark.asyncio
+async def test_gif_mixed_batch_caption_on_first_only(monkeypatch, cfg):
+    _use_http(monkeypatch, _gif_batch_http())
+    tg = StrictTg()
+    await streamer.relay_web_media(
+        tg, _gif_batch_items(), -100, caption_html="<b>J</b> 1-2 : hi")
+    first, second = tg.multi
+    assert first[0].message.startswith("J 1-2")
+    assert all(sm.message == "" for sm in first[1:] + second)
+    assert not tg.sent[0][1]["caption"], "动图不带说明"
+
+
+@pytest.mark.asyncio
+async def test_gif_first_carries_caption(monkeypatch, cfg):
+    """动图排在最前面时，说明挂在它身上，后面的相册不再带。"""
+    _use_http(monkeypatch, FakeHttp({
+        "https://g.mp4": (b"g" * 5, 200),
+        "https://a.jpg": (b"a" * 5, 200),
+        "https://b.jpg": (b"b" * 5, 200)}))
+    tg = StrictTg()
+    _, _, note = await streamer.relay_web_media(
+        tg, [WebMedia("gif", "https://g.mp4"), WebMedia("photo", "https://a.jpg"),
+             WebMedia("photo", "https://b.jpg")], -100, caption_html="<b>J</b> : hi")
+    assert note == ""
+    assert tg.sent[0][1]["caption"].startswith("J : hi")
+    assert all(sm.message == "" for sm in tg.multi[0])
+
+
+@pytest.mark.asyncio
+async def test_gif_relay_ids_in_send_order(monkeypatch, cfg):
+    """投递时整串 id 交给 copyMessages，它按 id 顺序复制并保住各自的分组。"""
+    _use_http(monkeypatch, _gif_batch_http())
+
+    class Seq(StrictTg):
+        n = 0
+
+        async def send_file(self, relay, file=None, **kw):
+            self.sent.append((file, kw))
+            Seq.n += 1
+            return type("S", (), {"id": Seq.n})()
+
+        async def __call__(self, req):
+            res = await super().__call__(req)
+            if type(req).__name__ == "SendMultiMediaRequest":
+                for u in res.updates:
+                    Seq.n += 1
+                    u.message.id = Seq.n
+            return res
+
+    ids, _, _ = await streamer.relay_web_media(Seq(), _gif_batch_items(), -100)
+    assert ids == [1, 2, 3, 4, 5]
