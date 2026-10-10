@@ -312,7 +312,7 @@ def id_tag(tw: Tweet) -> str:
     return to_hashtag(tw.screen_name)
 
 
-def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
+def build_html(tw: Tweet, limit: int, show_name: bool = True) -> tuple[str, bool]:
     """组装消息 HTML。超长时截断正文，返回 (html, 是否截断)。
 
     格式：
@@ -322,17 +322,20 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
         via <a href="署名链接">署名</a>
 
     没有正文时引用块里只有「昵称 :」。
+    show_name=False（/setting 里关掉推文昵称）时引用块里只有正文，
+    没有正文就不要引用块。
     超链接的 URL 不计入 Telegram 的长度限制，只有显示文字算。
     """
     name = tw.name.strip() or tw.screen_name
     tag = id_tag(tw)
     text = tw.text.strip()
 
-    head_plain = f"{name} :" + (" " if text else "")
+    head_plain = (f"{name} :" + (" " if text else "")) if show_name else ""
     last_plain = LINK_TEXT + (f" · {tag}" if tag else "")
     sign_plain = f"\n\nvia {SIGN_TEXT}" if SIGN_TEXT else ""
-    overhead = (utf16_len(head_plain) + 1 + utf16_len(last_plain)
-                + utf16_len(sign_plain))
+    has_quote = show_name or bool(text)
+    overhead = (utf16_len(head_plain) + (1 if has_quote else 0)
+                + utf16_len(last_plain) + utf16_len(sign_plain))
     budget = max(limit - overhead, 0)
 
     truncated = False
@@ -340,10 +343,13 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
         truncated = True
         text = _cut_utf16(text, max(budget - 1, 0)).rstrip() + "…"
 
-    quote = f"<b>{html.escape(name, quote=False)}</b> :"
-    if text:
-        quote += " " + html.escape(text, quote=False)
-    parts = [f"<blockquote>{quote}</blockquote>"]
+    if show_name:
+        quote = f"<b>{html.escape(name, quote=False)}</b> :"
+        if text:
+            quote += " " + html.escape(text, quote=False)
+    else:
+        quote = html.escape(text, quote=False)
+    parts = [f"<blockquote>{quote}</blockquote>"] if quote else []
 
     last = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
     if tag:
@@ -357,7 +363,7 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
     return "\n".join(parts), truncated
 
 
-def plan(tw: Tweet, mode: str | None = None) -> dict:
+def plan(tw: Tweet, mode: str | None = None, show_name: bool = True) -> dict:
     """决定呈现形态，返回可以直接落库的描述。
 
     text        纯文字推文，一条消息，不带预览（预览只会把正文再显示一遍）
@@ -365,24 +371,24 @@ def plan(tw: Tweet, mode: str | None = None) -> dict:
     media       媒体带说明（单个或相册）
     media_long  同上但说明超过 1024，媒体后面另跟一条文字
 
-    mode 不给时按 TWEET_MODE。auto 在这里先按 preview 规划，
+    mode 不给时按 TWEET_MODE（调度器会传入 /setting 里的值）。auto 在这里先按 preview 规划，
     由调度器在发送前检查预览，不行再用 mode="media" 重新规划。
     """
     mode = (mode or TWEET_MODE)
     base = {"kind": "tweet", "url": tw.url, "preview_url": tw.preview_url}
 
     if not tw.media:
-        body, _ = build_html(tw, TEXT_LIMIT)
+        body, _ = build_html(tw, TEXT_LIMIT, show_name)
         return {**base, "mode": "text", "html": body, "caption": False}
 
     if mode != "media":
-        body, _ = build_html(tw, TEXT_LIMIT)
+        body, _ = build_html(tw, TEXT_LIMIT, show_name)
         return {**base, "mode": "preview", "html": body, "caption": False}
 
-    cap, cut = build_html(tw, CAPTION_LIMIT)
+    cap, cut = build_html(tw, CAPTION_LIMIT, show_name)
     if not cut:
         return {**base, "mode": "media", "html": cap, "caption": True}
-    body, _ = build_html(tw, TEXT_LIMIT)
+    body, _ = build_html(tw, TEXT_LIMIT, show_name)
     return {**base, "mode": "media_long", "html": body, "caption": False}
 
 
@@ -441,7 +447,7 @@ def _fair_caps(lengths: list[int], budget: int) -> list[int]:
 
 
 def build_batch_html(entries: list[tuple], limit: int,
-                     skipped: int = 0) -> tuple[str, bool]:
+                     skipped: int = 0, show_name: bool = True) -> tuple[str, bool]:
     """把多条推文拼成一条消息的说明文字。
 
     entries 是 [(Tweet, label)]，label 是这条推文的媒体在相册里的位置
@@ -465,34 +471,40 @@ def build_batch_html(entries: list[tuple], limit: int,
         tags.append(id_tag(tw))
         texts.append(tw.text.strip())
 
-    # 纯文本形态，只用来算长度
-    heads = [f"{n} {l} :" if l else f"{n} :" for n, l in zip(names, labels)]
+    # 纯文本形态，只用来算长度。不显示昵称时只剩序号；
+    # 连序号也没有（纯文字推文）就没有前缀，引用块里只有正文
+    if show_name:
+        heads = [f"{n} {l} :" if l else f"{n} :" for n, l in zip(names, labels)]
+    else:
+        heads = [f"{l} :" if l else "" for l in labels]
+    shown = [bool(h) or bool(t) for h, t in zip(heads, texts)]
     links = [LINK_TEXT + (f" {l}" if l else "") + (f" · {t}" if t else "")
              for l, t in zip(labels, tags)]
 
     note = SKIP_NOTE.format(n=skipped) if skipped else ""
     sign_plain = f"\n\nvia {SIGN_TEXT}" if SIGN_TEXT else ""
 
-    n_lines = len(heads) + len(links) + (1 if note else 0)
+    n_lines = sum(shown) + len(links) + (1 if note else 0)
     fixed = (sum(utf16_len(h) for h in heads)
              + sum(utf16_len(x) for x in links)
              + utf16_len(note) + utf16_len(sign_plain)
              + max(n_lines - 1, 0)                      # 行间换行
-             + sum(1 for t in texts if t))              # 昵称与正文之间的空格
+             + sum(1 for h, t in zip(heads, texts) if h and t))  # 前缀与正文之间的空格
     caps = _fair_caps([utf16_len(t) for t in texts], limit - fixed)
 
     esc = lambda x: html.escape(x, quote=False)         # noqa: E731
     parts = []
-    for name, label, text, cap in zip(names, labels, texts, caps):
-        quote = f"<b>{esc(name)}</b>"
-        if label:
-            quote += f" {label}"
-        quote += " :"
+    for name, label, text, cap, head in zip(names, labels, texts, caps, heads):
+        if show_name:
+            quote = f"<b>{esc(name)}</b>" + (f" {label}" if label else "") + " :"
+        else:
+            quote = head
         if text and cap > 0:
             body = text if utf16_len(text) <= cap else \
                 _cut_utf16(text, max(cap - 1, 0)).rstrip() + "…"
-            quote += " " + esc(body)
-        parts.append(f"<blockquote>{quote}</blockquote>")
+            quote += (" " if quote else "") + esc(body)
+        if quote:
+            parts.append(f"<blockquote>{quote}</blockquote>")
 
     for (tw, _), label, tag in zip(entries, labels, tags):
         line = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
@@ -527,7 +539,8 @@ def split_batch(pairs: list[tuple]) -> tuple[list[tuple], list[tuple]]:
     return take, []
 
 
-def plan_batch(tws: list, skipped: int = 0) -> tuple[dict, list]:
+def plan_batch(tws: list, skipped: int = 0,
+               show_name: bool = True) -> tuple[dict, list]:
     """规划一条合并消息，返回 (落库用的描述, 按顺序排好的媒体列表)。
 
     合并必然走 media 逻辑：一条消息只能有一个链接预览，装不下多条推文的媒体。
@@ -541,13 +554,13 @@ def plan_batch(tws: list, skipped: int = 0) -> tuple[dict, list]:
     base = {"kind": "tweet", "batch": True,
             "url": tws[0].url, "preview_url": tws[0].preview_url}
     if not media:
-        body, _ = build_batch_html(entries, TEXT_LIMIT, skipped)
+        body, _ = build_batch_html(entries, TEXT_LIMIT, skipped, show_name)
         return {**base, "mode": "text", "html": body, "caption": False}, []
 
-    cap, fits = build_batch_html(entries, CAPTION_LIMIT, skipped)
+    cap, fits = build_batch_html(entries, CAPTION_LIMIT, skipped, show_name)
     if fits:
         return {**base, "mode": "media", "html": cap, "caption": True}, media
-    body, _ = build_batch_html(entries, TEXT_LIMIT, skipped)
+    body, _ = build_batch_html(entries, TEXT_LIMIT, skipped, show_name)
     return {**base, "mode": "media_long", "html": body, "caption": False}, media
 
 

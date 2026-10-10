@@ -24,6 +24,7 @@ from telethon.errors import (
 from telethon.tl.functions.messages import GetDiscussionMessageRequest
 from telethon.tl.types import Message, MessageService, PeerChannel
 
+import spoiler
 import streamer
 from parser import MsgRef
 
@@ -174,12 +175,11 @@ def is_protected(entity: Any, msg: Message) -> bool:
 async def probe(client: TelegramClient, ref: MsgRef) -> tuple[Any, Message, bool]:
     """轻量探测：定位消息并判断是否需要搬运字节，用于决定走哪条通道。
 
-    两种情况需要搬：内容受保护（服务端拒绝转发），
-    或链接带了 nosp（用户主动要求重传以剥离剧透遮罩）。
+    只有受保护的内容需要搬字节。nosp（去剧透）现在是搬完之后零流量重发，
+    不再需要重新下载上传。
     """
     entity, msg = await locate(client, ref)
-    heavy = is_protected(entity, msg) or ref.force_reupload
-    return entity, msg, heavy
+    return entity, msg, is_protected(entity, msg)
 
 
 def media_size(msg: Message) -> int:
@@ -196,29 +196,44 @@ async def relay(
     register_tmp: Optional[Callable[[Optional[str]], Any]] = None,
     entity: Any = None,
     msg: Optional[Message] = None,
+    keep_spoiler: bool = False,
 ) -> Relayed:
     """把链接指向的消息搬进中转频道。
 
     entity/msg 可由 probe() 预先传入，避免重复拉取。
+
+    keep_spoiler 是 /setting 里的剧透开关；链接带 nosp 时这一次强制去掉。
+    搬完之后按它统一处理剧透（见 spoiler.py），来源里没有剧透就整步跳过。
     """
     if entity is None or msg is None:
         entity, msg = await locate(client, ref)
 
     group = [msg] if ref.single else await load_album(client, entity, msg)
+    res = await _move(client, ref, relay_channel, entity, msg, group,
+                      on_progress, task_id, register_tmp)
+
+    keep = keep_spoiler and not ref.force_reupload
+    if spoiler.involved(group):
+        res.message_ids = await spoiler.apply(
+            client, relay_channel, res.message_ids,
+            spoiler.wanted(group, len(res.message_ids), keep), keep_text=keep)
+    return res
+
+
+async def _move(client, ref: MsgRef, relay_channel: int, entity: Any,
+                msg: Message, group: list, on_progress, task_id,
+                register_tmp) -> Relayed:
     is_album = len(group) > 1
     protected = is_protected(entity, msg)
 
     note = ""
-    if ref.force_reupload and not protected:
-        log.info("nosp：%s 主动走重传路径以剥离剧透遮罩", ref)
     if msg.poll is not None:
         note = "投票会被复制成一个全新的投票，原始票数无法保留（API 限制）。"
     elif getattr(msg, "reply_markup", None) is not None:
         note = "原消息带有 inline 按钮，复制后按钮会丢失（API 限制）。"
 
     # ---------- 路径 A ----------
-    # nosp 要求重传，直转会把原样的剧透遮罩一起带过来，所以跳过这条路
-    if not protected and not ref.force_reupload:
+    if not protected:
         try:
             sent = await client.forward_messages(
                 relay_channel, [m.id for m in group], entity

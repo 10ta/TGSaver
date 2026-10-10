@@ -28,6 +28,8 @@ import admin
 import db
 import forward
 import menu
+import pack
+import prefs
 import streamer
 import tweet
 from config import CFG
@@ -70,12 +72,13 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 <code>t.me/c/1234567890/45 1-7</code>  话题里的第 1~7 条
 <code>t.me/c/1234567890/45/4632-4638</code>  消息 4632~4638
 
-<b>② 去掉剧透遮罩</b>
-链接后面加 <code>nosp</code>：
+<b>② 剧透</b>
+默认去掉剧透遮罩和文字剧透，在 /setting 里可以改成保留。
+保留模式下想对某一条单独去掉，链接后面加 <code>nosp</code>：
 
 <code>t.me/频道名/123 nosp</code>
 
-会重新下载上传，比直转慢。受保护的内容本来就是重传，遮罩一律自动去掉，不用加。
+处理剧透是服务端重发，零流量，不用重新下载上传。
 
 <b>③ 保存推文</b>
 直接发 X / Twitter 帖子链接：
@@ -113,7 +116,17 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 一个相册算一条。超过一条就拼成相册，文字汇总到说明里，带序号；
 图片视频、文件、音频按 Telegram 的规则分开成组，超过 10 个自动拆成多条。
 
+<b>⑥ 组装转发来的媒体</b>
+随手把图片、视频、文件转发给我，我先默默收着，不回复。
+攒够了发 /pack，组装成相册发回（每 10 个一条，零流量）；
+/pack fw 去向  组装后再转一份过去
+/clear  清空收集箱
+说明文字汇总到相册说明里。来源名默认不写，在 /setting 里可以打开。
+
 <b>命令</b>
+/pack — 组装收集到的媒体
+/clear — 清空收集箱
+/setting — 开关设置
 /status — 登录状态、流量与消息统计
 /killall — 终止所有进行中的任务并清空队列
 /logout — 注销登录凭据
@@ -558,6 +571,81 @@ async def cmd_logout(m: Message) -> None:
         "所有用户都将无法使用，直到机主重新运行 login.py。")
 
 
+@router.message(F.photo | F.video | F.animation | F.document | F.audio
+                | F.voice | F.video_note | F.sticker)
+async def on_media(m: Message) -> None:
+    """转发来的媒体先放进收集箱，不回复。/pack 时一起组装。"""
+    if not await _allowed(m):
+        return
+    item = pack.from_message(m)
+    if item is None:
+        return
+    if not pack.add(m.from_user.id, item) and pack.first_overflow(m.from_user.id):
+        await m.reply(f"收集箱满了（{pack.INBOX_MAX} 个），后面的没收进来。"
+                      f"先 /pack 或 /clear。")
+
+
+@router.message(Command("pack"))
+async def cmd_pack(m: Message, command: CommandObject) -> None:
+    """把收集箱里的媒体组装成相册发回。可以带 fw。"""
+    if not await _allowed(m):
+        return
+    uid = m.from_user.id
+    args = (command.args or "").strip()
+    fw_to = None
+    if args:
+        has_fw, spec, rest = parse_forward(args)
+        if not has_fw or rest.strip():
+            await m.reply("用法：<code>/pack</code> 或 <code>/pack fw 去向</code>")
+            return
+        fw_to = await _resolve_forward(m, spec)
+        if fw_to is None:
+            return
+
+    # 同一批转发里可能还有几条在路上，等一下再取；
+    # 这条命令之后才到的留给下一次
+    await asyncio.sleep(pack.SETTLE)
+    items = pack.take(uid, before=m.message_id)
+    if not items:
+        await m.reply("收集箱是空的。先把媒体转发给我，再发 /pack。")
+        return
+
+    p = await prefs.get(uid)
+    relay = await acl.relay_channel_for(uid)
+    try:
+        packed = await pack.build(m.bot, relay, items, keep_spoiler=p.keep_spoiler,
+                                  show_source=p.tg_source)
+        await pack.deliver(m.bot, relay, m.chat.id, packed)
+    except Exception as e:  # noqa: BLE001
+        log.exception("组装失败")
+        pack.restore(uid, items)
+        await m.reply(f"❌ 组装失败：{e}\n收集箱里的东西还在，可以再发一次 /pack。")
+        return
+    await db.bump_usage(uid, 0)
+
+    notes = [packed.note] if packed.note else []
+    if fw_to:
+        try:
+            client = await POOL.acquire(acl.session_user(uid))
+            async with POOL.using(acl.session_user(uid)):
+                await forward.send(client, fw_to, relay, packed.ids)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"转发失败：{e}")
+    if p.pack_delete:
+        await pack.delete_originals(m.bot, m.chat.id,
+                                    [x.msg_id for x in items] + [m.message_id])
+    if notes:
+        await m.answer("⚠️ " + "\n".join(notes))
+
+
+@router.message(Command("clear"))
+async def cmd_clear(m: Message) -> None:
+    if not await _allowed(m):
+        return
+    n = pack.clear(m.from_user.id)
+    await m.reply(f"已清空 {n} 个。" if n else "收集箱是空的。")
+
+
 @router.message(F.text)
 async def on_text(m: Message) -> None:
     if not await _allowed(m):
@@ -713,6 +801,7 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(admin.router)
+    dp.include_router(prefs.router)
     dp.include_router(router)
 
     await POOL.start()
@@ -729,7 +818,7 @@ async def main() -> None:
 
     poll = asyncio.create_task(
         dp.start_polling(bot, handle_signals=False,
-                         allowed_updates=["message"])
+                         allowed_updates=["message", "callback_query"])
     )
     await stop.wait()
     log.info("收到退出信号，正在收尾…")

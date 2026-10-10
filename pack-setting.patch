@@ -1,0 +1,2557 @@
+diff --git a/.env.example b/.env.example
+index 8601232..b9762f1 100644
+--- a/.env.example
++++ b/.env.example
+@@ -35,6 +35,7 @@ SECRET_KEY=
+ #   auto     先问 Telegram 预览里有没有媒体：齐全就发预览，缺了就发原始媒体（默认）
+ #   preview  强制预览：文字 + fxtwitter 大图预览。最快、零流量，但长视频可能不出现
+ #   media    强制发送原始图片视频，多图是独立相册，可单独保存
++# 这里只是默认值，每个人可以在 bot 里发 /setting 改成自己的
+ TWEET_MODE=auto
+ 
+ # auto 模式下等 Telegram 生成预览的最长秒数，超时就改发原始媒体。
+diff --git a/README.md b/README.md
+index c6bc162..7213fd4 100644
+--- a/README.md
++++ b/README.md
+@@ -38,7 +38,8 @@ TgSaver 用一个私有中转频道把这三道坎一次绕开：
+ - **三条传输路径自动选择**，普通内容零流量零磁盘
+ - **双通道队列**，大文件搬运不阻塞后面的轻量请求
+ - **完整保真**：文本 entities、相册分组、视频时长分辨率、缩略图、
+-  spoiler 标记、文件名、caption 全部保留
++  文件名、caption 全部保留；剧透保留还是去掉由 `/setting` 决定
++- **收集箱**：随手转发一批媒体给 bot，`/pack` 一键组装成相册，零流量
+ - **任务持久化**，进程崩溃重启自动续跑，遗留临时文件自动清理
+ - **凭据加密存储**，密钥与数据库分离
+ - **依赖只有 5 个**，无 Docker、无 Redis、无 Celery
+@@ -248,11 +249,14 @@ via @署名
+   把别人的正文全挤掉。条目太多以致正文削到 0 仍装不下时，媒体不带说明，
+   说明另发一条文字消息
+ 
+-只发一条链接时行为不变：不带序号，照常走 `TWEET_MODE`。
++只发一条链接时行为不变：不带序号，照常走推文形态设置。
++
++`/setting` 里的「推文昵称」关掉后，引用块里只有正文（多条合并时只剩序号），
++原帖链接和 #ID 不变。
+ 
+ #### 三种呈现方式
+ 
+-由 `.env` 里的 `TWEET_MODE` 决定：
++由 `/setting` 里的「推文形态」决定，没改过时跟随 `.env` 的 `TWEET_MODE`：
+ 
+ | | `auto`（默认） | `preview` | `media` |
+ |---|---|---|---|
+@@ -440,26 +444,28 @@ Telegram 客户端看到消息以 `@botname ` 开头会拦截成 inline 查询
+ GIF、文件、语音、圆形视频、贴纸、位置、联系人、caption、
+ 文件名、视频时长与分辨率、缩略图。相册整组保留。
+ 
+-### 剧透遮罩
++### 剧透
+ 
+-| 情况 | 行为 |
+-|---|---|
+-| 受保护内容（路径 B/C） | **自动去掉**，因为本来就是重新上传 |
+-| 普通内容（路径 A） | 默认保留——服务端直转无法剥离 |
+-| 普通内容 + `nosp` | 改走重传路径，去掉遮罩 |
++剧透有两种：媒体上的遮罩，和文字里的剧透片段。由 `/setting` 里的**剧透总开关**
++统一决定，默认**去掉**。
+ 
+-链接后面单独加一个 `nosp` 即可：
++| 设置 | 行为 |
++|---|---|
++| 去掉（默认） | 所有路径都去掉遮罩和文字剧透 |
++| 保留 | 所有路径都原样保留，包括受保护内容（重传后会把遮罩补回去） |
++| 保留 + 链接加 `nosp` | 这一条去掉 |
+ 
+ ```
+ https://t.me/chan/123 nosp
+ ```
+ 
+-也支持写成查询参数 `?nosp`，可与 `?single` 并用。
++`nosp` 也支持写成查询参数 `?nosp`，可与 `?single` 并用；标记会被写进链接本身再入库，
++任务重试或进程重启后依然有效。
+ 
+-代价是这条链接不再享受零流量零磁盘的直转，会实际下载再上传一遍。
+-所以做成了开关而不是默认行为——大多数时候你并不需要它。
+-
+-标记会被写进链接本身再入库，任务重试或进程重启后依然有效。
++**处理剧透是零流量的。** 消息搬进中转频道之后，比对想要的状态和实际状态，
++不一致就用服务端引用把这批消息重发一遍、删掉旧的——不下载不上传。整批重发
++而不是只改有问题的几条，是为了保住相册分组和 id 递增。来源里没有剧透时整步跳过，
++一个请求都不多发。以前的 `nosp` 要重新下载上传，现在不用了。
+ 
+ 三处 API 层面的硬限制，遇到时 bot 会明确告知：
+ 
+@@ -482,10 +488,13 @@ https://t.me/chan/123 nosp
+ ```
+ t.me/频道/123      发消息链接即可，无需命令
+ x.com/用户/status/1 发推文链接，整理成昵称 + 引用 + 大图预览 + 原帖链接
+-t.me/频道/123 nosp 加 nosp 去掉剧透遮罩（会重传）
++t.me/频道/123 nosp 这一条去掉剧透（总开关设为保留时用）
+ t.me/对话名 1-5    抓私聊内容（没有消息链接的用这个）
+-... fw @频道       结果直接转发到该频道，隐藏来源，本人不收
++... fw @频道       本人照常收到，再额外转一份到该频道，隐藏来源
+ 
++/pack      把收集箱里的媒体组装成相册发回，可写 /pack fw 去向
++/clear     清空收集箱
++/setting   开关设置
+ /status    登录状态、流量与消息统计、队列深度
+ /killall   终止所有进行中的任务并清空队列
+ /logout    从 Telegram 服务端撤销 session 并清除本地记录
+@@ -498,6 +507,35 @@ t.me/对话名 1-5    抓私聊内容（没有消息链接的用这个）
+ `/killall` 会中断正在进行的下载上传、清空两条队列、清理临时文件，
+ 然后重新拉起 worker。服务本身不重启。
+ 
++### 收集箱：/pack /clear
++
++随手把一批图片、视频、文件转发给 bot，它默默收着，不回复。攒够了发 `/pack`：
++
++- 用 file_id 重新发送，**全程只有 bot、零流量**，没有 50MB 限制
++- 分组规则和抓取组装一样：图片视频混排成相册，文件一组，音频一组，
++  每组最多 10 个；动图、贴纸、语音、圆形视频进不了相册，单独发（带它自己的说明）
++- 按你转发的顺序排；原本是同一个相册的算一条，说明里序号写成区间
++- 说明文字汇总到相册第一项，格式和抓取组装一样；来源名默认不写
++- `/pack fw 去向` 组装后再转一份过去，隐藏来源（和 `fw` 同一套逻辑）
++- `/pack` 之后才到的媒体留在收集箱里，等下一次
++- 组装失败时收集箱原样保留，直接再发一次 `/pack` 即可
++
++收集箱只在内存里，重启就没了——这是随转随组装的即时操作，丢了重新转发就是。
++上限 500 个，满了提醒一次。
++
++### 设置：/setting
++
++发 `/setting` 弹出一排按钮，点一下切换，立即生效。每个人各自一份，存在数据库里。
++
++| 开关 | 默认 | 作用 |
++|---|---|---|
++| 剧透 | 去掉 | 见「保真边界 → 剧透」 |
++| 推文昵称 | 显示 | 推文引用块里写不写昵称 |
++| TG 来源名 | 隐藏 | 组装 Telegram 消息（多链接、抓取、`/pack`）时说明里写不写来源名和 #用户名 |
++| 组装后删除原消息 | 否 | `/pack` 之后删掉你转发来的原消息和这条命令 |
++| 推文形态 | 跟随 `TWEET_MODE` | 自动 → 预览 → 原始媒体，轮换 |
++| fw 默认去向 | — | 设过才显示，点一下清除 |
++
+ 输入框旁的 **Menu** 按钮、以及打 `/` 时弹出的候选列表会自动出现，
+ 启动时通过 `setMyCommands` 注册。管理命令只注册在机主的对话作用域里，
+ 授权用户的菜单看不到它们——但这只是显示层面的隐藏，真正的鉴权在
+@@ -548,12 +586,15 @@ fetcher.py        定位消息、判定路径、送进中转频道
+ streamer.py       有界异步管道 + 媒体属性重建
+ sender.py         copyMessage 投递
+ menu.py           命令菜单注册（按作用域区分机主与普通用户）
++prefs.py          /setting 开关的存取与按钮
++pack.py           收集箱与 /pack 组装
++spoiler.py        剧透总开关的统一处理（零流量重发）
+ tweet.py          推文链接识别、FxTwitter API 解析、消息组装
+ taskqueue.py      双通道队列、重试、FloodWait、进度
+ admin.py          用户管理与审批
+ login.py          首次交互登录
+ genkey.py         生成加密密钥
+-tests/            34 项测试
++tests/            测试
+ 
+ init.sh           一键部署 / 修复（幂等，可反复跑）
+ git-init.sh       首次推送到 GitHub
+@@ -630,7 +671,7 @@ pip install pytest pytest-asyncio
+ pytest -q
+ ```
+ 
+-531 项，覆盖：
++608 项，覆盖：
+ 
+ - **链接解析**的全部形态，含论坛话题三段式（中间那个数字是话题 id 不是消息 id，
+   这是最容易写错的地方）、`?single`、`tg://` 协议、各类非法输入
+@@ -671,6 +712,16 @@ pytest -q
+ - **论坛话题与消息 id**：话题链接只有跟着数字时才算抓取目标、位置与 id 的
+   区分、id 区间覆盖相册时只取一次、话题内翻找用 reply_to、多个 t.me 链接
+   合成一个组装任务、话题链接误用时的提示、抓不够数时报告翻找统计
++- **剧透总开关**：默认去掉遮罩和文字剧透、保留模式下原样保留（重传丢掉的遮罩补回来）、
++  nosp 这一次强制去掉且不再走重传、整批重发保住相册与 id 递增、来源没剧透时不多发请求、
++  中途失败撤回已发部分并按原样投递
++- **设置**：只存改过的项、各人各一份、坏数据回退默认、老库自动补列、按钮切换与刷新、
++  陌生人点按钮被拒、推文昵称和 TG 来源名开关对说明文字的影响（省下的长度还给正文）、
++  调度器按发起人的设置规划推文
++- **收集箱**：各类媒体识别（动图不被当成文件）、转发来源识别、只取命令之前到的、
++  上限与只提醒一次、原相册合并成一个单元、按类型分组与 10 个上限、只用 file_id、
++  说明只挂第一项、剧透和来源名开关、整组失败退回逐条、投递按 100 条分块且不拆相册、
++  删除原消息、失败时收集箱原样保留、`/pack fw` 本人照收再转发
+ - **相册退回逐条**：直接用已在服务器上的媒体逐条发、不重传；缩略图流重复使用
+   前必须倒回开头（否则读空、报 FilePartEmpty）
+ - **命令菜单**：命令名与描述符合 Telegram 格式、无重复、管理命令不外泄、
+@@ -710,7 +761,7 @@ pytest -q
+ 
+ | | 授权用户 | 机主 |
+ |---|---|---|
+-| 发链接、抓取、`nosp` | ✓ | ✓ |
++| 发链接、抓取、`nosp`、`/pack`、`/setting`（各自一份） | ✓ | ✓ |
+ | `/status` | 只看自己的用量 | 只看自己的用量 |
+ | `/killall` | 只终止自己的任务 | 终止全部 |
+ | `/users` `/adduser` `/deluser` `/ban` `/unban` | ✗ | ✓ |
+diff --git a/assemble.py b/assemble.py
+index b81a929..d573c76 100644
+--- a/assemble.py
++++ b/assemble.py
+@@ -67,23 +67,30 @@ def _label(start: int, count: int) -> str:
+     return str(start) if count == 1 else f"{start}-{start + count - 1}"
+ 
+ 
+-def build_caption(sources: list[tuple], limit: int) -> tuple[str, bool]:
++def build_caption(sources: list[tuple], limit: int,
++                  show_source: bool = True) -> tuple[str, bool]:
+     """汇总说明文字。返回 (html, 是否装得下)。
+ 
+     sources: [(name, tag, first_pos, last_pos, [(label, text), ...])]，按出现顺序。
+     装不下指固定部分本身就超了 limit，调用方该改用更宽松的上限另发一条。
++
++    show_source=False（/setting 里 TG 来源名关着，默认）时不写来源名和
++    #用户名，引用块里只有「序号 : 文字」；没有文字的来源整块省掉。
++    名字是空串（比如你自己发的、不是转发来的）也一样不写。
+     """
+     u16 = tweet.utf16_len
+     texts, fixed, n_lines = [], 0, 0
+     for name, tag, a, b, items in sources:
+-        fixed += u16(f"{name} :")
+-        n_lines += 1
++        head = show_source and bool(name)
++        if head:
++            fixed += u16(f"{name} :")
++            n_lines += 1
+         for label, text in items:
+             if text:
+                 fixed += u16(f"{label} : ")
+                 texts.append(text)
+                 n_lines += 1
+-        if tag:
++        if show_source and tag:
+             fixed += u16(f"{_label(a, b - a + 1)} · {tag}")
+             n_lines += 1
+     sign_plain = f"\n\nvia {tweet.SIGN_TEXT}" if tweet.SIGN_TEXT else ""
+@@ -93,7 +100,7 @@ def build_caption(sources: list[tuple], limit: int) -> tuple[str, bool]:
+     esc = lambda x: html.escape(x, quote=False)     # noqa: E731
+     parts, k = [], 0
+     for name, tag, a, b, items in sources:
+-        quote = f"<b>{esc(name)}</b> :"
++        lines = [f"<b>{esc(name)}</b> :"] if show_source and name else []
+         for label, text in items:
+             if not text:
+                 continue
+@@ -105,16 +112,18 @@ def build_caption(sources: list[tuple], limit: int) -> tuple[str, bool]:
+                 body = text
+             else:
+                 body = tweet._cut_utf16(text, max(cap - 1, 0)).rstrip() + "…"
+-            quote += f"\n{label} : {esc(body)}"
+-        parts.append(f"<blockquote>{quote}</blockquote>")
+-    for name, tag, a, b, items in sources:
+-        if tag:
+-            parts.append(f"{_label(a, b - a + 1)} · {esc(tag)}")
++            lines.append(f"{label} : {esc(body)}")
++        if lines:
++            parts.append("<blockquote>" + "\n".join(lines) + "</blockquote>")
++    if show_source:
++        for name, tag, a, b, items in sources:
++            if tag:
++                parts.append(f"{_label(a, b - a + 1)} · {esc(tag)}")
+     if tweet.SIGN_TEXT:
+         sign = esc(tweet.SIGN_TEXT)
+         if tweet.SIGN_URL:
+             sign = f'<a href="{html.escape(tweet.SIGN_URL, quote=True)}">{sign}</a>'
+-        parts += ["", f"via {sign}"]
++        parts += ["", f"via {sign}"] if parts else [f"via {sign}"]
+     return "\n".join(parts), fixed <= limit
+ 
+ 
+@@ -156,15 +165,17 @@ def category(msg: Any) -> Optional[str]:
+     return None
+ 
+ 
+-def plan_blocks(msgs: list, msg_of=lambda x: x) -> list[list]:
++def plan_blocks(msgs: list, msg_of=lambda x: x, cat=None) -> list[list]:
+     """分组。返回若干块，每块是一个相册（≥2 项）或一条单独的消息。
+ 
+     msg_of 用来从条目里取出消息本身（条目可以是 (msg, 单元下标) 这样的元组）。
++    cat 是归类函数，默认按 Telethon 消息归类；收集箱里是 Bot API 的媒体，另给一个。
+     """
++    cat = cat or category
+     blocks: list[list] = []
+     where: dict[str, int] = {}
+     for m in msgs:
+-        c = category(msg_of(m))
++        c = cat(msg_of(m))
+         if c is None:
+             blocks.append([m])
+             continue
+@@ -181,8 +192,8 @@ def plan_blocks(msgs: list, msg_of=lambda x: x) -> list[list]:
+     return out
+ 
+ 
+-async def compose(client: Any, peer: Any,
+-                  units: list[Unit]) -> tuple[list[int], str]:
++async def compose(client: Any, peer: Any, units: list[Unit],
++                  show_source: bool = True) -> tuple[list[int], str]:
+     """把各单元在中转频道里的消息组装好，返回 (最终的消息 id, 说明)。"""
+     from telethon.extensions import html as tl_html
+ 
+@@ -214,13 +225,13 @@ async def compose(client: Any, peer: Any,
+             continue
+ 
+         sources = caption_for(b, units, unit_text)
+-        cap_html, fits = build_caption(sources, tweet.CAPTION_LIMIT)
++        cap_html, fits = build_caption(sources, tweet.CAPTION_LIMIT, show_source)
+         if fits:
+             cap_text, cap_ents = tl_html.parse(cap_html)
+             long_html = None
+         else:
+             cap_text, cap_ents = "", None
+-            long_html, _ = build_caption(sources, tweet.TEXT_LIMIT)
++            long_html, _ = build_caption(sources, tweet.TEXT_LIMIT, show_source)
+ 
+         try:
+             multi = [InputSingleMedia(
+diff --git a/bot.py b/bot.py
+index 9bcc499..65d8f46 100644
+--- a/bot.py
++++ b/bot.py
+@@ -28,6 +28,8 @@ import admin
+ import db
+ import forward
+ import menu
++import pack
++import prefs
+ import streamer
+ import tweet
+ from config import CFG
+@@ -70,12 +72,13 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
+ <code>t.me/c/1234567890/45 1-7</code>  话题里的第 1~7 条
+ <code>t.me/c/1234567890/45/4632-4638</code>  消息 4632~4638
+ 
+-<b>② 去掉剧透遮罩</b>
+-链接后面加 <code>nosp</code>：
++<b>② 剧透</b>
++默认去掉剧透遮罩和文字剧透，在 /setting 里可以改成保留。
++保留模式下想对某一条单独去掉，链接后面加 <code>nosp</code>：
+ 
+ <code>t.me/频道名/123 nosp</code>
+ 
+-会重新下载上传，比直转慢。受保护的内容本来就是重传，遮罩一律自动去掉，不用加。
++处理剧透是服务端重发，零流量，不用重新下载上传。
+ 
+ <b>③ 保存推文</b>
+ 直接发 X / Twitter 帖子链接：
+@@ -113,7 +116,17 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
+ 一个相册算一条。超过一条就拼成相册，文字汇总到说明里，带序号；
+ 图片视频、文件、音频按 Telegram 的规则分开成组，超过 10 个自动拆成多条。
+ 
++<b>⑥ 组装转发来的媒体</b>
++随手把图片、视频、文件转发给我，我先默默收着，不回复。
++攒够了发 /pack，组装成相册发回（每 10 个一条，零流量）；
++/pack fw 去向  组装后再转一份过去
++/clear  清空收集箱
++说明文字汇总到相册说明里。来源名默认不写，在 /setting 里可以打开。
++
+ <b>命令</b>
++/pack — 组装收集到的媒体
++/clear — 清空收集箱
++/setting — 开关设置
+ /status — 登录状态、流量与消息统计
+ /killall — 终止所有进行中的任务并清空队列
+ /logout — 注销登录凭据
+@@ -558,6 +571,81 @@ async def cmd_logout(m: Message) -> None:
+         "所有用户都将无法使用，直到机主重新运行 login.py。")
+ 
+ 
++@router.message(F.photo | F.video | F.animation | F.document | F.audio
++                | F.voice | F.video_note | F.sticker)
++async def on_media(m: Message) -> None:
++    """转发来的媒体先放进收集箱，不回复。/pack 时一起组装。"""
++    if not await _allowed(m):
++        return
++    item = pack.from_message(m)
++    if item is None:
++        return
++    if not pack.add(m.from_user.id, item) and pack.first_overflow(m.from_user.id):
++        await m.reply(f"收集箱满了（{pack.INBOX_MAX} 个），后面的没收进来。"
++                      f"先 /pack 或 /clear。")
++
++
++@router.message(Command("pack"))
++async def cmd_pack(m: Message, command: CommandObject) -> None:
++    """把收集箱里的媒体组装成相册发回。可以带 fw。"""
++    if not await _allowed(m):
++        return
++    uid = m.from_user.id
++    args = (command.args or "").strip()
++    fw_to = None
++    if args:
++        has_fw, spec, rest = parse_forward(args)
++        if not has_fw or rest.strip():
++            await m.reply("用法：<code>/pack</code> 或 <code>/pack fw 去向</code>")
++            return
++        fw_to = await _resolve_forward(m, spec)
++        if fw_to is None:
++            return
++
++    # 同一批转发里可能还有几条在路上，等一下再取；
++    # 这条命令之后才到的留给下一次
++    await asyncio.sleep(pack.SETTLE)
++    items = pack.take(uid, before=m.message_id)
++    if not items:
++        await m.reply("收集箱是空的。先把媒体转发给我，再发 /pack。")
++        return
++
++    p = await prefs.get(uid)
++    relay = await acl.relay_channel_for(uid)
++    try:
++        packed = await pack.build(m.bot, relay, items, keep_spoiler=p.keep_spoiler,
++                                  show_source=p.tg_source)
++        await pack.deliver(m.bot, relay, m.chat.id, packed)
++    except Exception as e:  # noqa: BLE001
++        log.exception("组装失败")
++        pack.restore(uid, items)
++        await m.reply(f"❌ 组装失败：{e}\n收集箱里的东西还在，可以再发一次 /pack。")
++        return
++    await db.bump_usage(uid, 0)
++
++    notes = [packed.note] if packed.note else []
++    if fw_to:
++        try:
++            client = await POOL.acquire(acl.session_user(uid))
++            async with POOL.using(acl.session_user(uid)):
++                await forward.send(client, fw_to, relay, packed.ids)
++        except Exception as e:  # noqa: BLE001
++            notes.append(f"转发失败：{e}")
++    if p.pack_delete:
++        await pack.delete_originals(m.bot, m.chat.id,
++                                    [x.msg_id for x in items] + [m.message_id])
++    if notes:
++        await m.answer("⚠️ " + "\n".join(notes))
++
++
++@router.message(Command("clear"))
++async def cmd_clear(m: Message) -> None:
++    if not await _allowed(m):
++        return
++    n = pack.clear(m.from_user.id)
++    await m.reply(f"已清空 {n} 个。" if n else "收集箱是空的。")
++
++
+ @router.message(F.text)
+ async def on_text(m: Message) -> None:
+     if not await _allowed(m):
+@@ -713,6 +801,7 @@ async def main() -> None:
+ 
+     dp = Dispatcher()
+     dp.include_router(admin.router)
++    dp.include_router(prefs.router)
+     dp.include_router(router)
+ 
+     await POOL.start()
+@@ -729,7 +818,7 @@ async def main() -> None:
+ 
+     poll = asyncio.create_task(
+         dp.start_polling(bot, handle_signals=False,
+-                         allowed_updates=["message"])
++                         allowed_updates=["message", "callback_query"])
+     )
+     await stop.wait()
+     log.info("收到退出信号，正在收尾…")
+diff --git a/db.py b/db.py
+index 928702d..c1e7441 100644
+--- a/db.py
++++ b/db.py
+@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS users (
+     last_active      INTEGER,
+     task_count       INTEGER NOT NULL DEFAULT 0,
+     bytes_total      INTEGER NOT NULL DEFAULT 0,
+-    last_forward     TEXT
++    last_forward     TEXT,
++    settings         TEXT                                -- /setting 里的开关，JSON
+ );
+ 
+ CREATE TABLE IF NOT EXISTS tasks (
+@@ -101,8 +102,10 @@ async def init() -> None:
+ async def _migrate() -> None:
+     """给早于当前版本的数据库补列。CREATE TABLE IF NOT EXISTS 不会改已有表。"""
+     cur = await _db.execute("PRAGMA table_info(users)")
+-    if "last_forward" not in {r["name"] for r in await cur.fetchall()}:
+-        await _db.execute("ALTER TABLE users ADD COLUMN last_forward TEXT")
++    ucols = {r["name"] for r in await cur.fetchall()}
++    for col in ("last_forward", "settings"):
++        if col not in ucols:
++            await _db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+ 
+     cur = await _db.execute("PRAGMA table_info(tasks)")
+     have = {r["name"] for r in await cur.fetchall()}
+diff --git a/fetcher.py b/fetcher.py
+index c4998da..c88a331 100644
+--- a/fetcher.py
++++ b/fetcher.py
+@@ -24,6 +24,7 @@ from telethon.errors import (
+ from telethon.tl.functions.messages import GetDiscussionMessageRequest
+ from telethon.tl.types import Message, MessageService, PeerChannel
+ 
++import spoiler
+ import streamer
+ from parser import MsgRef
+ 
+@@ -174,12 +175,11 @@ def is_protected(entity: Any, msg: Message) -> bool:
+ async def probe(client: TelegramClient, ref: MsgRef) -> tuple[Any, Message, bool]:
+     """轻量探测：定位消息并判断是否需要搬运字节，用于决定走哪条通道。
+ 
+-    两种情况需要搬：内容受保护（服务端拒绝转发），
+-    或链接带了 nosp（用户主动要求重传以剥离剧透遮罩）。
++    只有受保护的内容需要搬字节。nosp（去剧透）现在是搬完之后零流量重发，
++    不再需要重新下载上传。
+     """
+     entity, msg = await locate(client, ref)
+-    heavy = is_protected(entity, msg) or ref.force_reupload
+-    return entity, msg, heavy
++    return entity, msg, is_protected(entity, msg)
+ 
+ 
+ def media_size(msg: Message) -> int:
+@@ -196,29 +196,44 @@ async def relay(
+     register_tmp: Optional[Callable[[Optional[str]], Any]] = None,
+     entity: Any = None,
+     msg: Optional[Message] = None,
++    keep_spoiler: bool = False,
+ ) -> Relayed:
+     """把链接指向的消息搬进中转频道。
+ 
+     entity/msg 可由 probe() 预先传入，避免重复拉取。
++
++    keep_spoiler 是 /setting 里的剧透开关；链接带 nosp 时这一次强制去掉。
++    搬完之后按它统一处理剧透（见 spoiler.py），来源里没有剧透就整步跳过。
+     """
+     if entity is None or msg is None:
+         entity, msg = await locate(client, ref)
+ 
+     group = [msg] if ref.single else await load_album(client, entity, msg)
++    res = await _move(client, ref, relay_channel, entity, msg, group,
++                      on_progress, task_id, register_tmp)
++
++    keep = keep_spoiler and not ref.force_reupload
++    if spoiler.involved(group):
++        res.message_ids = await spoiler.apply(
++            client, relay_channel, res.message_ids,
++            spoiler.wanted(group, len(res.message_ids), keep), keep_text=keep)
++    return res
++
++
++async def _move(client, ref: MsgRef, relay_channel: int, entity: Any,
++                msg: Message, group: list, on_progress, task_id,
++                register_tmp) -> Relayed:
+     is_album = len(group) > 1
+     protected = is_protected(entity, msg)
+ 
+     note = ""
+-    if ref.force_reupload and not protected:
+-        log.info("nosp：%s 主动走重传路径以剥离剧透遮罩", ref)
+     if msg.poll is not None:
+         note = "投票会被复制成一个全新的投票，原始票数无法保留（API 限制）。"
+     elif getattr(msg, "reply_markup", None) is not None:
+         note = "原消息带有 inline 按钮，复制后按钮会丢失（API 限制）。"
+ 
+     # ---------- 路径 A ----------
+-    # nosp 要求重传，直转会把原样的剧透遮罩一起带过来，所以跳过这条路
+-    if not protected and not ref.force_reupload:
++    if not protected:
+         try:
+             sent = await client.forward_messages(
+                 relay_channel, [m.id for m in group], entity
+diff --git a/menu.py b/menu.py
+index f25fd61..27d53a6 100644
+--- a/menu.py
++++ b/menu.py
+@@ -28,6 +28,9 @@ log = logging.getLogger("menu")
+ 
+ # 所有人可见。描述要短，菜单里一行显示得下。
+ PUBLIC: list[tuple[str, str]] = [
++    ("pack", "📦 组装收集到的媒体，可加 fw 去向"),
++    ("clear", "🗑 清空收集箱"),
++    ("setting", "⚙️ 开关设置"),
+     ("status", "📊 登录状态、流量与消息统计"),
+     ("killall", "⛔ 终止进行中的任务并清空队列"),
+     ("help", "❓ 使用说明"),
+diff --git a/pack.py b/pack.py
+new file mode 100644
+index 0000000..d45988b
+--- /dev/null
++++ b/pack.py
+@@ -0,0 +1,323 @@
++"""收集箱：随手转发给 bot 的媒体先攒着，/pack 一次组装成相册发回，/clear 清空。
++
++全部由 bot 完成，不经过 user 账号：bot 收到的每个媒体都带 file_id，用 file_id
++重新发送是服务端引用，不下载不上传，没有 50MB 限制，2GB 的视频也是瞬间完成。
++
++流程和别的功能一致：先在中转频道里组好，再 copyMessages 给你。这样 fw 可以
++直接复用（user 账号从中转频道转出去，隐藏来源）。
++
++收集箱只在内存里。这是「随转随组装」的低频即时操作，重启丢了重新转发就是。
++
++分组规则和抓取组装一样（assemble.plan_blocks）：图片视频混排成相册，文件一组，
++音频一组，每组最多 10 个；动图、贴纸、语音、圆形视频进不了相册，单独发。
++每个相册的说明汇总所有文字，序号是在这个相册里的位置。
++"""
++from __future__ import annotations
++
++import asyncio
++import logging
++from dataclasses import dataclass, field
++from typing import Any, Optional
++
++from aiogram.exceptions import TelegramRetryAfter
++from aiogram.types import (
++    InputMediaAudio,
++    InputMediaDocument,
++    InputMediaPhoto,
++    InputMediaVideo,
++    LinkPreviewOptions,
++)
++
++import assemble
++import tweet
++
++log = logging.getLogger("pack")
++
++INBOX_MAX = 500         # 收集箱上限，防止误操作攒爆内存
++SETTLE = 0.8            # /pack 之前等一下，让同一批转发里还在路上的媒体落进来
++COPY_MAX = 100          # copyMessages 一次最多复制这么多条
++
++# 检查顺序有讲究：动图消息同时带 animation 和 document，必须先认 animation
++KINDS = ("photo", "video", "animation", "video_note", "voice", "audio",
++         "sticker", "document")
++
++
++@dataclass
++class Item:
++    msg_id: int                     # 你发给 bot 的那条消息的 id，排序和删除都用它
++    kind: str
++    file_id: str
++    caption: str = ""
++    entities: list = field(default_factory=list)
++    spoiler: bool = False
++    group: Optional[str] = None     # media_group_id：原本是同一个相册
++    src_key: str = "self"
++    src_name: str = ""
++    src_tag: str = ""
++
++
++def origin_of(m: Any) -> tuple[str, str, str]:
++    """转发来源 (标识, 显示名, #用户名)。不是转发来的返回 ("self", "", "")。"""
++    o = getattr(m, "forward_origin", None)
++    if o is None:
++        return "self", "", ""
++    t = getattr(o, "type", "")
++    if t == "hidden_user":
++        name = o.sender_user_name or ""
++        return f"h:{name}", name, ""
++    if t == "user":
++        u = o.sender_user
++        name = " ".join(x for x in (u.first_name, u.last_name) if x)
++        return f"u{u.id}", name, tweet.to_hashtag(u.username) if u.username else ""
++    chat = getattr(o, "chat", None) or getattr(o, "sender_chat", None)
++    if chat is None:
++        return "self", "", ""
++    uname = getattr(chat, "username", None)
++    return (f"c{chat.id}", chat.title or "",
++            tweet.to_hashtag(uname) if uname else "")
++
++
++def from_message(m: Any) -> Optional[Item]:
++    for kind in KINDS:
++        obj = getattr(m, kind, None)
++        if not obj:
++            continue
++        file_id = obj[-1].file_id if kind == "photo" else obj.file_id
++        key, name, tag = origin_of(m)
++        return Item(
++            msg_id=m.message_id, kind=kind, file_id=file_id,
++            caption=m.caption or "", entities=list(m.caption_entities or []),
++            spoiler=bool(getattr(m, "has_media_spoiler", False)),
++            group=m.media_group_id, src_key=key, src_name=name, src_tag=tag)
++    return None
++
++
++# ------------------------------------------------------------------ 收集箱
++
++_inbox: dict[int, list[Item]] = {}
++_warned: set[int] = set()
++
++
++def add(user_id: int, item: Item) -> bool:
++    """放进收集箱。满了返回 False。"""
++    box = _inbox.setdefault(user_id, [])
++    if len(box) >= INBOX_MAX:
++        return False
++    box.append(item)
++    return True
++
++
++def first_overflow(user_id: int) -> bool:
++    """满了之后只提醒一次，免得一批转发刷出几十条提示。"""
++    if user_id in _warned:
++        return False
++    _warned.add(user_id)
++    return True
++
++
++def take(user_id: int, before: Optional[int] = None) -> list[Item]:
++    """取出（并移出）收集箱里的东西，按消息 id 从旧到新。
++
++    before 给了就只取 id 比它小的 —— /pack 之后才到的留给下一次。
++    """
++    box = _inbox.get(user_id, [])
++    got = [x for x in box if before is None or x.msg_id < before]
++    rest = [x for x in box if not (before is None or x.msg_id < before)]
++    if rest:
++        _inbox[user_id] = rest
++    else:
++        _inbox.pop(user_id, None)
++    _warned.discard(user_id)
++    return sorted(got, key=lambda x: x.msg_id)
++
++
++def restore(user_id: int, items: list[Item]) -> None:
++    """组装失败时放回去，用户可以直接再发一次 /pack。"""
++    box = _inbox.setdefault(user_id, [])
++    box.extend(items)
++    box.sort(key=lambda x: x.msg_id)
++
++
++def clear(user_id: int) -> int:
++    _warned.discard(user_id)
++    return len(_inbox.pop(user_id, []))
++
++
++def count(user_id: int) -> int:
++    return len(_inbox.get(user_id, []))
++
++
++# ------------------------------------------------------------------ 组装
++
++def category(item: Item) -> Optional[str]:
++    if item.kind in ("photo", "video"):
++        return "visual"
++    if item.kind == "document":
++        return "file"
++    if item.kind == "audio":
++        return "audio"
++    return None          # 动图、贴纸、语音、圆形视频：只能单独发
++
++
++def units_of(items: list[Item]) -> tuple[list[assemble.Unit], list[int], list[str]]:
++    """把条目归成「单元」：原本同一个相册的算一个单元，其余一条一个。
++
++    返回 (单元, 每个条目所属单元的下标, 每个单元的文字)。
++    """
++    units: list[assemble.Unit] = []
++    owner: list[int] = []
++    texts: list[list[str]] = []
++    for i, it in enumerate(items):
++        prev = items[i - 1] if i else None
++        if prev is not None and it.group and it.group == prev.group:
++            ui = owner[-1]
++        else:
++            units.append(assemble.Unit(key=it.src_key, name=it.src_name,
++                                       tag=it.src_tag))
++            texts.append([])
++            ui = len(units) - 1
++        owner.append(ui)
++        if it.caption.strip():
++            texts[ui].append(it.caption.strip())
++    return units, owner, ["\n".join(t) for t in texts]
++
++
++def _ents(item: Item, keep_spoiler: bool) -> list:
++    if keep_spoiler:
++        return item.entities
++    return [e for e in item.entities if getattr(e, "type", "") != "spoiler"]
++
++
++async def _retry(fn, *a, **kw):
++    """Bot 往频道里连发会被限流，按 Telegram 给的秒数等完再发。"""
++    for _ in range(6):
++        try:
++            return await fn(*a, **kw)
++        except TelegramRetryAfter as e:
++            log.info("限流 %ss", e.retry_after)
++            await asyncio.sleep(e.retry_after + 1)
++    return await fn(*a, **kw)
++
++
++def _album_item(it: Item, cap_html: Optional[str], keep_spoiler: bool):
++    kw = {"media": it.file_id}
++    if cap_html:
++        kw.update(caption=cap_html, parse_mode="HTML")
++    sp = keep_spoiler and it.spoiler
++    if it.kind == "photo":
++        return InputMediaPhoto(**kw, has_spoiler=sp)
++    if it.kind == "video":
++        return InputMediaVideo(**kw, has_spoiler=sp, supports_streaming=True)
++    if it.kind == "audio":
++        return InputMediaAudio(**kw)
++    return InputMediaDocument(**kw)
++
++
++async def _send_single(bot: Any, chat: int, it: Item, keep_spoiler: bool) -> int:
++    """单独一条：原样发，带它自己的说明和格式。"""
++    sp = keep_spoiler and it.spoiler
++    ents = _ents(it, keep_spoiler)
++    cap = {"caption": it.caption or None, "caption_entities": ents or None,
++           "parse_mode": None}
++    k = it.kind
++    if k == "photo":
++        m = await _retry(bot.send_photo, chat, it.file_id, has_spoiler=sp, **cap)
++    elif k == "video":
++        m = await _retry(bot.send_video, chat, it.file_id, has_spoiler=sp,
++                         supports_streaming=True, **cap)
++    elif k == "animation":
++        m = await _retry(bot.send_animation, chat, it.file_id, has_spoiler=sp, **cap)
++    elif k == "audio":
++        m = await _retry(bot.send_audio, chat, it.file_id, **cap)
++    elif k == "voice":
++        m = await _retry(bot.send_voice, chat, it.file_id, **cap)
++    elif k == "video_note":
++        m = await _retry(bot.send_video_note, chat, it.file_id)
++    elif k == "sticker":
++        m = await _retry(bot.send_sticker, chat, it.file_id)
++    else:
++        m = await _retry(bot.send_document, chat, it.file_id, **cap)
++    return m.message_id
++
++
++@dataclass
++class Packed:
++    blocks: list[list[int]]          # 中转频道里每一块（相册或单条）的消息 id
++    note: str = ""
++
++    @property
++    def ids(self) -> list[int]:
++        return [i for b in self.blocks for i in b]
++
++
++async def build(bot: Any, relay: int, items: list[Item], *,
++                keep_spoiler: bool = False,
++                show_source: bool = False) -> Packed:
++    """在中转频道里按块发好。"""
++    units, owner, unit_text = units_of(items)
++    entries = list(zip(items, owner))
++    blocks = assemble.plan_blocks(entries, msg_of=lambda e: e[0], cat=category)
++
++    out: list[list[int]] = []
++    note = ""
++    for block in blocks:
++        its = [it for it, _ in block]
++        if len(block) == 1:
++            out.append([await _send_single(bot, relay, its[0], keep_spoiler)])
++            continue
++
++        sources = assemble.caption_for(block, units, unit_text)
++        cap, fits = assemble.build_caption(sources, tweet.CAPTION_LIMIT, show_source)
++        long_html = None
++        if not fits:
++            long_html, _ = assemble.build_caption(sources, tweet.TEXT_LIMIT, show_source)
++            cap = None
++        try:
++            media = [_album_item(it, cap if i == 0 else None, keep_spoiler)
++                     for i, it in enumerate(its)]
++            sent = await _retry(bot.send_media_group, relay, media)
++            ids = [m.message_id for m in sent]
++        except TelegramRetryAfter:
++            raise
++        except Exception as e:  # noqa: BLE001
++            log.warning("组装相册失败，改为逐条: %s", e)
++            ids = [await _send_single(bot, relay, it, keep_spoiler) for it in its]
++            note = "部分内容未能组成相册，已逐条发送。"
++            long_html = None
++        if long_html:
++            # 说明的固定部分本身就超了 1024：相册不带说明，汇总另发一条
++            m = await _retry(bot.send_message, relay, long_html, parse_mode="HTML",
++                             link_preview_options=LinkPreviewOptions(is_disabled=True))
++            ids.append(m.message_id)
++        out.append(ids)
++    return Packed(out, note)
++
++
++async def deliver(bot: Any, relay: int, chat: int, packed: Packed) -> int:
++    """copyMessages 给用户。相册分组照样保住；一次最多 100 条，块不拆开。"""
++    n = 0
++    chunk: list[int] = []
++
++    async def flush():
++        nonlocal n, chunk
++        if chunk:
++            res = await _retry(bot.copy_messages, chat_id=chat,
++                               from_chat_id=relay, message_ids=chunk)
++            n += len(res)
++            chunk = []
++
++    for ids in packed.blocks:
++        if chunk and len(chunk) + len(ids) > COPY_MAX:
++            await flush()
++        chunk.extend(ids)
++    await flush()
++    return n
++
++
++async def delete_originals(bot: Any, chat: int, msg_ids: list[int]) -> None:
++    """删掉你转发来的原消息。超过 48 小时的 Telegram 不让删，忽略即可。"""
++    for i in range(0, len(msg_ids), 100):
++        try:
++            await bot.delete_messages(chat, msg_ids[i:i + 100])
++        except Exception as e:  # noqa: BLE001
++            log.info("删除原消息失败（不影响结果）: %s", e)
+diff --git a/prefs.py b/prefs.py
+new file mode 100644
+index 0000000..aeaa564
+--- /dev/null
++++ b/prefs.py
+@@ -0,0 +1,165 @@
++"""每个人自己的偏好设置，发 /setting 弹出一排按钮，点一下切换，立即生效。
++
++存在 users.settings（JSON）里，只存改过的项；没改过的跟随默认值。
++推文形态的默认值来自 .env 的 TWEET_MODE，所以老配置照样有效。
++
++    keep_spoiler  剧透        默认去掉。打开后原样保留媒体遮罩和文字剧透
++    tw_name       推文昵称    默认显示。关掉后引用块里只有正文
++    tg_source     TG 来源名   默认隐藏。组装 Telegram 消息时，说明里写不写
++                              来源的名字和 #用户名
++    pack_delete   组装后删除  默认不删。/pack 之后删掉你转发来的原消息
++    tweet_mode    推文形态    auto / preview / media 轮换
++    fw 默认去向   只能清除；设置去向仍然用 `fw 去向`
++"""
++from __future__ import annotations
++
++import json
++import logging
++from dataclasses import asdict, dataclass, fields, replace
++
++from aiogram import F, Router
++from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
++from aiogram.filters import Command
++
++import acl
++import db
++import tweet
++
++log = logging.getLogger("prefs")
++
++TWEET_MODES = ("auto", "preview", "media")
++
++
++@dataclass(frozen=True)
++class Prefs:
++    keep_spoiler: bool = False
++    tw_name: bool = True
++    tg_source: bool = False
++    pack_delete: bool = False
++    tweet_mode: str = "auto"
++
++
++def defaults() -> Prefs:
++    mode = tweet.TWEET_MODE if tweet.TWEET_MODE in TWEET_MODES else "auto"
++    return Prefs(tweet_mode=mode)
++
++
++def _decode(raw) -> Prefs:
++    base = defaults()
++    if not raw:
++        return base
++    try:
++        data = json.loads(raw)
++    except (TypeError, ValueError):
++        log.warning("设置数据损坏，按默认值处理")
++        return base
++    names = {f.name: f.type for f in fields(Prefs)}
++    clean = {}
++    for k, v in (data or {}).items():
++        if k not in names:
++            continue                        # 已废弃的项，忽略
++        if k == "tweet_mode":
++            if v in TWEET_MODES:
++                clean[k] = v
++        elif isinstance(v, bool):
++            clean[k] = v
++    return replace(base, **clean)
++
++
++async def get(user_id: int) -> Prefs:
++    row = await db.get_user(user_id)
++    return _decode(row["settings"] if row else None)
++
++
++async def update(user_id: int, **changes) -> Prefs:
++    """改几项并保存。只存和默认值不同的项，默认值以后改了也能跟上。"""
++    cur = replace(await get(user_id), **changes)
++    base = defaults()
++    diff = {k: v for k, v in asdict(cur).items() if getattr(base, k) != v}
++    await db.upsert_user(user_id, settings=json.dumps(diff) if diff else None)
++    return cur
++
++
++# ------------------------------------------------------------------ 界面
++
++_MODE_TEXT = {"auto": "自动", "preview": "预览", "media": "原始媒体"}
++
++SETTING_TEXT = (
++    "<b>⚙️ 设置</b>　点按钮切换，立即生效\n\n"
++    "<b>剧透</b>　保留或去掉原消息的剧透遮罩和文字剧透，零流量\n"
++    "<b>推文昵称</b>　推文引用块里写不写昵称\n"
++    "<b>TG 来源名</b>　组装 Telegram 消息时，说明里写不写来源名和 #用户名\n"
++    "<b>组装后删除</b>　/pack 之后删掉你转发来的原消息\n"
++    "<b>推文形态</b>　自动：预览有媒体就发预览，没有就发原始媒体"
++)
++
++
++def keyboard(p: Prefs, last_forward: str | None) -> InlineKeyboardMarkup:
++    def btn(text: str, key: str) -> list[InlineKeyboardButton]:
++        return [InlineKeyboardButton(text=text, callback_data=f"pf:{key}")]
++
++    rows = [
++        btn(f"剧透：{'保留' if p.keep_spoiler else '去掉'}", "keep_spoiler"),
++        btn(f"推文昵称：{'显示' if p.tw_name else '隐藏'}", "tw_name"),
++        btn(f"TG 来源名：{'显示' if p.tg_source else '隐藏'}", "tg_source"),
++        btn(f"组装后删除原消息：{'是' if p.pack_delete else '否'}", "pack_delete"),
++        btn(f"推文形态：{_MODE_TEXT[p.tweet_mode]}", "tweet_mode"),
++    ]
++    if last_forward:
++        rows.append(btn(f"fw 默认去向：{last_forward}（点击清除）", "fw_clear"))
++    return InlineKeyboardMarkup(inline_keyboard=rows)
++
++
++def toggle(p: Prefs, key: str) -> dict:
++    """按下某个按钮后要改的项。认不出的键返回空。"""
++    if key == "tweet_mode":
++        i = TWEET_MODES.index(p.tweet_mode)
++        return {"tweet_mode": TWEET_MODES[(i + 1) % len(TWEET_MODES)]}
++    if key in ("keep_spoiler", "tw_name", "tg_source", "pack_delete"):
++        return {key: not getattr(p, key)}
++    return {}
++
++
++router = Router(name="prefs")
++
++
++async def _ok(user_id: int) -> bool:
++    return await acl.check(user_id) is acl.Access.OK
++
++
++@router.message(Command("setting"))
++@router.message(Command("settings"))
++async def cmd_setting(m: Message) -> None:
++    if m.from_user is None or not await _ok(m.from_user.id):
++        return
++    uid = m.from_user.id
++    row = await db.get_user(uid)
++    await m.reply(SETTING_TEXT, reply_markup=keyboard(
++        await get(uid), row["last_forward"] if row else None))
++
++
++@router.callback_query(F.data.startswith("pf:"))
++async def on_press(q: CallbackQuery) -> None:
++    uid = q.from_user.id
++    if not await _ok(uid):
++        await q.answer("无权使用。", show_alert=True)
++        return
++    key = q.data.split(":", 1)[1]
++    if key == "fw_clear":
++        await db.upsert_user(uid, last_forward=None)
++        toast = "已清除 fw 默认去向"
++        p = await get(uid)
++    else:
++        changes = toggle(await get(uid), key)
++        if not changes:
++            await q.answer()
++            return
++        p = await update(uid, **changes)
++        toast = "已保存"
++    row = await db.get_user(uid)
++    try:
++        await q.message.edit_reply_markup(
++            reply_markup=keyboard(p, row["last_forward"] if row else None))
++    except Exception as e:  # noqa: BLE001
++        log.debug("刷新设置按钮失败: %s", e)
++    await q.answer(toast)
+diff --git a/spoiler.py b/spoiler.py
+new file mode 100644
+index 0000000..1d11edf
+--- /dev/null
++++ b/spoiler.py
+@@ -0,0 +1,158 @@
++"""剧透的统一处理。
++
++剧透有两种：媒体上的遮罩（photo / document 的 spoiler 标记），和文字里的
++剧透片段（MessageEntitySpoiler）。由 /setting 里的总开关决定保留还是去掉，
++默认去掉；链接后加 nosp 是这一次强制去掉。
++
++各条路径原本的表现不一样：
++  直转（A）     服务端转发，遮罩和文字剧透原样带过来
++  重传（B / C） 重建媒体时不设遮罩，遮罩丢了；文字剧透原样保留
++所以统一在搬进中转频道**之后**补一步：比对想要的状态和实际状态，
++不一致就把这批消息用服务端引用重发一遍，再删掉旧的。
++
++重发引用的是中转频道里已有的媒体，不下载、不上传，零流量。
++整批重发而不是只改有问题的那几条，是为了保住相册分组和 id 递增
++（Bot API 的 copyMessages 要求 id 严格递增）。
++"""
++from __future__ import annotations
++
++import logging
++from typing import Any, Optional
++
++from telethon import helpers, utils
++from telethon.tl.functions.messages import SendMediaRequest, SendMultiMediaRequest
++from telethon.tl.types import (
++    InputSingleMedia,
++    MessageEntitySpoiler,
++    MessageMediaDocument,
++    MessageMediaPhoto,
++    MessageMediaWebPage,
++)
++
++from streamer import _ids_from_updates
++
++log = logging.getLogger("spoiler")
++
++
++def can_cover(m: Any) -> bool:
++    """这条消息的媒体能不能带遮罩（只有照片和文件类可以）。"""
++    media = getattr(m, "media", None)
++    return (isinstance(media, MessageMediaPhoto) and media.photo is not None) or \
++        (isinstance(media, MessageMediaDocument) and media.document is not None)
++
++
++def covered(m: Any) -> bool:
++    return can_cover(m) and bool(getattr(m.media, "spoiler", False))
++
++
++def has_text_spoiler(m: Any) -> bool:
++    return any(isinstance(e, MessageEntitySpoiler) for e in (getattr(m, "entities", None) or []))
++
++
++def involved(msgs: list) -> bool:
++    """来源里有没有任何剧透。没有的话后面整步都可以跳过，一个请求都不多发。"""
++    return any(covered(m) or has_text_spoiler(m) for m in msgs)
++
++
++def wanted(sources: list, n: int, keep: bool) -> list[bool]:
++    """每条中转消息想要的遮罩状态。保留时照抄来源，去掉时全部 False。
++
++    来源和中转结果条数对不上（极少见）时，有一张带遮罩就全部带上。
++    """
++    if not keep:
++        return [False] * n
++    flags = [covered(m) for m in sources]
++    if len(flags) == n:
++        return flags
++    return [any(flags)] * n
++
++
++def _entities(m: Any, keep_text: bool) -> Optional[list]:
++    ents = list(getattr(m, "entities", None) or [])
++    if not keep_text:
++        ents = [e for e in ents if not isinstance(e, MessageEntitySpoiler)]
++    return ents or None
++
++
++def _input(m: Any, want: bool) -> Any:
++    im = utils.get_input_media(m.media)
++    im.spoiler = want
++    return im
++
++
++def _needs_change(m: Any, want: bool, keep_text: bool) -> bool:
++    if can_cover(m) and covered(m) != want:
++        return True
++    return not keep_text and has_text_spoiler(m)
++
++
++def _blocks(pairs: list) -> list[list]:
++    """相邻且 grouped_id 相同的归成一个相册，其余各自一条。"""
++    out: list[list] = []
++    for m, w in pairs:
++        gid = getattr(m, "grouped_id", None)
++        if out and gid is not None and getattr(out[-1][0][0], "grouped_id", None) == gid:
++            out[-1].append((m, w))
++        else:
++            out.append([(m, w)])
++    return out
++
++
++async def apply(client: Any, peer: Any, ids: list[int], want: list[bool],
++                keep_text: bool) -> list[int]:
++    """让中转频道里这批消息的剧透状态符合要求，返回最终的消息 id。
++
++    已经符合就原样返回。中途失败时撤掉已经重发的部分、返回原来的 id ——
++    内容照样送到，只是剧透没处理成，不能因为这一步让整个任务失败。
++    """
++    got = await client.get_messages(peer, ids=ids)
++    pairs = [(m, w) for m, w in zip(got, want) if m is not None]
++    if not any(_needs_change(m, w, keep_text) for m, w in pairs):
++        return ids
++
++    out: list[int] = []
++    try:
++        for block in _blocks(pairs):
++            if len(block) > 1 and all(can_cover(m) for m, _ in block):
++                multi = [InputSingleMedia(
++                    media=_input(m, w), random_id=helpers.generate_random_long(),
++                    message=m.message or "", entities=_entities(m, keep_text))
++                    for m, w in block]
++                res = await client(SendMultiMediaRequest(peer=peer, multi_media=multi))
++                out.extend(_ids_from_updates(res))
++                continue
++            for m, w in block:
++                out.extend(await _resend_one(client, peer, m, w, keep_text))
++    except Exception as e:  # noqa: BLE001
++        log.warning("剧透处理失败，按原样投递: %s", e)
++        if out:
++            try:
++                await client.delete_messages(peer, out)
++            except Exception:  # noqa: BLE001
++                pass
++        return ids
++
++    try:
++        await client.delete_messages(peer, [m.id for m, _ in pairs])
++    except Exception as e:  # noqa: BLE001
++        log.debug("清理旧副本失败（不影响结果）: %s", e)
++    log.info("剧透已处理：%d 条重发（%s）", len(out), "保留" if any(want) else "去掉")
++    return out
++
++
++async def _resend_one(client: Any, peer: Any, m: Any, want: bool,
++                      keep_text: bool) -> list[int]:
++    if can_cover(m):
++        res = await client(SendMediaRequest(
++            peer=peer, media=_input(m, want), message=m.message or "",
++            entities=_entities(m, keep_text),
++            random_id=helpers.generate_random_long()))
++        return _ids_from_updates(res)
++    if m.media is None or isinstance(m.media, MessageMediaWebPage):
++        sent = await client.send_message(
++            peer, m.message or "", formatting_entities=_entities(m, keep_text),
++            link_preview=isinstance(m.media, MessageMediaWebPage))
++        return [sent.id]
++    # 投票、位置这类：没有剧透可言，原样复制一份占住顺序
++    sent = await client.forward_messages(peer, [m.id], peer, drop_author=True)
++    return [x.id for x in (sent if isinstance(sent, list) else [sent])]
+diff --git a/taskqueue.py b/taskqueue.py
+index f567f54..b8913f0 100644
+--- a/taskqueue.py
++++ b/taskqueue.py
+@@ -30,6 +30,7 @@ import assemble
+ import db
+ import fetcher
+ import forward
++import prefs
+ import sender
+ import streamer
+ import tweet
+@@ -91,6 +92,8 @@ class Job:
+     forward_to: Optional[str] = None   # fw 的去向；有值时结果不发给本人
+     tweet: Any = None              # 进程内缓存的推文数据，快通道转慢通道时复用
+     lane: str = "fast"          # 当前所在通道，killall 重新排队时要用
++    # 发起人的 /setting，每次运行时重读一遍（改了设置，重试时也跟着变）
++    prefs: Any = field(default_factory=lambda: prefs.defaults())
+     last_edit: float = field(default=0.0)
+     last_text: str = ""
+ 
+@@ -269,6 +272,7 @@ class Runner:
+         job.lane = lane
+         await db.update_task(job.task_id, state="running", lane=lane)
+         try:
++            job.prefs = await prefs.get(job.owner_id)
+             # 已经搬完了（上次投递失败或进程重启），直接重投递，不重传。
+             if job.relayed:
+                 log.info("task=%s 已搬运，跳过传输直接投递", job.task_id)
+@@ -309,17 +313,14 @@ class Runner:
+                 await db.update_task(job.task_id, lane="slow", state="pending")
+                 size = fetcher.media_size(msg)
+                 hint = f"（{streamer.human_size(size)}）" if size else ""
+-                why = ("已指定 nosp，重新上传以去掉剧透遮罩"
+-                       if ref.force_reupload and
+-                       not fetcher.is_protected(entity, msg)
+-                       else "该内容禁止转存，转为搬运模式")
+-                await self._say(job, f"{why}{hint}…")
++                await self._say(job, f"该内容禁止转存，转为搬运模式{hint}…")
+                 await self.slow.put(job)
+                 return
+ 
+             relay_ch = await acl.relay_channel_for(job.owner_id)
+             res = await fetcher.relay(
+-                client, ref, relay_ch, entity=entity, msg=msg
++                client, ref, relay_ch, entity=entity, msg=msg,
++                keep_spoiler=job.prefs.keep_spoiler,
+             )
+         await self._finish(job, res)
+ 
+@@ -348,6 +349,7 @@ class Runner:
+                     on_progress=lambda *a: self._progress(job, *a),
+                     task_id=job.task_id, register_tmp=register_tmp,
+                     entity=entity, msg=msg,
++                    keep_spoiler=job.prefs.keep_spoiler,
+                 )
+             await self._finish(job, res)
+ 
+@@ -379,10 +381,11 @@ class Runner:
+         tw = job.tweet or await tweet.fetch(ref)
+         job.tweet = tw
+         if job.extra is None or job.extra.get("kind") != "tweet":
+-            job.extra = tweet.plan(tw)
++            job.extra = tweet.plan(tw, mode=job.prefs.tweet_mode,
++                                   show_name=job.prefs.tw_name)
+ 
+         if lane == "fast" and job.extra["mode"] == "preview" \
+-                and tweet.TWEET_MODE == "auto" and not job.extra.get("checked"):
++                and job.prefs.tweet_mode == "auto" and not job.extra.get("checked"):
+             await self._check_preview(job, tw)
+         await self._send_tweet_media(job, lane)
+ 
+@@ -546,7 +549,8 @@ class Runner:
+                                   job.request_chat_id, job.request_msg_id,
+                                   forward_to=job.forward_to)
+ 
+-            job.extra, media = tweet.plan_batch([t for _, t in take], skipped)
++            job.extra, media = tweet.plan_batch([t for _, t in take], skipped,
++                                                show_name=job.prefs.tw_name)
+             job.tweet = tweet.Tweet(
+                 id=take[0][1].id, name="", screen_name="", text="", media=media)
+ 
+@@ -591,7 +595,8 @@ class Runner:
+                     res = await fetcher.relay(
+                         client, parse_link(link), relay_ch,
+                         on_progress=lambda *a: self._progress(job, *a),
+-                        task_id=job.task_id, register_tmp=register_tmp)
++                        task_id=job.task_id, register_tmp=register_tmp,
++                        keep_spoiler=job.prefs.keep_spoiler)
+             except fetcher.FetchError as e:
+                 log.info("task=%s 跳过 %s：%s", job.task_id, link, e)
+                 done[link] = []
+@@ -608,7 +613,8 @@ class Runner:
+         await self._say(job, "正在组装…")
+         async with POOL.using(suid):
+             units = await self._grab_units(client, links, done)
+-            final, note = await assemble.compose(client, relay_ch, units)
++            final, note = await assemble.compose(
++                client, relay_ch, units, show_source=job.prefs.tg_source)
+         if skipped:
+             note = f"{note} 其中 {skipped} 条取不到。".strip()
+ 
+@@ -672,7 +678,8 @@ class Runner:
+         job.extra["checked"] = True
+         if verdict == "missing":
+             log.info("task=%s %s，改发原始媒体", job.task_id, why)
+-            job.extra = {**tweet.plan(tw, mode="media"), "checked": True}
++            job.extra = {**tweet.plan(tw, mode="media", show_name=job.prefs.tw_name),
++                         "checked": True}
+             await self._say(job, f"{why}，改为发送原始媒体…")
+ 
+     async def _finish(self, job: Job, res: fetcher.Relayed) -> None:
+diff --git a/tests/test_assemble.py b/tests/test_assemble.py
+index 70dfe2e..a6ec40a 100644
+--- a/tests/test_assemble.py
++++ b/tests/test_assemble.py
+@@ -278,7 +278,7 @@ def _setup(monkeypatch, relay_results, compose_result=([901, 902], "")):
+         return fetcher.Relayed(r, len(r) > 1, "A", 0)
+     monkeypatch.setattr(fetcher, "relay", fake_relay)
+ 
+-    async def fake_compose(client, peer, units):
++    async def fake_compose(client, peer, units, **kw):
+         composed.append([i for u in units for i in u.ids])
+         return compose_result
+     monkeypatch.setattr(assemble, "compose", fake_compose)
+@@ -590,7 +590,7 @@ async def test_tme_batch_relays_each_link(qdb, monkeypatch):
+ 
+     got_units = []
+ 
+-    async def fake_compose(client, peer, units):
++    async def fake_compose(client, peer, units, **kw):
+         got_units.extend(units)
+         return [901, 902], ""
+     monkeypatch.setattr(assemble, "compose", fake_compose)
+diff --git a/tests/test_menu.py b/tests/test_menu.py
+index 75cae1e..19063db 100644
+--- a/tests/test_menu.py
++++ b/tests/test_menu.py
+@@ -63,6 +63,7 @@ def test_every_listed_command_actually_exists():
+     """菜单里列出的命令必须真的有处理函数，否则点了没反应。"""
+     src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
+     src += (Path(__file__).resolve().parent.parent / "admin.py").read_text()
++    src += (Path(__file__).resolve().parent.parent / "prefs.py").read_text()
+     registered = set(re.findall(r'Command\("(\w+)"\)', src))
+     registered.add("help")      # 走 CommandStart/Command("help")
+     for cmd, _ in ALL:
+diff --git a/tests/test_pack.py b/tests/test_pack.py
+new file mode 100644
+index 0000000..955a968
+--- /dev/null
++++ b/tests/test_pack.py
+@@ -0,0 +1,446 @@
++"""收集箱：转发来的媒体攒着，/pack 组装成相册发回。
++
++全程只有 bot：用 file_id 重发是服务端引用，零流量。这里用假 bot 记录调用，
++验证分组、说明汇总、剧透开关、来源名开关、投递分块、删除原消息、/pack 的流程。
++"""
++import os
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++from types import SimpleNamespace
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from cryptography.fernet import Fernet  # noqa: E402
++
++os.environ.setdefault("API_ID", "1")
++os.environ.setdefault("API_HASH", "h")
++os.environ.setdefault("BOT_TOKEN", "t")
++os.environ.setdefault("OWNER_ID", "42")
++os.environ.setdefault("RELAY_CHANNEL_ID", "-1001111111111")
++os.environ.setdefault("SECRET_KEY", Fernet.generate_key().decode())
++
++import pytest  # noqa: E402
++from aiogram.types import (  # noqa: E402
++    Animation, Audio, Chat, Document, InputMediaDocument, InputMediaPhoto,
++    InputMediaVideo, Message, MessageEntity, MessageOriginChannel,
++    MessageOriginHiddenUser, MessageOriginUser, PhotoSize, Sticker, User, Video,
++)
++
++import db  # noqa: E402
++import pack  # noqa: E402
++import tweet  # noqa: E402
++from pack import Item  # noqa: E402
++
++NOW = datetime.now(timezone.utc)
++ME = Chat(id=42, type="private")
++CHAN = Chat(id=-1009, type="channel", title="某频道", username="some_chan")
++
++
++def _msg(mid, kind="photo", caption=None, group=None, origin=None,
++         spoiler=False, entities=None):
++    kw = {}
++    if kind == "photo":
++        kw["photo"] = [PhotoSize(file_id=f"small{mid}", file_unique_id="s", width=1, height=1),
++                       PhotoSize(file_id=f"p{mid}", file_unique_id="b", width=9, height=9)]
++    elif kind == "video":
++        kw["video"] = Video(file_id=f"v{mid}", file_unique_id="u", width=1, height=1, duration=1)
++    elif kind == "animation":
++        kw["animation"] = Animation(file_id=f"g{mid}", file_unique_id="u", width=1,
++                                    height=1, duration=1)
++        kw["document"] = Document(file_id=f"g{mid}", file_unique_id="u")
++    elif kind == "document":
++        kw["document"] = Document(file_id=f"d{mid}", file_unique_id="u")
++    elif kind == "audio":
++        kw["audio"] = Audio(file_id=f"a{mid}", file_unique_id="u", duration=1)
++    elif kind == "sticker":
++        kw["sticker"] = Sticker(file_id=f"s{mid}", file_unique_id="u", type="regular",
++                                width=1, height=1, is_animated=False, is_video=False)
++    return Message(message_id=mid, date=NOW, chat=ME, caption=caption,
++                   caption_entities=entities, media_group_id=group,
++                   forward_origin=origin, has_media_spoiler=spoiler or None, **kw)
++
++
++def _chan_origin():
++    return MessageOriginChannel(type="channel", date=NOW, chat=CHAN, message_id=1)
++
++
++class FakeBot:
++    def __init__(self, fail_group=False):
++        self.calls = []
++        self.next = 1000
++        self.fail_group = fail_group
++
++    def _id(self):
++        self.next += 1
++        return SimpleNamespace(message_id=self.next)
++
++    async def send_media_group(self, chat, media, **kw):
++        if self.fail_group:
++            raise RuntimeError("MEDIA_INVALID")
++        self.calls.append(("group", chat, media))
++        return [self._id() for _ in media]
++
++    def __getattr__(self, name):
++        if not name.startswith("send_"):
++            raise AttributeError(name)
++
++        async def send(chat, *a, **kw):
++            self.calls.append((name[5:], chat, a, kw))
++            return self._id()
++        return send
++
++    async def copy_messages(self, chat_id, from_chat_id, message_ids, **kw):
++        self.calls.append(("copies", chat_id, list(message_ids)))
++        return list(message_ids)
++
++    async def delete_messages(self, chat, ids):
++        self.calls.append(("delete", chat, list(ids)))
++        return True
++
++    def of(self, kind):
++        return [c for c in self.calls if c[0] == kind]
++
++
++@pytest.fixture(autouse=True)
++def _no_signature(monkeypatch):
++    monkeypatch.setattr(tweet, "SIGN_TEXT", "")
++    monkeypatch.setattr(tweet, "SIGN_URL", "")
++    pack._inbox.clear()
++    pack._warned.clear()
++
++
++# ================================================================ 认出媒体
++
++@pytest.mark.parametrize("kind,file_id", [
++    ("photo", "p1"),            # 照片取最大的那个尺寸
++    ("video", "v1"),
++    ("animation", "g1"),        # 动图同时带 document，必须认成动图
++    ("document", "d1"),
++    ("audio", "a1"),
++    ("sticker", "s1"),
++])
++def test_from_message_kinds(kind, file_id):
++    it = pack.from_message(_msg(1, kind))
++    assert (it.kind, it.file_id) == (kind, file_id)
++
++
++def test_from_message_text_only_is_none():
++    assert pack.from_message(Message(message_id=1, date=NOW, chat=ME, text="hi")) is None
++
++
++def test_origin_channel_user_hidden_self():
++    assert pack.origin_of(_msg(1, origin=_chan_origin())) == \
++        ("c-1009", "某频道", "#some_chan")
++    u = User(id=7, is_bot=False, first_name="小", last_name="明", username="xm")
++    assert pack.origin_of(_msg(1, origin=MessageOriginUser(
++        type="user", date=NOW, sender_user=u))) == ("u7", "小 明", "#xm")
++    assert pack.origin_of(_msg(1, origin=MessageOriginHiddenUser(
++        type="hidden_user", date=NOW, sender_user_name="匿名"))) == ("h:匿名", "匿名", "")
++    assert pack.origin_of(_msg(1)) == ("self", "", "")
++
++
++def test_spoiler_and_caption_captured():
++    ents = [MessageEntity(type="spoiler", offset=0, length=2)]
++    it = pack.from_message(_msg(3, caption="秘密", spoiler=True, entities=ents, group="g"))
++    assert it.spoiler and it.caption == "秘密" and it.group == "g"
++    assert it.entities[0].type == "spoiler"
++
++
++# ================================================================ 收集箱
++
++def test_take_only_before_command_and_sorted():
++    for mid in (5, 3, 9, 4):
++        pack.add(42, Item(mid, "photo", f"p{mid}"))
++    got = pack.take(42, before=6)
++    assert [x.msg_id for x in got] == [3, 4, 5], "从旧到新"
++    assert [x.msg_id for x in pack.take(42)] == [9], "命令之后才到的留给下一次"
++    assert pack.count(42) == 0
++
++
++def test_users_have_separate_boxes():
++    pack.add(42, Item(1, "photo", "a"))
++    pack.add(77, Item(2, "photo", "b"))
++    assert pack.clear(42) == 1 and pack.count(77) == 1
++
++
++def test_inbox_limit_and_single_warning(monkeypatch):
++    monkeypatch.setattr(pack, "INBOX_MAX", 2)
++    assert pack.add(42, Item(1, "photo", "a")) and pack.add(42, Item(2, "photo", "b"))
++    assert not pack.add(42, Item(3, "photo", "c"))
++    assert pack.first_overflow(42) and not pack.first_overflow(42), "满了只提醒一次"
++    pack.clear(42)
++    assert pack.first_overflow(42), "清空后重新计"
++
++
++def test_restore_after_failure():
++    pack.add(42, Item(9, "photo", "late"))
++    got = pack.take(42, before=5)
++    pack.restore(42, [Item(1, "photo", "a"), Item(2, "photo", "b")])
++    assert got == [] and [x.msg_id for x in pack.take(42)] == [1, 2, 9]
++
++
++# ================================================================ 单元与分组
++
++def test_units_merge_original_albums():
++    items = [Item(1, "photo", "a", "第一组", group="g1"),
++             Item(2, "photo", "b", group="g1"),
++             Item(3, "photo", "c", "单张"),
++             Item(4, "video", "d", group="g2"),
++             Item(5, "video", "e", "第二组", group="g2")]
++    units, owner, texts = pack.units_of(items)
++    assert owner == [0, 0, 1, 2, 2]
++    assert texts == ["第一组", "单张", "第二组"]
++
++
++@pytest.mark.asyncio
++async def test_twelve_photos_two_albums():
++    bot = FakeBot()
++    items = [Item(i, "photo", f"p{i}") for i in range(1, 13)]
++    packed = await pack.build(bot, -100, items)
++    assert [len(c[2]) for c in bot.of("group")] == [10, 2]
++    assert [len(b) for b in packed.blocks] == [10, 2]
++    assert packed.note == ""
++
++
++@pytest.mark.asyncio
++async def test_mixed_kinds_follow_album_rules():
++    """图片视频一组，文件一组，动图和贴纸单独发。"""
++    bot = FakeBot()
++    items = [Item(1, "photo", "p1"), Item(2, "animation", "g2"),
++             Item(3, "video", "v3"), Item(4, "document", "d4"),
++             Item(5, "document", "d5"), Item(6, "sticker", "s6")]
++    await pack.build(bot, -100, items)
++    groups = [c[2] for c in bot.of("group")]
++    assert [type(x) for x in groups[0]] == [InputMediaPhoto, InputMediaVideo]
++    assert [type(x) for x in groups[1]] == [InputMediaDocument, InputMediaDocument]
++    assert [c[2][0] for c in bot.of("animation")] == ["g2"]
++    assert [c[2][0] for c in bot.of("sticker")] == ["s6"]
++    sent_ids = [x.media for g in groups for x in g]
++    assert sent_ids == ["p1", "v3", "d4", "d5"], "用 file_id，不传字节"
++
++
++@pytest.mark.asyncio
++async def test_caption_summary_on_first_only_without_source_by_default():
++    bot = FakeBot()
++    items = [Item(1, "photo", "a", "第一张", src_key="c1", src_name="某频道", src_tag="#ch"),
++             Item(2, "photo", "b"),
++             Item(3, "photo", "c", "第三张", src_key="c1", src_name="某频道", src_tag="#ch")]
++    await pack.build(bot, -100, items)
++    media = bot.of("group")[0][2]
++    assert media[0].caption == "<blockquote>1 : 第一张\n3 : 第三张</blockquote>"
++    assert media[1].caption is None and media[2].caption is None
++    assert "某频道" not in media[0].caption and "#ch" not in media[0].caption, \
++        "TG 来源名默认不写"
++
++
++@pytest.mark.asyncio
++async def test_caption_with_source_when_enabled():
++    bot = FakeBot()
++    items = [Item(1, "photo", "a", "你好", src_key="c1", src_name="某频道", src_tag="#ch"),
++             Item(2, "photo", "b", src_key="c1", src_name="某频道", src_tag="#ch")]
++    await pack.build(bot, -100, items, show_source=True)
++    cap = bot.of("group")[0][2][0].caption
++    assert cap == "<blockquote><b>某频道</b> :\n1 : 你好</blockquote>\n1-2 · #ch"
++
++
++@pytest.mark.asyncio
++async def test_no_text_no_caption():
++    bot = FakeBot()
++    await pack.build(bot, -100, [Item(1, "photo", "a"), Item(2, "photo", "b")])
++    assert all(x.caption is None for x in bot.of("group")[0][2])
++
++
++@pytest.mark.asyncio
++async def test_spoiler_dropped_by_default_kept_when_enabled():
++    items = [Item(1, "photo", "a", spoiler=True), Item(2, "video", "b", spoiler=True),
++             Item(3, "animation", "g", spoiler=True)]
++    bot = FakeBot()
++    await pack.build(bot, -100, items)
++    assert not any(x.has_spoiler for x in bot.of("group")[0][2])
++    assert bot.of("animation")[0][3]["has_spoiler"] is False
++
++    bot = FakeBot()
++    await pack.build(bot, -100, items, keep_spoiler=True)
++    assert all(x.has_spoiler for x in bot.of("group")[0][2])
++    assert bot.of("animation")[0][3]["has_spoiler"] is True
++
++
++@pytest.mark.asyncio
++async def test_single_keeps_own_caption_strips_spoiler_entity():
++    ents = [MessageEntity(type="spoiler", offset=0, length=2),
++            MessageEntity(type="bold", offset=3, length=2)]
++    bot = FakeBot()
++    await pack.build(bot, -100, [Item(1, "animation", "g", "秘密 加粗", ents)])
++    kw = bot.of("animation")[0][3]
++    assert kw["caption"] == "秘密 加粗" and kw["parse_mode"] is None
++    assert [e.type for e in kw["caption_entities"]] == ["bold"]
++
++    bot = FakeBot()
++    await pack.build(bot, -100, [Item(1, "animation", "g", "秘密 加粗", ents)],
++                     keep_spoiler=True)
++    assert [e.type for e in bot.of("animation")[0][3]["caption_entities"]] == \
++        ["spoiler", "bold"]
++
++
++@pytest.mark.asyncio
++async def test_group_failure_falls_back_to_singles():
++    bot = FakeBot(fail_group=True)
++    packed = await pack.build(bot, -100, [Item(1, "photo", "a"), Item(2, "photo", "b")])
++    assert [c[2][0] for c in bot.of("photo")] == ["a", "b"]
++    assert packed.note and len(packed.ids) == 2
++
++
++@pytest.mark.asyncio
++async def test_overlong_caption_sent_as_separate_text(monkeypatch):
++    monkeypatch.setattr(tweet, "CAPTION_LIMIT", 10)
++    bot = FakeBot()
++    items = [Item(i, "photo", f"p{i}", "字" * 5) for i in range(1, 4)]
++    packed = await pack.build(bot, -100, items)
++    assert all(x.caption is None for x in bot.of("group")[0][2])
++    assert len(bot.of("message")) == 1, "汇总另发一条"
++    assert len(packed.blocks[0]) == 4
++
++
++# ================================================================ 投递
++
++@pytest.mark.asyncio
++async def test_deliver_chunks_without_splitting_blocks():
++    bot = FakeBot()
++    blocks = [list(range(k * 10, k * 10 + 10)) for k in range(10)] + [[500, 501]]
++    n = await pack.deliver(bot, -100, 42, pack.Packed(blocks))
++    copies = [c[2] for c in bot.of("copies")]
++    assert [len(c) for c in copies] == [100, 2] and n == 102
++
++
++@pytest.mark.asyncio
++async def test_delete_originals_in_batches():
++    bot = FakeBot()
++    await pack.delete_originals(bot, 42, list(range(250)))
++    assert [len(c[2]) for c in bot.of("delete")] == [100, 100, 50]
++
++
++# ================================================================ /pack 流程
++
++@pytest.fixture
++async def fresh(tmp_path):
++    from config import CFG
++    object.__setattr__(CFG, "db_path", tmp_path / "p.db")
++    await db.init()
++    yield
++    await db.close()
++
++
++class FakeMsg:
++    def __init__(self, bot, mid=100, uid=42):
++        self.bot = bot
++        self.message_id = mid
++        self.from_user = SimpleNamespace(id=uid)
++        self.chat = SimpleNamespace(id=uid)
++        self.replies = []
++
++    async def reply(self, text, **kw):
++        self.replies.append(text)
++
++    async def answer(self, text, **kw):
++        self.replies.append(text)
++
++
++@pytest.fixture
++def botmod(monkeypatch):
++    import bot as botmod
++    monkeypatch.setattr(pack, "SETTLE", 0)
++    return botmod
++
++
++@pytest.mark.asyncio
++async def test_cmd_pack_delivers_and_keeps_originals_by_default(fresh, botmod):
++    for mid in (1, 2, 3):
++        pack.add(42, Item(mid, "photo", f"p{mid}"))
++    bot = FakeBot()
++    m = FakeMsg(bot)
++    await botmod.cmd_pack(m, SimpleNamespace(args=None))
++    assert len(bot.of("group")[0][2]) == 3
++    assert bot.of("copies")[0][1] == 42
++    assert not bot.of("delete"), "默认不删原消息"
++    assert m.replies == [], "成功时不打扰"
++    assert pack.count(42) == 0
++
++
++@pytest.mark.asyncio
++async def test_cmd_pack_deletes_when_enabled(fresh, botmod):
++    import prefs
++    await prefs.update(42, pack_delete=True)
++    pack.add(42, Item(1, "photo", "a"))
++    pack.add(42, Item(2, "photo", "b"))
++    bot = FakeBot()
++    await botmod.cmd_pack(FakeMsg(bot, mid=100), SimpleNamespace(args=None))
++    assert bot.of("delete")[0][2] == [1, 2, 100], "原消息和命令本身一起删"
++
++
++@pytest.mark.asyncio
++async def test_cmd_pack_empty(fresh, botmod):
++    m = FakeMsg(FakeBot())
++    await botmod.cmd_pack(m, SimpleNamespace(args=None))
++    assert "空" in m.replies[0]
++
++
++@pytest.mark.asyncio
++async def test_cmd_pack_failure_restores_inbox(fresh, botmod, monkeypatch):
++    pack.add(42, Item(1, "photo", "a"))
++
++    async def boom(*a, **kw):
++        raise RuntimeError("网络断了")
++    monkeypatch.setattr(pack, "build", boom)
++    m = FakeMsg(FakeBot())
++    await botmod.cmd_pack(m, SimpleNamespace(args=None))
++    assert "组装失败" in m.replies[0] and pack.count(42) == 1
++
++
++@pytest.mark.asyncio
++async def test_cmd_pack_bad_args(fresh, botmod):
++    pack.add(42, Item(1, "photo", "a"))
++    m = FakeMsg(FakeBot())
++    await botmod.cmd_pack(m, SimpleNamespace(args="随便写点"))
++    assert "用法" in m.replies[0] and pack.count(42) == 1
++
++
++@pytest.mark.asyncio
++async def test_cmd_pack_fw_forwards_relay_copies(fresh, botmod, monkeypatch):
++    await db.upsert_user(42, last_forward="@mychan")
++    pack.add(42, Item(1, "photo", "a"))
++    pack.add(42, Item(2, "photo", "b"))
++    sent = []
++
++    async def fake_send(client, target, peer, ids):
++        sent.append((target, list(ids)))
++        return len(ids)
++
++    class Pool:
++        async def acquire(self, uid):
++            return object()
++
++        def using(self, uid):
++            return _Null()
++
++    class _Null:
++        async def __aenter__(self):
++            return None
++
++        async def __aexit__(self, *a):
++            return False
++
++    monkeypatch.setattr(botmod.forward, "send", fake_send)
++    monkeypatch.setattr(botmod, "POOL", Pool())
++    bot = FakeBot()
++    await botmod.cmd_pack(FakeMsg(bot), SimpleNamespace(args="fw"))
++    assert bot.of("copies"), "本人那份照常收到"
++    assert sent == [("@mychan", [1001, 1002])]
++
++
++@pytest.mark.asyncio
++async def test_cmd_clear(fresh, botmod):
++    pack.add(42, Item(1, "photo", "a"))
++    m = FakeMsg(FakeBot())
++    await botmod.cmd_clear(m)
++    assert m.replies == ["已清空 1 个。"] and pack.count(42) == 0
+diff --git a/tests/test_prefs.py b/tests/test_prefs.py
+new file mode 100644
+index 0000000..cca64b9
+--- /dev/null
++++ b/tests/test_prefs.py
+@@ -0,0 +1,282 @@
++"""/setting：开关的存取、按钮、以及两个来源名开关对说明文字的影响。"""
++import os
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from cryptography.fernet import Fernet  # noqa: E402
++
++os.environ.setdefault("API_ID", "1")
++os.environ.setdefault("API_HASH", "h")
++os.environ.setdefault("BOT_TOKEN", "t")
++os.environ.setdefault("OWNER_ID", "42")
++os.environ.setdefault("RELAY_CHANNEL_ID", "-1001111111111")
++os.environ.setdefault("SECRET_KEY", Fernet.generate_key().decode())
++
++import json  # noqa: E402
++
++import pytest  # noqa: E402
++
++import assemble  # noqa: E402
++import db  # noqa: E402
++import prefs  # noqa: E402
++import tweet  # noqa: E402
++from streamer import WebMedia  # noqa: E402
++from tweet import Tweet  # noqa: E402
++
++
++@pytest.fixture
++async def fresh(tmp_path):
++    from config import CFG
++    object.__setattr__(CFG, "db_path", tmp_path / "s.db")
++    await db.init()
++    yield
++    await db.close()
++
++
++@pytest.fixture(autouse=True)
++def _no_signature(monkeypatch):
++    monkeypatch.setattr(tweet, "SIGN_TEXT", "")
++    monkeypatch.setattr(tweet, "SIGN_URL", "")
++
++
++# ================================================================ 存取
++
++def test_defaults(monkeypatch):
++    monkeypatch.setattr(tweet, "TWEET_MODE", "auto")
++    p = prefs.defaults()
++    assert p == prefs.Prefs(keep_spoiler=False, tw_name=True, tg_source=False,
++                            pack_delete=False, tweet_mode="auto")
++
++
++def test_tweet_mode_default_follows_env(monkeypatch):
++    monkeypatch.setattr(tweet, "TWEET_MODE", "media")
++    assert prefs.defaults().tweet_mode == "media"
++    monkeypatch.setattr(tweet, "TWEET_MODE", "garbage")
++    assert prefs.defaults().tweet_mode == "auto"
++
++
++@pytest.mark.asyncio
++async def test_roundtrip_stores_only_changes(fresh):
++    p = await prefs.update(42, keep_spoiler=True)
++    assert p.keep_spoiler and (await prefs.get(42)).keep_spoiler
++    assert json.loads((await db.get_user(42))["settings"]) == {"keep_spoiler": True}
++    await prefs.update(42, keep_spoiler=False)
++    assert (await db.get_user(42))["settings"] is None, "改回默认就不存"
++
++
++@pytest.mark.asyncio
++async def test_per_user(fresh):
++    await db.upsert_user(77, status="active")
++    await prefs.update(77, tw_name=False)
++    assert (await prefs.get(42)).tw_name and not (await prefs.get(77)).tw_name
++
++
++@pytest.mark.parametrize("raw", ["{坏掉的", '{"tweet_mode": "nope", "tw_name": "yes", "old": 1}'])
++def test_bad_data_falls_back(raw):
++    assert prefs._decode(raw) == prefs.defaults()
++
++
++@pytest.mark.asyncio
++async def test_old_database_gets_column(tmp_path):
++    """老库没有 settings 列，启动时自动补上。"""
++    import aiosqlite
++    from config import CFG
++    path = tmp_path / "old.db"
++    async with aiosqlite.connect(path) as c:
++        await c.execute("CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT, "
++                        "role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'pending', "
++                        "session_enc BLOB, session_status TEXT NOT NULL DEFAULT 'none', "
++                        "relay_channel_id INTEGER, added_by INTEGER, added_at INTEGER NOT NULL, "
++                        "last_active INTEGER, task_count INTEGER NOT NULL DEFAULT 0, "
++                        "bytes_total INTEGER NOT NULL DEFAULT 0)")
++        await c.commit()
++    object.__setattr__(CFG, "db_path", path)
++    await db.init()
++    try:
++        await prefs.update(42, pack_delete=True)
++        assert (await prefs.get(42)).pack_delete
++    finally:
++        await db.close()
++
++
++# ================================================================ 按钮
++
++def test_toggle_and_cycle():
++    p = prefs.Prefs()
++    assert prefs.toggle(p, "keep_spoiler") == {"keep_spoiler": True}
++    assert prefs.toggle(p, "tw_name") == {"tw_name": False}
++    assert prefs.toggle(p, "tweet_mode") == {"tweet_mode": "preview"}
++    assert prefs.toggle(prefs.Prefs(tweet_mode="media"), "tweet_mode") == {"tweet_mode": "auto"}
++    assert prefs.toggle(p, "rm -rf") == {}
++
++
++def test_keyboard_labels():
++    kb = prefs.keyboard(prefs.Prefs(), None)
++    texts = [r[0].text for r in kb.inline_keyboard]
++    assert texts == ["剧透：去掉", "推文昵称：显示", "TG 来源名：隐藏",
++                     "组装后删除原消息：否", "推文形态：自动"]
++    assert all(r[0].callback_data.startswith("pf:") for r in kb.inline_keyboard)
++    kb = prefs.keyboard(prefs.Prefs(), "@optv4")
++    assert kb.inline_keyboard[-1][0].text.startswith("fw 默认去向：@optv4")
++
++
++class _Q:
++    def __init__(self, data, uid=42):
++        from types import SimpleNamespace
++        self.data = data
++        self.from_user = SimpleNamespace(id=uid)
++        self.toasts = []
++        self.markups = []
++
++        async def edit(reply_markup=None):
++            self.markups.append(reply_markup)
++        self.message = SimpleNamespace(edit_reply_markup=edit)
++
++    async def answer(self, text=None, **kw):
++        self.toasts.append(text)
++
++
++@pytest.mark.asyncio
++async def test_press_toggles_and_refreshes(fresh):
++    q = _Q("pf:tg_source")
++    await prefs.on_press(q)
++    assert (await prefs.get(42)).tg_source
++    assert q.markups[0].inline_keyboard[2][0].text == "TG 来源名：显示"
++    assert q.toasts == ["已保存"]
++
++
++@pytest.mark.asyncio
++async def test_press_clears_forward(fresh):
++    await db.upsert_user(42, last_forward="@a")
++    q = _Q("pf:fw_clear")
++    await prefs.on_press(q)
++    assert (await db.get_user(42))["last_forward"] is None
++    assert all("fw" not in r[0].text for r in q.markups[0].inline_keyboard)
++
++
++@pytest.mark.asyncio
++async def test_press_by_stranger_rejected(fresh):
++    q = _Q("pf:keep_spoiler", uid=999)
++    await prefs.on_press(q)
++    assert q.toasts == ["无权使用。"] and not (await prefs.get(999)).keep_spoiler
++
++
++# ================================================================ 推文昵称开关
++
++def _tw(text="正文", media=None, name="花无尘", sn="HuaWu"):
++    return Tweet("1", name, sn, text, media or [])
++
++
++def test_tweet_name_shown_by_default():
++    h, _ = tweet.build_html(_tw(), 1024)
++    assert h.startswith("<blockquote><b>花无尘</b> : 正文</blockquote>")
++
++
++def test_tweet_name_hidden():
++    h, _ = tweet.build_html(_tw(), 1024, show_name=False)
++    assert h.startswith("<blockquote>正文</blockquote>\n<a href=")
++    assert "花无尘" not in h and "#HuaWu" in h, "#ID 还在，只去掉昵称"
++
++
++def test_tweet_name_hidden_no_text_no_quote():
++    h, _ = tweet.build_html(_tw(text=""), 1024, show_name=False)
++    assert "<blockquote>" not in h and h.startswith("<a href=")
++
++
++def test_tweet_name_hidden_truncation_budget():
++    """去掉昵称后省下的长度要还给正文。"""
++    long = "字" * 2000
++    with_name, _ = tweet.build_html(_tw(text=long), 200)
++    without, _ = tweet.build_html(_tw(text=long), 200, show_name=False)
++    assert without.count("字") > with_name.count("字")
++    plain = without.replace("<blockquote>", "").replace("</blockquote>", "")
++    assert tweet.utf16_len(plain.split("<a href")[0]) <= 200
++
++
++def test_plan_passes_show_name():
++    t = _tw(media=[WebMedia("photo", "https://a")])
++    assert "花无尘" not in tweet.plan(t, mode="media", show_name=False)["html"]
++    assert "花无尘" in tweet.plan(t, mode="media")["html"]
++
++
++def test_batch_name_hidden_keeps_labels():
++    a = _tw("甲", [WebMedia("photo", "https://a")], name="A", sn="a")
++    b = _tw("", [WebMedia("photo", "https://b"), WebMedia("photo", "https://c")],
++            name="B", sn="b")
++    c = _tw("纯文字", [], name="C", sn="c")
++    extra, _ = tweet.plan_batch([a, b, c], show_name=False)
++    h = extra["html"]
++    assert "<blockquote>1 : 甲</blockquote>" in h
++    assert "<blockquote>2-3 :</blockquote>" in h
++    assert "<blockquote>纯文字</blockquote>" in h
++    assert "<b>" not in h
++
++
++@pytest.mark.asyncio
++async def test_runner_uses_prefs_for_tweet(monkeypatch):
++    """调度器按发起人的设置规划推文：昵称开关、推文形态。"""
++    import taskqueue
++    seen = {}
++
++    def fake_plan(tw, mode=None, show_name=True):
++        seen.update(mode=mode, show_name=show_name)
++        return {"kind": "tweet", "mode": "text", "html": "x", "caption": False,
++                "url": tw.url, "preview_url": tw.preview_url}
++
++    async def fake_fetch(ref):
++        return _tw()
++
++    async def nop(*a, **kw):
++        return None
++
++    monkeypatch.setattr(tweet, "plan", fake_plan)
++    monkeypatch.setattr(tweet, "fetch", fake_fetch)
++    r = taskqueue.Runner.__new__(taskqueue.Runner)
++    r._send_tweet_media = nop
++    job = taskqueue.Job(1, 42, "https://x.com/a/status/1", 9, 5)
++    job.prefs = prefs.Prefs(tw_name=False, tweet_mode="media")
++    await r._run_tweet(job, "fast")
++    assert seen == {"mode": "media", "show_name": False}
++
++
++# ================================================================ TG 来源名开关
++
++SRC = [("某频道", "#chan", 1, 3, [("1", "第一条"), ("2-3", "")])]
++
++
++def test_caption_with_source():
++    h, ok = assemble.build_caption(SRC, 1024)
++    assert ok and h == "<blockquote><b>某频道</b> :\n1 : 第一条</blockquote>\n1-3 · #chan"
++
++
++def test_caption_without_source():
++    h, ok = assemble.build_caption(SRC, 1024, show_source=False)
++    assert ok and h == "<blockquote>1 : 第一条</blockquote>"
++
++
++def test_caption_without_source_drops_empty_blocks():
++    src = SRC + [("别的群", "#other", 4, 5, [("4-5", "")])]
++    h, _ = assemble.build_caption(src, 1024, show_source=False)
++    assert h == "<blockquote>1 : 第一条</blockquote>"
++
++
++def test_caption_nothing_at_all_with_signature(monkeypatch):
++    monkeypatch.setattr(tweet, "SIGN_TEXT", "@欧派TV")
++    h, _ = assemble.build_caption([("x", "#x", 1, 2, [("1-2", "")])], 1024,
++                                  show_source=False)
++    assert h == "via @欧派TV", "只剩署名时前面不空两行"
++
++
++def test_caption_empty_name_never_shown():
++    h, _ = assemble.build_caption([("", "", 1, 2, [("1", "hi")])], 1024)
++    assert h == "<blockquote>1 : hi</blockquote>"
++
++
++def test_caption_without_source_budget_goes_to_text():
++    long = "字" * 3000
++    src = [("某个很长很长的频道名字", "#a_very_long_channel_tag", 1, 2, [("1-2", long)])]
++    a, _ = assemble.build_caption(src, 300)
++    b, _ = assemble.build_caption(src, 300, show_source=False)
++    assert b.count("字") > a.count("字")
+diff --git a/tests/test_spoiler.py b/tests/test_spoiler.py
+new file mode 100644
+index 0000000..87ca8d6
+--- /dev/null
++++ b/tests/test_spoiler.py
+@@ -0,0 +1,246 @@
++"""剧透总开关。
++
++默认去掉：媒体遮罩和文字剧透都不保留。打开后原样保留；nosp 是这一次强制去掉。
++处理方式是搬进中转频道之后，用服务端引用重发一遍，零流量 —— nosp 不再重新下载上传。
++"""
++import os
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from cryptography.fernet import Fernet  # noqa: E402
++
++os.environ.setdefault("API_ID", "1")
++os.environ.setdefault("API_HASH", "h")
++os.environ.setdefault("BOT_TOKEN", "t")
++os.environ.setdefault("OWNER_ID", "42")
++os.environ.setdefault("RELAY_CHANNEL_ID", "-1001111111111")
++os.environ.setdefault("SECRET_KEY", Fernet.generate_key().decode())
++
++import pytest  # noqa: E402
++from telethon.tl import functions, types  # noqa: E402
++
++import fetcher  # noqa: E402
++import spoiler  # noqa: E402
++from parser import parse_link  # noqa: E402
++
++NOW = datetime.now(timezone.utc)
++CH = types.PeerChannel(555)
++
++
++def _photo(mid, cover=False, text="", ents=None, gid=None):
++    return types.Message(
++        id=mid, peer_id=CH, date=NOW, message=text, entities=ents, grouped_id=gid,
++        media=types.MessageMediaPhoto(
++            photo=types.Photo(id=mid, access_hash=1, file_reference=b"", date=NOW,
++                              sizes=[], dc_id=1), spoiler=cover))
++
++
++def _video(mid, cover=False, gid=None):
++    return types.Message(
++        id=mid, peer_id=CH, date=NOW, message="", grouped_id=gid,
++        media=types.MessageMediaDocument(
++            document=types.Document(id=mid, access_hash=1, file_reference=b"", date=NOW,
++                                    mime_type="video/mp4", size=1, dc_id=1,
++                                    attributes=[]), spoiler=cover))
++
++
++def _text(mid, text="hi", ents=None):
++    return types.Message(id=mid, peer_id=CH, date=NOW, message=text, entities=ents)
++
++
++SP = types.MessageEntitySpoiler(offset=0, length=2)
++BOLD = types.MessageEntityBold(offset=0, length=2)
++
++
++class FakeClient:
++    """记录请求；中转频道里的消息由 store 决定。"""
++
++    def __init__(self, store, fail=False):
++        self.store = {m.id: m for m in store}
++        self.requests = []
++        self.deleted = []
++        self.next = 900
++        self.fail = fail
++
++    async def get_messages(self, peer, ids=None):
++        return [self.store.get(i) for i in ids]
++
++    def _ups(self, n):
++        ups = []
++        for _ in range(n):
++            self.next += 1
++            ups.append(types.UpdateNewChannelMessage(
++                message=types.Message(id=self.next, peer_id=CH, date=NOW, message=""),
++                pts=1, pts_count=1))
++        return types.Updates(updates=ups, users=[], chats=[], date=NOW, seq=0)
++
++    async def __call__(self, req):
++        self.requests.append(req)
++        if self.fail and len(self.requests) > 1:
++            raise RuntimeError("boom")
++        if isinstance(req, functions.messages.SendMultiMediaRequest):
++            return self._ups(len(req.multi_media))
++        if isinstance(req, functions.messages.SendMediaRequest):
++            return self._ups(1)
++        raise AssertionError(type(req).__name__)
++
++    async def send_message(self, peer, text, formatting_entities=None, link_preview=False):
++        self.requests.append(("text", text, formatting_entities))
++        self.next += 1
++        return types.Message(id=self.next, peer_id=CH, date=NOW, message=text)
++
++    async def forward_messages(self, peer, ids, from_peer, **kw):
++        self.requests.append(("fwd", list(ids)))
++        out = []
++        for _ in ids:
++            self.next += 1
++            out.append(types.Message(id=self.next, peer_id=CH, date=NOW, message=""))
++        return out
++
++    async def delete_messages(self, peer, ids):
++        self.deleted.append(list(ids))
++
++    def of(self, cls):
++        return [r for r in self.requests if isinstance(r, cls)]
++
++
++# ================================================================ 判定
++
++def test_involved():
++    assert not spoiler.involved([_photo(1), _text(2, ents=[BOLD])])
++    assert spoiler.involved([_photo(1, cover=True)])
++    assert spoiler.involved([_text(1, ents=[SP])])
++
++
++def test_wanted():
++    src = [_photo(1, cover=True), _photo(2)]
++    assert spoiler.wanted(src, 2, keep=False) == [False, False]
++    assert spoiler.wanted(src, 2, keep=True) == [True, False]
++    assert spoiler.wanted(src, 3, keep=True) == [True] * 3, "条数对不上就全部带上"
++
++
++# ================================================================ 处理
++
++@pytest.mark.asyncio
++async def test_nothing_to_do_sends_nothing():
++    c = FakeClient([_photo(1), _video(2)])
++    assert await spoiler.apply(c, CH, [1, 2], [False, False], keep_text=False) == [1, 2]
++    assert c.requests == [] and c.deleted == []
++
++
++@pytest.mark.asyncio
++async def test_strip_cover_single():
++    c = FakeClient([_photo(1, cover=True, text="hi", ents=[BOLD])])
++    ids = await spoiler.apply(c, CH, [1], [False], keep_text=False)
++    req = c.of(functions.messages.SendMediaRequest)[0]
++    assert isinstance(req.media, types.InputMediaPhoto) and req.media.spoiler is False
++    assert req.message == "hi" and req.entities == [BOLD], "其余格式保留"
++    assert ids == [901] and c.deleted == [[1]]
++
++
++@pytest.mark.asyncio
++async def test_strip_keeps_album_together_and_order():
++    c = FakeClient([_photo(1, cover=True, gid=7), _video(2, gid=7), _text(3, "尾巴")])
++    ids = await spoiler.apply(c, CH, [1, 2, 3], [False] * 3, keep_text=False)
++    multi = c.of(functions.messages.SendMultiMediaRequest)
++    assert len(multi) == 1 and len(multi[0].multi_media) == 2, "相册整组重发"
++    assert not any(x.media.spoiler for x in multi[0].multi_media)
++    assert ids == sorted(ids) and len(ids) == 3, "id 递增，copyMessages 才不出错"
++    assert c.deleted == [[1, 2, 3]]
++
++
++@pytest.mark.asyncio
++async def test_strip_text_spoiler_entity():
++    c = FakeClient([_text(1, "秘密内容", [SP, BOLD])])
++    await spoiler.apply(c, CH, [1], [False], keep_text=False)
++    assert c.requests[0] == ("text", "秘密内容", [BOLD])
++
++
++@pytest.mark.asyncio
++async def test_keep_restores_cover_lost_by_reupload():
++    """受保护内容重传后遮罩丢了；保留模式下要补回来。"""
++    c = FakeClient([_photo(1), _photo(2)])
++    await spoiler.apply(c, CH, [1, 2], [True, False], keep_text=True)
++    sent = [r for r in c.requests if isinstance(r, functions.messages.SendMediaRequest)]
++    assert [r.media.spoiler for r in sent] == [True, False]
++
++
++@pytest.mark.asyncio
++async def test_keep_leaves_text_spoiler():
++    c = FakeClient([_text(1, "秘密", [SP])])
++    assert await spoiler.apply(c, CH, [1], [False], keep_text=True) == [1]
++    assert c.requests == []
++
++
++@pytest.mark.asyncio
++async def test_failure_rolls_back_and_returns_original():
++    c = FakeClient([_photo(1, cover=True), _photo(2, cover=True)], fail=True)
++    ids = await spoiler.apply(c, CH, [1, 2], [False, False], keep_text=False)
++    assert ids == [1, 2]
++    assert c.deleted == [[901]], "已重发的那条撤掉，原件不动"
++
++
++# ================================================================ 接进 relay
++
++class RelayClient(FakeClient):
++    """路径 A：forward_messages 进中转频道，中转里的副本保留来源的遮罩。"""
++
++    def __init__(self, src):
++        super().__init__([])
++        self.src = src
++
++    async def forward_messages(self, peer, ids, from_peer=None, **kw):
++        out = []
++        for m in self.src:
++            self.next += 1
++            copy = types.Message(id=self.next, peer_id=CH, date=NOW, message=m.message,
++                                 entities=m.entities, media=m.media)
++            self.store[copy.id] = copy
++            out.append(copy)
++        return out
++
++
++async def _relay(src, link, keep):
++    c = RelayClient(src)
++    res = await fetcher.relay(c, parse_link(link), -100, entity=object(),
++                              msg=src[0], keep_spoiler=keep)
++    return c, res
++
++
++@pytest.mark.asyncio
++async def test_relay_strips_by_default():
++    c, res = await _relay([_photo(10, cover=True)], "https://t.me/durov/10", keep=False)
++    req = c.of(functions.messages.SendMediaRequest)[0]
++    assert req.media.spoiler is False and res.message_ids == [902]
++
++
++@pytest.mark.asyncio
++async def test_relay_keeps_when_enabled():
++    c, res = await _relay([_photo(10, cover=True)], "https://t.me/durov/10", keep=True)
++    assert not c.of(functions.messages.SendMediaRequest), "直转已经带着遮罩，不用动"
++    assert res.message_ids == [901]
++
++
++@pytest.mark.asyncio
++async def test_relay_nosp_overrides_keep():
++    c, res = await _relay([_photo(10, cover=True)], "https://t.me/durov/10?nosp", keep=True)
++    assert c.of(functions.messages.SendMediaRequest)[0].media.spoiler is False
++
++
++@pytest.mark.asyncio
++async def test_relay_no_spoiler_no_extra_requests():
++    c, res = await _relay([_photo(10)], "https://t.me/durov/10", keep=False)
++    assert c.requests == [] and res.path == "A"
++
++
++@pytest.mark.asyncio
++async def test_nosp_no_longer_forces_slow_lane(monkeypatch):
++    """nosp 以前要重新下载上传，现在零流量：探测时不再当成「重活」。"""
++    async def fake_locate(client, ref):
++        return object(), _photo(10, cover=True)
++    monkeypatch.setattr(fetcher, "locate", fake_locate)
++    _, _, heavy = await fetcher.probe(None, parse_link("https://t.me/durov/10?nosp"))
++    assert heavy is False
+diff --git a/tweet.py b/tweet.py
+index 8584ce4..7f29109 100644
+--- a/tweet.py
++++ b/tweet.py
+@@ -312,7 +312,7 @@ def id_tag(tw: Tweet) -> str:
+     return to_hashtag(tw.screen_name)
+ 
+ 
+-def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
++def build_html(tw: Tweet, limit: int, show_name: bool = True) -> tuple[str, bool]:
+     """组装消息 HTML。超长时截断正文，返回 (html, 是否截断)。
+ 
+     格式：
+@@ -322,17 +322,20 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
+         via <a href="署名链接">署名</a>
+ 
+     没有正文时引用块里只有「昵称 :」。
++    show_name=False（/setting 里关掉推文昵称）时引用块里只有正文，
++    没有正文就不要引用块。
+     超链接的 URL 不计入 Telegram 的长度限制，只有显示文字算。
+     """
+     name = tw.name.strip() or tw.screen_name
+     tag = id_tag(tw)
+     text = tw.text.strip()
+ 
+-    head_plain = f"{name} :" + (" " if text else "")
++    head_plain = (f"{name} :" + (" " if text else "")) if show_name else ""
+     last_plain = LINK_TEXT + (f" · {tag}" if tag else "")
+     sign_plain = f"\n\nvia {SIGN_TEXT}" if SIGN_TEXT else ""
+-    overhead = (utf16_len(head_plain) + 1 + utf16_len(last_plain)
+-                + utf16_len(sign_plain))
++    has_quote = show_name or bool(text)
++    overhead = (utf16_len(head_plain) + (1 if has_quote else 0)
++                + utf16_len(last_plain) + utf16_len(sign_plain))
+     budget = max(limit - overhead, 0)
+ 
+     truncated = False
+@@ -340,10 +343,13 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
+         truncated = True
+         text = _cut_utf16(text, max(budget - 1, 0)).rstrip() + "…"
+ 
+-    quote = f"<b>{html.escape(name, quote=False)}</b> :"
+-    if text:
+-        quote += " " + html.escape(text, quote=False)
+-    parts = [f"<blockquote>{quote}</blockquote>"]
++    if show_name:
++        quote = f"<b>{html.escape(name, quote=False)}</b> :"
++        if text:
++            quote += " " + html.escape(text, quote=False)
++    else:
++        quote = html.escape(text, quote=False)
++    parts = [f"<blockquote>{quote}</blockquote>"] if quote else []
+ 
+     last = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
+     if tag:
+@@ -357,7 +363,7 @@ def build_html(tw: Tweet, limit: int) -> tuple[str, bool]:
+     return "\n".join(parts), truncated
+ 
+ 
+-def plan(tw: Tweet, mode: str | None = None) -> dict:
++def plan(tw: Tweet, mode: str | None = None, show_name: bool = True) -> dict:
+     """决定呈现形态，返回可以直接落库的描述。
+ 
+     text        纯文字推文，一条消息，不带预览（预览只会把正文再显示一遍）
+@@ -365,24 +371,24 @@ def plan(tw: Tweet, mode: str | None = None) -> dict:
+     media       媒体带说明（单个或相册）
+     media_long  同上但说明超过 1024，媒体后面另跟一条文字
+ 
+-    mode 不给时按 TWEET_MODE。auto 在这里先按 preview 规划，
++    mode 不给时按 TWEET_MODE（调度器会传入 /setting 里的值）。auto 在这里先按 preview 规划，
+     由调度器在发送前检查预览，不行再用 mode="media" 重新规划。
+     """
+     mode = (mode or TWEET_MODE)
+     base = {"kind": "tweet", "url": tw.url, "preview_url": tw.preview_url}
+ 
+     if not tw.media:
+-        body, _ = build_html(tw, TEXT_LIMIT)
++        body, _ = build_html(tw, TEXT_LIMIT, show_name)
+         return {**base, "mode": "text", "html": body, "caption": False}
+ 
+     if mode != "media":
+-        body, _ = build_html(tw, TEXT_LIMIT)
++        body, _ = build_html(tw, TEXT_LIMIT, show_name)
+         return {**base, "mode": "preview", "html": body, "caption": False}
+ 
+-    cap, cut = build_html(tw, CAPTION_LIMIT)
++    cap, cut = build_html(tw, CAPTION_LIMIT, show_name)
+     if not cut:
+         return {**base, "mode": "media", "html": cap, "caption": True}
+-    body, _ = build_html(tw, TEXT_LIMIT)
++    body, _ = build_html(tw, TEXT_LIMIT, show_name)
+     return {**base, "mode": "media_long", "html": body, "caption": False}
+ 
+ 
+@@ -441,7 +447,7 @@ def _fair_caps(lengths: list[int], budget: int) -> list[int]:
+ 
+ 
+ def build_batch_html(entries: list[tuple], limit: int,
+-                     skipped: int = 0) -> tuple[str, bool]:
++                     skipped: int = 0, show_name: bool = True) -> tuple[str, bool]:
+     """把多条推文拼成一条消息的说明文字。
+ 
+     entries 是 [(Tweet, label)]，label 是这条推文的媒体在相册里的位置
+@@ -465,34 +471,40 @@ def build_batch_html(entries: list[tuple], limit: int,
+         tags.append(id_tag(tw))
+         texts.append(tw.text.strip())
+ 
+-    # 纯文本形态，只用来算长度
+-    heads = [f"{n} {l} :" if l else f"{n} :" for n, l in zip(names, labels)]
++    # 纯文本形态，只用来算长度。不显示昵称时只剩序号；
++    # 连序号也没有（纯文字推文）就没有前缀，引用块里只有正文
++    if show_name:
++        heads = [f"{n} {l} :" if l else f"{n} :" for n, l in zip(names, labels)]
++    else:
++        heads = [f"{l} :" if l else "" for l in labels]
++    shown = [bool(h) or bool(t) for h, t in zip(heads, texts)]
+     links = [LINK_TEXT + (f" {l}" if l else "") + (f" · {t}" if t else "")
+              for l, t in zip(labels, tags)]
+ 
+     note = SKIP_NOTE.format(n=skipped) if skipped else ""
+     sign_plain = f"\n\nvia {SIGN_TEXT}" if SIGN_TEXT else ""
+ 
+-    n_lines = len(heads) + len(links) + (1 if note else 0)
++    n_lines = sum(shown) + len(links) + (1 if note else 0)
+     fixed = (sum(utf16_len(h) for h in heads)
+              + sum(utf16_len(x) for x in links)
+              + utf16_len(note) + utf16_len(sign_plain)
+              + max(n_lines - 1, 0)                      # 行间换行
+-             + sum(1 for t in texts if t))              # 昵称与正文之间的空格
++             + sum(1 for h, t in zip(heads, texts) if h and t))  # 前缀与正文之间的空格
+     caps = _fair_caps([utf16_len(t) for t in texts], limit - fixed)
+ 
+     esc = lambda x: html.escape(x, quote=False)         # noqa: E731
+     parts = []
+-    for name, label, text, cap in zip(names, labels, texts, caps):
+-        quote = f"<b>{esc(name)}</b>"
+-        if label:
+-            quote += f" {label}"
+-        quote += " :"
++    for name, label, text, cap, head in zip(names, labels, texts, caps, heads):
++        if show_name:
++            quote = f"<b>{esc(name)}</b>" + (f" {label}" if label else "") + " :"
++        else:
++            quote = head
+         if text and cap > 0:
+             body = text if utf16_len(text) <= cap else \
+                 _cut_utf16(text, max(cap - 1, 0)).rstrip() + "…"
+-            quote += " " + esc(body)
+-        parts.append(f"<blockquote>{quote}</blockquote>")
++            quote += (" " if quote else "") + esc(body)
++        if quote:
++            parts.append(f"<blockquote>{quote}</blockquote>")
+ 
+     for (tw, _), label, tag in zip(entries, labels, tags):
+         line = f'<a href="{html.escape(tw.url, quote=True)}">{LINK_TEXT}</a>'
+@@ -527,7 +539,8 @@ def split_batch(pairs: list[tuple]) -> tuple[list[tuple], list[tuple]]:
+     return take, []
+ 
+ 
+-def plan_batch(tws: list, skipped: int = 0) -> tuple[dict, list]:
++def plan_batch(tws: list, skipped: int = 0,
++               show_name: bool = True) -> tuple[dict, list]:
+     """规划一条合并消息，返回 (落库用的描述, 按顺序排好的媒体列表)。
+ 
+     合并必然走 media 逻辑：一条消息只能有一个链接预览，装不下多条推文的媒体。
+@@ -541,13 +554,13 @@ def plan_batch(tws: list, skipped: int = 0) -> tuple[dict, list]:
+     base = {"kind": "tweet", "batch": True,
+             "url": tws[0].url, "preview_url": tws[0].preview_url}
+     if not media:
+-        body, _ = build_batch_html(entries, TEXT_LIMIT, skipped)
++        body, _ = build_batch_html(entries, TEXT_LIMIT, skipped, show_name)
+         return {**base, "mode": "text", "html": body, "caption": False}, []
+ 
+-    cap, fits = build_batch_html(entries, CAPTION_LIMIT, skipped)
++    cap, fits = build_batch_html(entries, CAPTION_LIMIT, skipped, show_name)
+     if fits:
+         return {**base, "mode": "media", "html": cap, "caption": True}, media
+-    body, _ = build_batch_html(entries, TEXT_LIMIT, skipped)
++    body, _ = build_batch_html(entries, TEXT_LIMIT, skipped, show_name)
+     return {**base, "mode": "media_long", "html": body, "caption": False}, media
+ 
+ 

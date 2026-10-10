@@ -28,6 +28,9 @@ log = logging.getLogger("menu")
 
 # 所有人可见。描述要短，菜单里一行显示得下。
 PUBLIC: list[tuple[str, str]] = [
+    ("pack", "📦 组装收集到的媒体，可加 fw 去向"),
+    ("clear", "🗑 清空收集箱"),
+    ("setting", "⚙️ 开关设置"),
     ("status", "📊 登录状态、流量与消息统计"),
     ("killall", "⛔ 终止进行中的任务并清空队列"),
     ("help", "❓ 使用说明"),

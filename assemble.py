@@ -67,23 +67,30 @@ def _label(start: int, count: int) -> str:
     return str(start) if count == 1 else f"{start}-{start + count - 1}"
 
 
-def build_caption(sources: list[tuple], limit: int) -> tuple[str, bool]:
+def build_caption(sources: list[tuple], limit: int,
+                  show_source: bool = True) -> tuple[str, bool]:
     """汇总说明文字。返回 (html, 是否装得下)。
 
     sources: [(name, tag, first_pos, last_pos, [(label, text), ...])]，按出现顺序。
     装不下指固定部分本身就超了 limit，调用方该改用更宽松的上限另发一条。
+
+    show_source=False（/setting 里 TG 来源名关着，默认）时不写来源名和
+    #用户名，引用块里只有「序号 : 文字」；没有文字的来源整块省掉。
+    名字是空串（比如你自己发的、不是转发来的）也一样不写。
     """
     u16 = tweet.utf16_len
     texts, fixed, n_lines = [], 0, 0
     for name, tag, a, b, items in sources:
-        fixed += u16(f"{name} :")
-        n_lines += 1
+        head = show_source and bool(name)
+        if head:
+            fixed += u16(f"{name} :")
+            n_lines += 1
         for label, text in items:
             if text:
                 fixed += u16(f"{label} : ")
                 texts.append(text)
                 n_lines += 1
-        if tag:
+        if show_source and tag:
             fixed += u16(f"{_label(a, b - a + 1)} · {tag}")
             n_lines += 1
     sign_plain = f"\n\nvia {tweet.SIGN_TEXT}" if tweet.SIGN_TEXT else ""
@@ -93,7 +100,7 @@ def build_caption(sources: list[tuple], limit: int) -> tuple[str, bool]:
     esc = lambda x: html.escape(x, quote=False)     # noqa: E731
     parts, k = [], 0
     for name, tag, a, b, items in sources:
-        quote = f"<b>{esc(name)}</b> :"
+        lines = [f"<b>{esc(name)}</b> :"] if show_source and name else []
         for label, text in items:
             if not text:
                 continue
@@ -105,16 +112,18 @@ def build_caption(sources: list[tuple], limit: int) -> tuple[str, bool]:
                 body = text
             else:
                 body = tweet._cut_utf16(text, max(cap - 1, 0)).rstrip() + "…"
-            quote += f"\n{label} : {esc(body)}"
-        parts.append(f"<blockquote>{quote}</blockquote>")
-    for name, tag, a, b, items in sources:
-        if tag:
-            parts.append(f"{_label(a, b - a + 1)} · {esc(tag)}")
+            lines.append(f"{label} : {esc(body)}")
+        if lines:
+            parts.append("<blockquote>" + "\n".join(lines) + "</blockquote>")
+    if show_source:
+        for name, tag, a, b, items in sources:
+            if tag:
+                parts.append(f"{_label(a, b - a + 1)} · {esc(tag)}")
     if tweet.SIGN_TEXT:
         sign = esc(tweet.SIGN_TEXT)
         if tweet.SIGN_URL:
             sign = f'<a href="{html.escape(tweet.SIGN_URL, quote=True)}">{sign}</a>'
-        parts += ["", f"via {sign}"]
+        parts += ["", f"via {sign}"] if parts else [f"via {sign}"]
     return "\n".join(parts), fixed <= limit
 
 
@@ -156,15 +165,17 @@ def category(msg: Any) -> Optional[str]:
     return None
 
 
-def plan_blocks(msgs: list, msg_of=lambda x: x) -> list[list]:
+def plan_blocks(msgs: list, msg_of=lambda x: x, cat=None) -> list[list]:
     """分组。返回若干块，每块是一个相册（≥2 项）或一条单独的消息。
 
     msg_of 用来从条目里取出消息本身（条目可以是 (msg, 单元下标) 这样的元组）。
+    cat 是归类函数，默认按 Telethon 消息归类；收集箱里是 Bot API 的媒体，另给一个。
     """
+    cat = cat or category
     blocks: list[list] = []
     where: dict[str, int] = {}
     for m in msgs:
-        c = category(msg_of(m))
+        c = cat(msg_of(m))
         if c is None:
             blocks.append([m])
             continue
@@ -181,8 +192,8 @@ def plan_blocks(msgs: list, msg_of=lambda x: x) -> list[list]:
     return out
 
 
-async def compose(client: Any, peer: Any,
-                  units: list[Unit]) -> tuple[list[int], str]:
+async def compose(client: Any, peer: Any, units: list[Unit],
+                  show_source: bool = True) -> tuple[list[int], str]:
     """把各单元在中转频道里的消息组装好，返回 (最终的消息 id, 说明)。"""
     from telethon.extensions import html as tl_html
 
@@ -214,13 +225,13 @@ async def compose(client: Any, peer: Any,
             continue
 
         sources = caption_for(b, units, unit_text)
-        cap_html, fits = build_caption(sources, tweet.CAPTION_LIMIT)
+        cap_html, fits = build_caption(sources, tweet.CAPTION_LIMIT, show_source)
         if fits:
             cap_text, cap_ents = tl_html.parse(cap_html)
             long_html = None
         else:
             cap_text, cap_ents = "", None
-            long_html, _ = build_caption(sources, tweet.TEXT_LIMIT)
+            long_html, _ = build_caption(sources, tweet.TEXT_LIMIT, show_source)
 
         try:
             multi = [InputSingleMedia(

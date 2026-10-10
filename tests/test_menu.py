@@ -63,6 +63,7 @@ def test_every_listed_command_actually_exists():
     """菜单里列出的命令必须真的有处理函数，否则点了没反应。"""
     src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
     src += (Path(__file__).resolve().parent.parent / "admin.py").read_text()
+    src += (Path(__file__).resolve().parent.parent / "prefs.py").read_text()
     registered = set(re.findall(r'Command\("(\w+)"\)', src))
     registered.add("help")      # 走 CommandStart/Command("help")
     for cmd, _ in ALL:

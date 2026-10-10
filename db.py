@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS users (
     last_active      INTEGER,
     task_count       INTEGER NOT NULL DEFAULT 0,
     bytes_total      INTEGER NOT NULL DEFAULT 0,
-    last_forward     TEXT
+    last_forward     TEXT,
+    settings         TEXT                                -- /setting 里的开关，JSON
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -101,8 +102,10 @@ async def init() -> None:
 async def _migrate() -> None:
     """给早于当前版本的数据库补列。CREATE TABLE IF NOT EXISTS 不会改已有表。"""
     cur = await _db.execute("PRAGMA table_info(users)")
-    if "last_forward" not in {r["name"] for r in await cur.fetchall()}:
-        await _db.execute("ALTER TABLE users ADD COLUMN last_forward TEXT")
+    ucols = {r["name"] for r in await cur.fetchall()}
+    for col in ("last_forward", "settings"):
+        if col not in ucols:
+            await _db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
 
     cur = await _db.execute("PRAGMA table_info(tasks)")
     have = {r["name"] for r in await cur.fetchall()}

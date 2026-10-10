@@ -278,7 +278,7 @@ def _setup(monkeypatch, relay_results, compose_result=([901, 902], "")):
         return fetcher.Relayed(r, len(r) > 1, "A", 0)
     monkeypatch.setattr(fetcher, "relay", fake_relay)
 
-    async def fake_compose(client, peer, units):
+    async def fake_compose(client, peer, units, **kw):
         composed.append([i for u in units for i in u.ids])
         return compose_result
     monkeypatch.setattr(assemble, "compose", fake_compose)
@@ -590,7 +590,7 @@ async def test_tme_batch_relays_each_link(qdb, monkeypatch):
 
     got_units = []
 
-    async def fake_compose(client, peer, units):
+    async def fake_compose(client, peer, units, **kw):
         got_units.extend(units)
         return [901, 902], ""
     monkeypatch.setattr(assemble, "compose", fake_compose)

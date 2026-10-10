@@ -30,6 +30,7 @@ import assemble
 import db
 import fetcher
 import forward
+import prefs
 import sender
 import streamer
 import tweet
@@ -91,6 +92,8 @@ class Job:
     forward_to: Optional[str] = None   # fw 的去向；有值时结果不发给本人
     tweet: Any = None              # 进程内缓存的推文数据，快通道转慢通道时复用
     lane: str = "fast"          # 当前所在通道，killall 重新排队时要用
+    # 发起人的 /setting，每次运行时重读一遍（改了设置，重试时也跟着变）
+    prefs: Any = field(default_factory=lambda: prefs.defaults())
     last_edit: float = field(default=0.0)
     last_text: str = ""
 
@@ -269,6 +272,7 @@ class Runner:
         job.lane = lane
         await db.update_task(job.task_id, state="running", lane=lane)
         try:
+            job.prefs = await prefs.get(job.owner_id)
             # 已经搬完了（上次投递失败或进程重启），直接重投递，不重传。
             if job.relayed:
                 log.info("task=%s 已搬运，跳过传输直接投递", job.task_id)
@@ -309,17 +313,14 @@ class Runner:
                 await db.update_task(job.task_id, lane="slow", state="pending")
                 size = fetcher.media_size(msg)
                 hint = f"（{streamer.human_size(size)}）" if size else ""
-                why = ("已指定 nosp，重新上传以去掉剧透遮罩"
-                       if ref.force_reupload and
-                       not fetcher.is_protected(entity, msg)
-                       else "该内容禁止转存，转为搬运模式")
-                await self._say(job, f"{why}{hint}…")
+                await self._say(job, f"该内容禁止转存，转为搬运模式{hint}…")
                 await self.slow.put(job)
                 return
 
             relay_ch = await acl.relay_channel_for(job.owner_id)
             res = await fetcher.relay(
-                client, ref, relay_ch, entity=entity, msg=msg
+                client, ref, relay_ch, entity=entity, msg=msg,
+                keep_spoiler=job.prefs.keep_spoiler,
             )
         await self._finish(job, res)
 
@@ -348,6 +349,7 @@ class Runner:
                     on_progress=lambda *a: self._progress(job, *a),
                     task_id=job.task_id, register_tmp=register_tmp,
                     entity=entity, msg=msg,
+                    keep_spoiler=job.prefs.keep_spoiler,
                 )
             await self._finish(job, res)
 
@@ -379,10 +381,11 @@ class Runner:
         tw = job.tweet or await tweet.fetch(ref)
         job.tweet = tw
         if job.extra is None or job.extra.get("kind") != "tweet":
-            job.extra = tweet.plan(tw)
+            job.extra = tweet.plan(tw, mode=job.prefs.tweet_mode,
+                                   show_name=job.prefs.tw_name)
 
         if lane == "fast" and job.extra["mode"] == "preview" \
-                and tweet.TWEET_MODE == "auto" and not job.extra.get("checked"):
+                and job.prefs.tweet_mode == "auto" and not job.extra.get("checked"):
             await self._check_preview(job, tw)
         await self._send_tweet_media(job, lane)
 
@@ -546,7 +549,8 @@ class Runner:
                                   job.request_chat_id, job.request_msg_id,
                                   forward_to=job.forward_to)
 
-            job.extra, media = tweet.plan_batch([t for _, t in take], skipped)
+            job.extra, media = tweet.plan_batch([t for _, t in take], skipped,
+                                                show_name=job.prefs.tw_name)
             job.tweet = tweet.Tweet(
                 id=take[0][1].id, name="", screen_name="", text="", media=media)
 
@@ -591,7 +595,8 @@ class Runner:
                     res = await fetcher.relay(
                         client, parse_link(link), relay_ch,
                         on_progress=lambda *a: self._progress(job, *a),
-                        task_id=job.task_id, register_tmp=register_tmp)
+                        task_id=job.task_id, register_tmp=register_tmp,
+                        keep_spoiler=job.prefs.keep_spoiler)
             except fetcher.FetchError as e:
                 log.info("task=%s 跳过 %s：%s", job.task_id, link, e)
                 done[link] = []
@@ -608,7 +613,8 @@ class Runner:
         await self._say(job, "正在组装…")
         async with POOL.using(suid):
             units = await self._grab_units(client, links, done)
-            final, note = await assemble.compose(client, relay_ch, units)
+            final, note = await assemble.compose(
+                client, relay_ch, units, show_source=job.prefs.tg_source)
         if skipped:
             note = f"{note} 其中 {skipped} 条取不到。".strip()
 
@@ -672,7 +678,8 @@ class Runner:
         job.extra["checked"] = True
         if verdict == "missing":
             log.info("task=%s %s，改发原始媒体", job.task_id, why)
-            job.extra = {**tweet.plan(tw, mode="media"), "checked": True}
+            job.extra = {**tweet.plan(tw, mode="media", show_name=job.prefs.tw_name),
+                         "checked": True}
             await self._say(job, f"{why}，改为发送原始媒体…")
 
     async def _finish(self, job: Job, res: fetcher.Relayed) -> None:
