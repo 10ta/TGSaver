@@ -100,6 +100,7 @@ HELP = """<b>TgSaver</b> — 把 Telegram 消息原样取回来给你。
 
 你照常收到那一份，之后额外转一份过去。
 用账号转发并隐藏来源，看不到 bot；转发失败只提示，不影响已收到的内容。
+相册没能保持成组时不转发（免得去向里刷屏），你收到的那份可以手动转。
 
 <b>⑤ 抓私聊内容</b>
 私聊里的单条消息没有链接（Telegram 只给公开频道和超级群生成），
@@ -624,7 +625,11 @@ async def cmd_pack(m: Message, command: CommandObject) -> None:
     await db.bump_usage(uid, 0)
 
     notes = [packed.note] if packed.note else []
-    if fw_to:
+    if fw_to and packed.note:
+        # 分组没保住：发给自己的零散几条无所谓，转到公开去向就成了刷屏
+        notes.append(f"为免 {fw_to} 里出现零散消息，这次没有转发。"
+                     f"你收到的这份可以检查后手动转发。")
+    elif fw_to:
         try:
             client = await POOL.acquire(acl.session_user(uid))
             async with POOL.using(acl.session_user(uid)):

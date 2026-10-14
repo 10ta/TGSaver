@@ -233,7 +233,7 @@ async def test_falls_back_using_already_uploaded_media():
     assert len(c.sent_by_ref) == 2, "应直接用服务器上的媒体逐条发"
     assert c.sent_individually == [], "不该走重新上传"
     assert len([u for u in c.uploaded if u[0] != "thumb"]) == 2, "文件只传过一次"
-    assert len(ids) == 2 and "分组未能保持" in note
+    assert len(ids) == 2 and note == streamer.SPLIT_NOTE
 
 
 @pytest.mark.asyncio

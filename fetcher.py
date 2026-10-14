@@ -46,6 +46,9 @@ class Relayed:
     path: str          # A / B / C
     bytes_moved: int
     note: str = ""     # 需要额外告知用户的说明
+    # 原本该成组的内容没能成组（被拆开发了）。这时不 fw：
+    # 发给自己的零散几条无所谓，转到公开的去向就成了刷屏
+    split: bool = False
 
 
 def _coerce_peer(v: str) -> Any:
@@ -271,7 +274,7 @@ async def _move(client, ref: MsgRef, relay_channel: int, entity: Any,
         note = " ".join(x for x in (note, album_note) if x).strip()
         log.info("路径%s 相册转存 %s x%d -> %s (%s)", path, ref, len(group),
                  ids, streamer.human_size(total))
-        return Relayed(ids, keep_album, path, total, note)
+        return Relayed(ids, keep_album, path, total, note, split=bool(album_note))
 
     all_ids: list[int] = []
     total = 0
@@ -302,7 +305,7 @@ async def _move(client, ref: MsgRef, relay_channel: int, entity: Any,
                "这组消息含非媒体项，已逐条转存，未能保持相册分组。"
     log.info("路径%s 转存 %s -> %s (%s)", path, ref, all_ids,
              streamer.human_size(total))
-    return Relayed(all_ids, False, path, total, note.strip())
+    return Relayed(all_ids, False, path, total, note.strip(), split=is_album)
 
 
 def _used_disk(size: int) -> bool:

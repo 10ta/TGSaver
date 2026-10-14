@@ -19,6 +19,9 @@
 *.session
 *.session-journal
 
+# 补丁文件：应用完就该删，别提交进仓库
+*.patch
+
 # 加密密钥的任何独立备份
 *.key
 secrets/

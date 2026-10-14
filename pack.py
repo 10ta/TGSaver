@@ -213,12 +213,19 @@ def _album_item(it: Item, cap_html: Optional[str], keep_spoiler: bool):
     return InputMediaDocument(**kw)
 
 
-async def _send_single(bot: Any, chat: int, it: Item, keep_spoiler: bool) -> int:
-    """单独一条：原样发，带它自己的说明和格式。"""
+async def _send_single(bot: Any, chat: int, it: Item, keep_spoiler: bool,
+                       cap_html: Optional[str] = None) -> int:
+    """单独一条：原样发，带它自己的说明和格式。
+
+    cap_html 给了就改用它（相册被拆开时，第一项要带着汇总说明）。
+    """
     sp = keep_spoiler and it.spoiler
-    ents = _ents(it, keep_spoiler)
-    cap = {"caption": it.caption or None, "caption_entities": ents or None,
-           "parse_mode": None}
+    if cap_html:
+        cap = {"caption": cap_html, "parse_mode": "HTML"}
+    else:
+        ents = _ents(it, keep_spoiler)
+        cap = {"caption": it.caption or None, "caption_entities": ents or None,
+               "parse_mode": None}
     k = it.kind
     if k == "photo":
         m = await _retry(bot.send_photo, chat, it.file_id, has_spoiler=sp, **cap)
@@ -238,6 +245,37 @@ async def _send_single(bot: Any, chat: int, it: Item, keep_spoiler: bool) -> int
     else:
         m = await _retry(bot.send_document, chat, it.file_id, **cap)
     return m.message_id
+
+
+SPLIT_NOTE = "部分内容未能组成相册，已拆开尽量分组发送。"
+
+
+async def _group_resilient(bot: Any, relay: int, media: list, its: list[Item],
+                           cap: Optional[str], keep_spoiler: bool
+                           ) -> tuple[list[int], bool]:
+    """发一个相册；被拒就对半拆开再试，尽量保住分组。返回 (id, 是否整组发出)。"""
+    intact = True
+
+    async def go(idx: list[int]) -> list[int]:
+        nonlocal intact
+        if len(idx) == 1:
+            i = idx[0]
+            return [await _send_single(bot, relay, its[i], keep_spoiler,
+                                       cap if i == 0 else None)]
+        try:
+            sent = await _retry(bot.send_media_group, relay, [media[i] for i in idx])
+            return [m.message_id for m in sent]
+        except TelegramRetryAfter:
+            raise
+        except Exception as e:  # noqa: BLE001
+            intact = False
+            log.warning("相册被拒，拆开重试: %s；组内: %s", e,
+                        ", ".join(f"{its[i].kind}:{its[i].file_id[:12]}" for i in idx))
+            mid = len(idx) // 2
+            return await go(idx[:mid]) + await go(idx[mid:])
+
+    ids = await go(list(range(len(media))))
+    return ids, intact
 
 
 @dataclass
@@ -272,18 +310,11 @@ async def build(bot: Any, relay: int, items: list[Item], *,
         if not fits:
             long_html, _ = assemble.build_caption(sources, tweet.TEXT_LIMIT, show_source)
             cap = None
-        try:
-            media = [_album_item(it, cap if i == 0 else None, keep_spoiler)
-                     for i, it in enumerate(its)]
-            sent = await _retry(bot.send_media_group, relay, media)
-            ids = [m.message_id for m in sent]
-        except TelegramRetryAfter:
-            raise
-        except Exception as e:  # noqa: BLE001
-            log.warning("组装相册失败，改为逐条: %s", e)
-            ids = [await _send_single(bot, relay, it, keep_spoiler) for it in its]
-            note = "部分内容未能组成相册，已逐条发送。"
-            long_html = None
+        media = [_album_item(it, cap if i == 0 else None, keep_spoiler)
+                 for i, it in enumerate(its)]
+        ids, intact = await _group_resilient(bot, relay, media, its, cap, keep_spoiler)
+        if not intact:
+            note = SPLIT_NOTE
         if long_html:
             # 说明的固定部分本身就超了 1024：相册不带说明，汇总另发一条
             m = await _retry(bot.send_message, relay, long_html, parse_mode="HTML",

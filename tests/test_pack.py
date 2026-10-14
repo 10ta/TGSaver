@@ -444,3 +444,39 @@ async def test_cmd_clear(fresh, botmod):
     m = FakeMsg(FakeBot())
     await botmod.cmd_clear(m)
     assert m.replies == ["已清空 1 个。"] and pack.count(42) == 0
+
+
+@pytest.mark.asyncio
+async def test_cmd_pack_fw_skipped_when_split(fresh, botmod, monkeypatch):
+    """相册被拆开了：本人照常收到，但不转发到公开去向。"""
+    await db.upsert_user(42, last_forward="@mychan")
+    pack.add(42, Item(1, "photo", "a"))
+    pack.add(42, Item(2, "photo", "b"))
+    sent = []
+
+    async def fake_send(*a, **kw):
+        sent.append(a)
+    monkeypatch.setattr(botmod.forward, "send", fake_send)
+    bot = FakeBot(fail_group=True)
+    m = FakeMsg(bot)
+    await botmod.cmd_pack(m, SimpleNamespace(args="fw"))
+    assert bot.of("copies") and sent == []
+    assert "@mychan" in m.replies[-1] and "没有转发" in m.replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_pack_bisect_keeps_rest_grouped():
+    class Picky(FakeBot):
+        async def send_media_group(self, chat, media, **kw):
+            if any(x.media == "p4" for x in media):
+                raise RuntimeError("MEDIA_INVALID")
+            return await super().send_media_group(chat, media, **kw)
+
+    bot = Picky()
+    items = [Item(i, "photo", f"p{i}", "说明" if i == 1 else "") for i in range(1, 11)]
+    packed = await pack.build(bot, -100, items)
+    assert packed.note == pack.SPLIT_NOTE
+    assert sum(len(c[2]) for c in bot.of("group")) >= 7
+    assert len(packed.ids) == 10
+    first = bot.of("group")[0][2][0]
+    assert first.media == "p1" and first.caption, "汇总说明仍在第一项"

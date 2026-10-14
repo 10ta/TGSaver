@@ -122,12 +122,21 @@ class FakeClient:
         return self._next
 
     async def __call__(self, req):
-        assert isinstance(req, SendMultiMediaRequest)
-        if self.fail_multi:
-            raise RuntimeError("MEDIA_INVALID")
-        self.multi.append(req.multi_media)
+        from telethon.tl.functions.messages import SendMediaRequest
+        if isinstance(req, SendMediaRequest):
+            self.singles = getattr(self, "singles", []) + [req]
+            items = [req]
+        else:
+            assert isinstance(req, SendMultiMediaRequest)
+            if self.fail_multi:
+                raise RuntimeError("MEDIA_INVALID")
+            bad = getattr(self, "bad", set())
+            if any(getattr(sm.media.id, "id", None) in bad for sm in req.multi_media):
+                raise RuntimeError("MEDIA_INVALID")
+            self.multi.append(req.multi_media)
+            items = req.multi_media
         ups = []
-        for _ in req.multi_media:
+        for _ in items:
             ups.append(T.UpdateNewChannelMessage(
                 message=T.Message(id=self._new(), peer_id=T.PeerChannel(1),
                                   date=NOW, message=""), pts=1, pts_count=1))
@@ -192,8 +201,22 @@ async def test_compose_nothing_to_merge_reuses_originals():
 async def test_compose_falls_back_to_singles():
     c = FakeClient([_photo_msg(1), _photo_msg(2)], fail_multi=True)
     final, note = await assemble.compose(c, -100, [U(1), U(2)])
-    assert c.forwarded == [[1, 2]] and len(final) == 2
-    assert "未能组成相册" in note
+    assert len(c.singles) == 2 and not c.forwarded, "用媒体引用单发，不用原样转发"
+    assert c.singles[0].message.startswith("YM 闪闪"), "第一项仍带汇总说明"
+    assert len(final) == 2 and note == assemble.SPLIT_NOTE
+
+
+@pytest.mark.asyncio
+async def test_compose_isolates_bad_item_keeps_rest_grouped():
+    """10 项里有 1 项进不了相册：其余仍然成组，不是全部散开。"""
+    msgs = [_photo_msg(i) for i in range(1, 11)]
+    c = FakeClient(msgs)
+    c.bad = {msgs[3].media.photo.id}
+    final, note = await assemble.compose(c, -100, [U(i) for i in range(1, 11)])
+    assert len(final) == 10 and note == assemble.SPLIT_NOTE
+    assert len(c.singles) <= 3, "坏的那项单发，最多再带几个被拆开的邻居"
+    assert sum(len(m) for m in c.multi) >= 7, "其余大多仍然成组"
+    assert final == sorted(final), "顺序不乱"
 
 
 @pytest.mark.asyncio

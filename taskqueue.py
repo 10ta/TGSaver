@@ -405,6 +405,11 @@ class Runner:
             return
         await self._drop_status(job)
 
+    @staticmethod
+    def _no_fw(job: Job) -> str:
+        return (f"分组没能保住，为免 {job.forward_to} 里出现零散消息，这次没有转发。"
+                f"你收到的这份可以检查后手动转发。")
+
     async def _forward_from_relay(self, job: Job) -> None:
         if job.relay_chat_id and job.relay_ids:
             await self._forward(job, job.relay_chat_id, job.relay_ids)
@@ -412,12 +417,6 @@ class Runner:
             await self._say(job, "⚠️ 转发失败：中转频道里没有可转发的消息。")
 
     async def _forward_tweet(self, job: Job) -> None:
-        """快通道下 bot 直接发给了用户，中转频道里没有副本。
-
-        bot 发的东西转不走（一转就露出 bot），所以这里用 user 账号
-        在中转频道另做一份再转出去。媒体仍然把 URL 交给 Telegram 自己拉，
-        本机零流量。
-        """
         """带 fw 时，由 user 账号把消息生成在中转频道里，再从那儿转出去。
 
         bot 发的东西转不了（那会露出 bot），所以这条路不经过 bot。
@@ -445,9 +444,13 @@ class Runner:
                     except Exception as e:  # noqa: BLE001
                         log.info("task=%s Telegram 拉不动，改为本机中转: %s",
                                  job.task_id, e)
-                        ids, _, _ = await streamer.relay_web_media(
+                        ids, _, split = await streamer.relay_web_media(
                             client, tw.media, relay_ch, caption_html=cap,
                             task_id=job.task_id, register_tmp=register_tmp)
+                        if split:
+                            log.info("task=%s 转发副本没能成组，不转发", job.task_id)
+                            await self._say(job, "⚠️ " + self._no_fw(job))
+                            return
                     if extra["mode"] == "media_long":
                         ids += await streamer.send_text_message(
                             client, relay_ch, extra["html"])
@@ -514,8 +517,9 @@ class Runner:
                 task_id=job.task_id, register_tmp=register_tmp,
             )
         if note:
-            job.extra["split"] = True      # 相册整组失败已逐条发，投递也逐条
-        res = fetcher.Relayed(ids, len(ids) > 1 and not note, "B", nbytes, note)
+            job.extra["split"] = True      # 相册被拆开了，投递也逐条，且不 fw
+        res = fetcher.Relayed(ids, len(ids) > 1 and not note, "B", nbytes, note,
+                              split=bool(note))
         await self._finish(job, res)
 
     async def _run_tweet_batch(self, job: Job, lane: str,
@@ -615,11 +619,12 @@ class Runner:
             units = await self._grab_units(client, links, done)
             final, note = await assemble.compose(
                 client, relay_ch, units, show_source=job.prefs.tg_source)
+        split = note == assemble.SPLIT_NOTE
         if skipped:
             note = f"{note} 其中 {skipped} 条取不到。".strip()
 
         await self._finish(job, fetcher.Relayed(
-            final, len(final) > 1, "B", moved, note))
+            final, len(final) > 1, "B", moved, note, split=split))
 
     @staticmethod
     async def _grab_units(client: Any, links: list[str],
@@ -692,6 +697,9 @@ class Runner:
         job.relay_chat_id = relay_ch
         job.relay_ids = res.message_ids
         job.relay_is_album = res.is_album
+        if res.split:
+            # 记进 extra 跟着任务落库：重启后重投递时也知道不该 fw
+            job.extra = {**(job.extra or {}), "split": True}
 
         await db.update_task(
             job.task_id, state="relayed", tmp_path=None,
@@ -725,7 +733,10 @@ class Runner:
         await db.bump_usage(job.owner_id, moved)
 
         if job.forward_to:
-            await self._forward_from_relay(job)
+            if (job.extra or {}).get("split"):
+                note = " ".join(x for x in (note, self._no_fw(job)) if x)
+            else:
+                await self._forward_from_relay(job)
 
         if note:
             await self._say(job, "⚠️ " + note)

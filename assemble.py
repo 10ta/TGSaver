@@ -35,23 +35,17 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from telethon import helpers, utils
-from telethon.tl.functions.messages import SendMultiMediaRequest
-from telethon.tl.types import (
-    DocumentAttributeAnimated,
-    DocumentAttributeAudio,
-    DocumentAttributeSticker,
-    DocumentAttributeVideo,
-    InputSingleMedia,
-    MessageMediaDocument,
-    MessageMediaPhoto,
-)
+from telethon.tl.functions.messages import SendMediaRequest
+from telethon.tl.types import InputSingleMedia
 
 import tweet
+import streamer
 from streamer import _ids_from_updates
 
 log = logging.getLogger("assemble")
 
 ALBUM_MAX = 10
+SPLIT_NOTE = "部分内容未能组成相册，已拆开尽量分组发送。"
 
 
 @dataclass
@@ -147,22 +141,8 @@ def caption_for(block: list, units: list[Unit], unit_text: list[str]) -> list[tu
 
 
 def category(msg: Any) -> Optional[str]:
-    """能进哪种相册。None 表示只能单独发。"""
-    media = getattr(msg, "media", None)
-    if isinstance(media, MessageMediaPhoto) and media.photo is not None:
-        return "visual"
-    if isinstance(media, MessageMediaDocument) and media.document is not None:
-        attrs = media.document.attributes or []
-        if any(isinstance(a, (DocumentAttributeSticker, DocumentAttributeAnimated))
-               for a in attrs):
-            return None
-        for a in attrs:
-            if isinstance(a, DocumentAttributeVideo):
-                return None if a.round_message else "visual"
-            if isinstance(a, DocumentAttributeAudio):
-                return None if a.voice else "audio"
-        return "file"
-    return None
+    """能进哪种相册。None 表示只能单独发。规则见 streamer.attrs_kind。"""
+    return streamer.album_kind(getattr(msg, "media", None))
 
 
 def plan_blocks(msgs: list, msg_of=lambda x: x, cat=None) -> list[list]:
@@ -233,25 +213,36 @@ async def compose(client: Any, peer: Any, units: list[Unit],
             cap_text, cap_ents = "", None
             long_html, _ = build_caption(sources, tweet.TEXT_LIMIT, show_source)
 
-        try:
-            multi = [InputSingleMedia(
-                media=utils.get_input_media(m.media),
-                random_id=helpers.generate_random_long(),
-                message=cap_text if i == 0 else "",
-                entities=(cap_ents or None) if i == 0 else None,
-            ) for i, m in enumerate(msgs)]
-            res = await client(SendMultiMediaRequest(peer=peer, multi_media=multi))
-            ids = _ids_from_updates(res)
-            if not ids:
-                raise RuntimeError("相册已发出但未能读回消息 id")
-            final.extend(ids)
-        except Exception as e:  # noqa: BLE001
-            log.warning("组装相册失败，改为逐条: %s", e)
-            sent = await client.forward_messages(peer, [m.id for m in msgs], peer,
+        multi = [InputSingleMedia(
+            media=utils.get_input_media(m.media),
+            random_id=helpers.generate_random_long(),
+            message=cap_text if i == 0 else "",
+            entities=(cap_ents or None) if i == 0 else None,
+        ) for i, m in enumerate(msgs)]
+
+        async def single(j: int, _msgs=msgs, _multi=multi) -> list[int]:
+            # 拆到只剩一项：先用同样的媒体引用单发（第一项带着汇总说明），
+            # 不行再原样转发那一条
+            sm = _multi[j]
+            try:
+                res = await client(SendMediaRequest(
+                    peer=peer, media=sm.media, message=sm.message,
+                    entities=sm.entities, random_id=helpers.generate_random_long()))
+                got = _ids_from_updates(res)
+                if got:
+                    return got
+            except Exception as e:  # noqa: BLE001
+                log.warning("#%s 单独发送失败，改为原样转发: %s", _msgs[j].id, e)
+            sent = await client.forward_messages(peer, [_msgs[j].id], peer,
                                                  drop_author=True)
-            final.extend(x.id for x in (sent if isinstance(sent, list) else [sent]))
-            note = "部分内容未能组成相册，已逐条发送。"
-            continue
+            return [x.id for x in (sent if isinstance(sent, list) else [sent])]
+
+        ids, intact = await streamer.send_album_resilient(
+            client, peer, multi, single,
+            [f"#{m.id}({category(m)})" for m in msgs])
+        final.extend(ids)
+        if not intact:
+            note = SPLIT_NOTE
 
         if long_html:
             # 固定部分本身就超 1024：相册不带说明，汇总另发一条

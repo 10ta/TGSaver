@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from telethon import TelegramClient, helpers, utils
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import (
     SendMediaRequest,
     SendMultiMediaRequest,
@@ -42,6 +43,8 @@ from telethon.tl.types import (
     InputMediaUploadedPhoto,
     InputSingleMedia,
     Message,
+    MessageMediaDocument,
+    MessageMediaPhoto,
     UpdateNewChannelMessage,
     UpdateNewMessage,
 )
@@ -401,6 +404,20 @@ async def send_external_media(client: TelegramClient, items: list[WebMedia],
 
     caption, ents = tl_html.parse(caption_html) if caption_html else ("", [])
     ids: list[int] = []
+    try:
+        await _send_external_runs(client, items, peer, caption, ents, ids)
+    except BaseException:
+        # 前几段已经发出去了：撤掉，调用方回退时会整批重做，免得中转频道里留半份
+        if ids:
+            try:
+                await client.delete_messages(peer, ids)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    return ids
+
+
+async def _send_external_runs(client, items, peer, caption, ents, ids) -> None:
     for run in album_runs([m.kind for m in items]):
         first = not ids                      # 说明只挂在整体的第一项上
         cap, ent = (caption, ents) if first else ("", [])
@@ -416,7 +433,6 @@ async def send_external_media(client: TelegramClient, items: list[WebMedia],
             formatting_entities=[ent] + [[] for _ in range(rest)])
         msgs = sent if isinstance(sent, list) else [sent]
         ids.extend(sorted(m.id for m in msgs))
-    return ids
 
 
 # --------------------------------------------------------------- 相册整组
@@ -465,18 +481,47 @@ async def _upload_via_disk(client, msg, spec: MediaSpec, prog,
             await _maybe_await(register_tmp(None))
 
 
+def attrs_kind(attrs: list) -> Optional[str]:
+    """按文档属性判断能进哪种相册：visual / file / audio；None 只能单独发。
+
+    Telegram 的相册规则：照片和视频可以混在一起；文件只能和文件组队；
+    音频只能和音频组队；动图、贴纸、语音、圆形视频根本进不了相册。
+    """
+    if any(isinstance(a, (DocumentAttributeSticker, DocumentAttributeAnimated))
+           for a in attrs):
+        return None
+    for a in attrs:
+        if isinstance(a, DocumentAttributeVideo):
+            return None if a.round_message else "visual"
+        if isinstance(a, DocumentAttributeAudio):
+            return None if a.voice else "audio"
+    return "file"
+
+
+def album_kind(media: Any) -> Optional[str]:
+    """一个服务端媒体对象（MessageMedia）能进哪种相册。"""
+    if isinstance(media, MessageMediaPhoto) and media.photo is not None:
+        return "visual"
+    if isinstance(media, MessageMediaDocument) and media.document is not None:
+        return attrs_kind(media.document.attributes or [])
+    return None
+
+
 async def _to_input_media(client: TelegramClient, handle: Any,
-                          spec: MediaSpec, relay: int) -> Any:
-    """把上传句柄变成可放进相册的 InputMedia。
+                          spec: MediaSpec, relay: int) -> tuple[Any, Optional[str]]:
+    """把上传句柄变成可放进相册的 InputMedia，同时返回它能进哪种相册。
 
     相册要求的是已经在服务端落地的媒体引用，所以必须先走一次
     UploadMedia 把"刚传上去的文件"转成"服务端的媒体对象"，
     再取其中的 photo / document 换成 InputMedia。
+
+    能进哪种相册以服务器返回的为准，而不是我们的猜测 —— 服务器认定的
+    类型才是 SendMultiMedia 校验时用的。服务器没给属性时才退回我们自己的。
     """
     if spec.is_photo:
         fm = InputMediaUploadedPhoto(file=handle)
         r = await client(UploadMediaRequest(relay, media=fm))
-        return utils.get_input_media(r.photo)
+        return utils.get_input_media(r.photo), "visual"
 
     thumb = None
     if spec.thumb is not None:
@@ -494,8 +539,10 @@ async def _to_input_media(client: TelegramClient, handle: Any,
         force_file=spec.force_document,
     )
     r = await client(UploadMediaRequest(relay, media=fm))
+    attrs = getattr(r.document, "attributes", None) or spec.attributes or []
+    kind = "file" if spec.force_document else attrs_kind(attrs)
     return utils.get_input_media(
-        r.document, supports_streaming=not spec.force_document)
+        r.document, supports_streaming=not spec.force_document), kind
 
 
 def _ids_from_updates(result: Any) -> list[int]:
@@ -773,33 +820,85 @@ async def relay_web_media(
     return ids, total, note
 
 
-async def _send_one_by_one(client: TelegramClient, peer: int, hs: list,
-                           ss: list[MediaSpec], multi: list) -> list[int]:
-    """相册发不出去时逐条补发。
+SPLIT_NOTE = "相册被 Telegram 整组拒收，已拆开尽量分组发送，分组未能完全保持。"
 
-    组相册前，每一项都已经通过 UploadMedia 落到了 Telegram 服务器（就是
-    multi 里的那些）。所以优先直接用它们逐条发，不重传文件、不重读缩略图。
-    某一项单独发也失败，才对它重新上传 —— 并记下是哪一项，方便追查
-    整组被拒到底是哪个文件引起的。
+
+def kind_runs(kinds: list[Optional[str]], limit: int = 10) -> list[list[int]]:
+    """按相册类别切段，返回每段的下标，顺序不变。
+
+    相邻且同类的拼成一段（最多 limit 项）；None（动图、贴纸等）单独成段。
     """
-    ids: list[int] = []
-    for i, (h, s) in enumerate(zip(hs, ss)):
-        if i < len(multi):
-            sm = multi[i]
-            try:
-                res = await client(SendMediaRequest(
-                    peer=peer, media=sm.media, message=sm.message,
-                    entities=sm.entities, random_id=helpers.generate_random_long()))
-                got = _ids_from_updates(res)
-                if got:
-                    ids.extend(got)
-                    continue
-            except Exception as e:  # noqa: BLE001
-                log.warning("相册第 %d 项（%s, %s）单独发送也失败，改为重新上传: %s",
-                            i + 1, s.file_name, s.mime_type, e)
-        sent = await _send(client, peer, h, s)
-        ids.append(sent.id)
-    return ids
+    runs: list[list[int]] = []
+    for i, k in enumerate(kinds):
+        if (k is not None and runs and len(runs[-1]) < limit
+                and kinds[runs[-1][-1]] == k):
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    return runs
+
+
+def _fresh(sm: InputSingleMedia) -> InputSingleMedia:
+    """重发时换一个 random_id，免得被服务端当成重复请求。"""
+    return InputSingleMedia(media=sm.media, random_id=helpers.generate_random_long(),
+                            message=sm.message, entities=sm.entities)
+
+
+async def send_album_resilient(client: Any, peer: Any, multi: list,
+                               single: Callable[[int], Any],
+                               names: Optional[list[str]] = None,
+                               ) -> tuple[list[int], bool]:
+    """发一个相册。整组被拒就对半拆开再试，尽量保住分组。
+
+    拆到只剩一项时调用 single(下标) 单独发。返回 (消息 id, 是否整组发出)。
+    有一项进不了相册时，其余项大多仍然成组：10 项里 1 项有问题，
+    结果通常是 2 个相册加 1~3 条单发，而不是 10 条散的。
+    每次被拒都记下这一组有哪些项，方便从日志里找出到底是哪个文件。
+    """
+    intact = True
+
+    async def go(idx: list[int]) -> list[int]:
+        nonlocal intact
+        if len(idx) == 1:
+            return list(await single(idx[0]))
+        try:
+            res = await client(SendMultiMediaRequest(
+                peer=peer, multi_media=[_fresh(multi[i]) for i in idx]))
+        except FloodWaitError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            intact = False
+            what = ", ".join(names[i] for i in idx) if names else f"{len(idx)} 项"
+            log.warning("相册被拒，拆开重试: %s；组内: %s", e, what)
+            mid = len(idx) // 2
+            return await go(idx[:mid]) + await go(idx[mid:])
+        got = _ids_from_updates(res)
+        if not got:
+            raise TransferError("相册已发出但未能读回消息 id")
+        return got
+
+    ids = await go(list(range(len(multi))))
+    return ids, intact
+
+
+async def _send_prepared_one(client: TelegramClient, peer: int, sm: Any,
+                             h: Any, s: MediaSpec) -> list[int]:
+    """单独发一项。优先用已经落到服务器上的媒体，不重传；不行才重新上传。"""
+    if sm is not None:
+        try:
+            res = await client(SendMediaRequest(
+                peer=peer, media=sm.media, message=sm.message,
+                entities=sm.entities, random_id=helpers.generate_random_long()))
+            got = _ids_from_updates(res)
+            if got:
+                return got
+        except FloodWaitError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s（%s）单独发送也失败，改为重新上传: %s",
+                        s.file_name, s.mime_type, e)
+    sent = await _send(client, peer, h, s)
+    return [sent.id]
 
 
 async def send_handles_as_album(
@@ -808,42 +907,65 @@ async def send_handles_as_album(
 ) -> tuple[list[int], str]:
     """把已上传的句柄组装成相册发出去。受保护内容和推文两条路径共用。
 
-    返回 (消息 id 列表, 说明)。整组失败时用已有句柄逐条补发，
-    不重传字节，并在说明里告知分组没保住。
+    返回 (消息 id 列表, 说明)。说明非空表示分组没能完全保住。
+
+    1. 每项先 UploadMedia 落到服务器，拿到**服务器认定的类型**
+    2. 按类型切段：图和视频一组、文件一组、音频一组，动图贴纸等单独发 ——
+       这是事先就知道的，照规则分开不算失败
+    3. 每段发相册；还是被拒就对半拆开重试，尽量保住分组
     """
-    # Telegram 相册上限 10 项，超出按 10 分块。
     sent_ids: list[int] = []
     note = ""
     for chunk_start in range(0, len(handles), 10):
         hs = handles[chunk_start:chunk_start + 10]
         ss = specs[chunk_start:chunk_start + 10]
-        multi = []
+        multi: list = []
+        kinds: list = []
         try:
             for h, s in zip(hs, ss):
-                im = await _to_input_media(client, h, s, relay_channel)
+                im, kind = await _to_input_media(client, h, s, relay_channel)
                 multi.append(InputSingleMedia(
                     media=im,
                     random_id=helpers.generate_random_long(),
                     message=s.caption or "",
                     entities=s.entities or None,
                 ))
-            res = await client(SendMultiMediaRequest(
-                peer=relay_channel, multi_media=multi))
-            got = _ids_from_updates(res)
-            if not got:
-                raise TransferError("相册已发出但未能读回消息 id")
-            sent_ids.extend(got)
-        except TransferError:
+                kinds.append(kind)
+        except (TransferError, FloodWaitError):
             raise
         except Exception as e:  # noqa: BLE001
-            # 字节已经传上去了，别浪费。退化成逐条发送，
-            # 至少把内容给到用户，只是分组保不住。
-            log.warning("相册整组发送失败，退化为逐条: %s；组内: %s", e,
-                        ", ".join(f"{s.file_name}({s.mime_type}, {_hs(s.size)})"
-                                  for s in ss))
-            sent_ids.extend(await _send_one_by_one(
-                client, relay_channel, hs, ss, multi))
-            note = "相册整组发送失败，已逐条转存，分组未能保持。"
+            # 某一项连 UploadMedia 都过不去：已经落地的直接用，其余重新上传，逐条发
+            log.warning("相册第 %d 项（%s）预处理失败，这一组逐条发送: %s",
+                        len(multi) + 1, ss[len(multi)].file_name, e)
+            for i, (h, s) in enumerate(zip(hs, ss)):
+                sm = multi[i] if i < len(multi) else None
+                sent_ids.extend(await _send_prepared_one(client, relay_channel, sm, h, s))
+            note = SPLIT_NOTE
+            continue
+
+        runs = kind_runs(kinds)
+        if len(runs) > 1:
+            log.info("按相册规则分成 %d 段: %s", len(runs),
+                     " | ".join(",".join(ss[i].file_name for i in r) for r in runs))
+        names = [f"{s.file_name}({s.mime_type}, {_hs(s.size)})" for s in ss]
+        for run in runs:
+            if len(run) == 1:
+                i = run[0]
+                sent_ids.extend(await _send_prepared_one(
+                    client, relay_channel, multi[i], hs[i], ss[i]))
+                continue
+
+            async def single(j: int, _run=run) -> list[int]:
+                i = _run[j]
+                return await _send_prepared_one(client, relay_channel,
+                                                multi[i], hs[i], ss[i])
+
+            ids, intact = await send_album_resilient(
+                client, relay_channel, [multi[i] for i in run], single,
+                [names[i] for i in run])
+            sent_ids.extend(ids)
+            if not intact:
+                note = SPLIT_NOTE
 
     return sorted(sent_ids), note
 
