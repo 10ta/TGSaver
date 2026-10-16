@@ -88,6 +88,8 @@ class FakeClient:
         return f"handle:{file_name}"
 
     async def download_media(self, msg, thumb=None, file=None, **kw):
+        if file is bytes and thumb is None and getattr(msg, "photo", None) is not None:
+            return b"x" * msg.photo.size        # 照片整张下载
         return None
 
     async def send_file(self, relay, file=None, **kw):

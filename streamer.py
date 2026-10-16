@@ -280,9 +280,30 @@ async def relay_protected(
     return ids, spec.size
 
 
+async def _upload_photo(client, msg, spec: MediaSpec, prog) -> Any:
+    """照片整张读进内存再传（照片最大也就十来 MB）。
+
+    不能走流式管道：流式上传要预先声明字节数，而 Telethon 给出的照片大小
+    （所有尺寸里最重的那个）和 iter_download 实际下载的尺寸（列表里最后一个）
+    不一定是同一个。两者对不上时，upload_file 读到末尾发现不够数，报
+    "read less than 131072 before reaching the end"，重试多少次都一样。
+    整张下载下来就知道确切大小，下载的也是最大的那个尺寸。
+    """
+    data = await client.download_media(msg, file=bytes,
+                                       progress_callback=prog("下载"))
+    if not data:
+        raise TransferError("照片下载失败（拿到 0 字节）")
+    spec.size = len(data)
+    return await client.upload_file(data, file_name=spec.file_name,
+                                    progress_callback=prog("上传"))
+
+
 async def _via_stream(client, msg, spec: MediaSpec, relay: int, prog) -> Any:
     log.info("流式转存 %s (%s)", spec.file_name, _hs(spec.size))
-    media = msg.photo if spec.is_photo else msg.document
+    if spec.is_photo:
+        handle = await _upload_photo(client, msg, spec, prog)
+        return await _send(client, relay, handle, spec)
+    media = msg.document
     async with _DownloadStream(
         client, media, spec.size, spec.file_name, prog("下载")
     ) as stream:
@@ -444,9 +465,10 @@ async def _upload_one(client: TelegramClient, msg: Message, spec: MediaSpec,
     if use_disk:
         return await _upload_via_disk(client, msg, spec, prog,
                                       task_id, register_tmp)
-    media = msg.photo if spec.is_photo else msg.document
+    if spec.is_photo:
+        return await _upload_photo(client, msg, spec, prog)
     async with _DownloadStream(
-        client, media, spec.size, spec.file_name, prog("下载")
+        client, msg.document, spec.size, spec.file_name, prog("下载")
     ) as stream:
         return await client.upload_file(
             stream, file_size=spec.size, file_name=spec.file_name,
@@ -597,6 +619,7 @@ async def relay_protected_album(
         handles.append(await _upload_one(client, m, s, relay_channel,
                                          _prog, task_id, register_tmp))
 
+    total = sum(s.size for s in specs)   # 照片的确切大小下载后才知道
     ids, note = await send_handles_as_album(
         client, relay_channel, handles, specs)
     return ids, total, note
