@@ -27,7 +27,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from telethon import TelegramClient, helpers, utils
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    FilePart0MissingError,
+    FilePartMissingError,
+    FloodWaitError,
+)
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.functions.messages import (
     SendMediaRequest,
     SendMultiMediaRequest,
@@ -39,6 +44,8 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
     DocumentAttributeSticker,
     DocumentAttributeVideo,
+    InputFile,
+    InputFileBig,
     InputMediaUploadedDocument,
     InputMediaUploadedPhoto,
     InputSingleMedia,
@@ -147,6 +154,9 @@ class MediaSpec:
     caption: str
     entities: list
     thumb: Optional[io.BytesIO] = None
+    # 从来源重新读出文件的某一段：read_part(偏移, 长度) -> bytes。
+    # 服务器说上传的某一块丢了（FILE_PART_X_MISSING）时，靠它只补传那一块
+    read_part: Optional[Callable[[int, int], Any]] = None
 
 
 def inspect_media(msg: Message) -> MediaSpec:
@@ -259,6 +269,8 @@ async def relay_protected(
         )
 
     spec.thumb = await fetch_thumb(client, msg)
+    if not spec.is_photo:
+        spec.read_part = _tg_reader(client, msg.document)
     use_disk = CFG.stream_max_size > 0 and spec.size > CFG.stream_max_size
 
     started = time.monotonic()
@@ -294,6 +306,7 @@ async def _upload_photo(client, msg, spec: MediaSpec, prog) -> Any:
     if not data:
         raise TransferError("照片下载失败（拿到 0 字节）")
     spec.size = len(data)
+    spec.read_part = _bytes_reader(data)
     return await client.upload_file(data, file_name=spec.file_name,
                                     progress_callback=prog("上传"))
 
@@ -333,6 +346,7 @@ async def _via_disk(client, msg, spec: MediaSpec, relay: int, prog,
     try:
         await client.download_media(msg, file=str(path),
                                     progress_callback=prog("下载"))
+        spec.size = path.stat().st_size      # 分块大小按实际文件算，补传时要对得上
         handle = await client.upload_file(
             str(path), file_name=spec.file_name, progress_callback=prog("上传")
         )
@@ -346,6 +360,93 @@ async def _via_disk(client, msg, spec: MediaSpec, relay: int, prog,
             await _maybe_await(register_tmp(None))
 
 
+# --------------------------------------------------------------- 补传丢失的分块
+#
+# 大文件按块上传（大于 750MB 的每块 512KB），每块服务器都回了「收到」，
+# 但最后拼文件（SendMedia / UploadMedia）时偶尔报某一块不在存储里了：
+# FILE_PART_X_MISSING。Telegram 给的处理办法是把那一块重新存一次再调用。
+# 以前这里不认识这个错，整个任务从头重来 —— 1.7GB 的文件重下重传三遍，
+# 而且每遍都可能在同一步再撞上。现在只补传缺的那一块，几百 KB 的事。
+
+RESAVE_TRIES = 5        # 一次发送里最多补传几次（每次可能报不同的块）
+
+
+def _tg_reader(client: TelegramClient, media: Any):
+    """从 Telegram 上的原文件里读一段。补传时用，不依赖本地临时文件。"""
+    async def read(offset: int, length: int) -> bytes:
+        buf = bytearray()
+        async for chunk in client.iter_download(
+                media, offset=offset, request_size=min(length, 512 * 1024)):
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) >= length:
+                break
+        return bytes(buf[:length])
+    return read
+
+
+def _bytes_reader(data: bytes):
+    async def read(offset: int, length: int) -> bytes:
+        return data[offset:offset + length]
+    return read
+
+
+def _http_reader(url: str):
+    """按 Range 从网上重新读一段。服务器不支持 Range 时从头读、跳过前面的。"""
+    async def read(offset: int, length: int) -> bytes:
+        headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
+        async with http_session() as http:
+            async with http.get(url, headers=headers) as resp:
+                if resp.status == 206:
+                    return (await resp.read())[:length]
+                if resp.status != 200:
+                    raise TransferError(f"补传时重新下载失败（HTTP {resp.status}）")
+                buf, skip = bytearray(), offset
+                async for chunk in resp.content.iter_chunked(CHUNK):
+                    if skip >= len(chunk):
+                        skip -= len(chunk)
+                        continue
+                    buf.extend(chunk[skip:])
+                    skip = 0
+                    if len(buf) >= length:
+                        break
+                return bytes(buf[:length])
+    return read
+
+
+async def _resave_part(client: Any, handle: Any, spec: "MediaSpec", which: int) -> None:
+    part_size = utils.get_appropriated_part_size(spec.size) * 1024
+    data = await _maybe_value(spec.read_part(which * part_size, part_size))
+    if not data:
+        raise TransferError(f"补传第 {which} 块时没能读到数据")
+    if isinstance(handle, InputFileBig):
+        req = SaveBigFilePartRequest(handle.id, which, handle.parts, data)
+    else:
+        req = SaveFilePartRequest(handle.id, which, data)
+    if not await client(req):
+        raise TransferError(f"补传第 {which} 块被服务器拒绝")
+
+
+async def with_resave(client: Any, handle: Any, spec: "MediaSpec", call):
+    """执行一个用到上传句柄的请求；服务器说某一块丢了，就补传那一块再来。"""
+    for attempt in range(RESAVE_TRIES + 1):
+        try:
+            return await call()
+        except (FilePartMissingError, FilePart0MissingError) as e:
+            which = getattr(e, "which", 0)
+            if (spec.read_part is None or attempt == RESAVE_TRIES
+                    or not isinstance(handle, (InputFile, InputFileBig))):
+                raise
+            log.warning("%s 的第 %d 块在服务器上丢了（共 %d 块），补传后重试",
+                        spec.file_name, which, handle.parts)
+            await _resave_part(client, handle, spec, which)
+
+
+async def _maybe_value(v: Any) -> Any:
+    return await v if hasattr(v, "__await__") else v
+
+
 def _rewind(f: Any) -> None:
     """内存里的缩略图是个流，上传一次就读到了末尾。再用之前必须倒回开头，
     否则读出来是 0 字节，Telegram 报 FilePartEmpty。"""
@@ -354,18 +455,20 @@ def _rewind(f: Any) -> None:
 
 
 async def _send(client, relay: int, handle, spec: MediaSpec):
-    _rewind(spec.thumb)
-    return await client.send_file(
-        relay,
-        file=handle,
-        caption=spec.caption or None,
-        formatting_entities=spec.entities or None,
-        attributes=spec.attributes or None,
-        mime_type=spec.mime_type,
-        thumb=spec.thumb,
-        force_document=spec.force_document,
-        supports_streaming=not spec.force_document and not spec.is_photo,
-    )
+    async def call():
+        _rewind(spec.thumb)
+        return await client.send_file(
+            relay,
+            file=handle,
+            caption=spec.caption or None,
+            formatting_entities=spec.entities or None,
+            attributes=spec.attributes or None,
+            mime_type=spec.mime_type,
+            thumb=spec.thumb,
+            force_document=spec.force_document,
+            supports_streaming=not spec.force_document and not spec.is_photo,
+        )
+    return await with_resave(client, handle, spec, call)
 
 
 async def _maybe_await(v: Any) -> None:
@@ -492,6 +595,7 @@ async def _upload_via_disk(client, msg, spec: MediaSpec, prog,
     try:
         await client.download_media(msg, file=str(path),
                                     progress_callback=prog("下载"))
+        spec.size = path.stat().st_size
         return await client.upload_file(
             str(path), file_name=spec.file_name, progress_callback=prog("上传"))
     finally:
@@ -542,7 +646,8 @@ async def _to_input_media(client: TelegramClient, handle: Any,
     """
     if spec.is_photo:
         fm = InputMediaUploadedPhoto(file=handle)
-        r = await client(UploadMediaRequest(relay, media=fm))
+        r = await with_resave(client, handle, spec,
+                              lambda: client(UploadMediaRequest(relay, media=fm)))
         return utils.get_input_media(r.photo), "visual"
 
     thumb = None
@@ -560,7 +665,8 @@ async def _to_input_media(client: TelegramClient, handle: Any,
         thumb=thumb,
         force_file=spec.force_document,
     )
-    r = await client(UploadMediaRequest(relay, media=fm))
+    r = await with_resave(client, handle, spec,
+                          lambda: client(UploadMediaRequest(relay, media=fm)))
     attrs = getattr(r.document, "attributes", None) or spec.attributes or []
     kind = "file" if spec.force_document else attrs_kind(attrs)
     return utils.get_input_media(
@@ -604,6 +710,8 @@ async def relay_protected_album(
 
     for m, s in zip(msgs, specs):
         s.thumb = await fetch_thumb(client, m)
+        if not s.is_photo:
+            s.read_part = _tg_reader(client, m.document)
 
     started = time.monotonic()
     handles = []
@@ -782,6 +890,7 @@ async def _upload_web(client: TelegramClient, http, item: WebMedia, idx: int,
                 if register_tmp:
                     await _maybe_await(register_tmp(None))
 
+    spec.read_part = _http_reader(item.url)
     if not spec.is_photo:
         spec.thumb = await _fetch_small(http, item.thumb_url, "thumb.jpg")
     return handle, spec
