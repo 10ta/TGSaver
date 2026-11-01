@@ -2,6 +2,10 @@
 Description=TgSaver - Telegram message archiver bot
 After=network-online.target
 Wants=network-online.target
+# 反复崩溃时别把系统拖垮：300 秒内最多重启 10 次。
+# 这两项属于 [Unit]，写在 [Service] 里会被 systemd 忽略
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -14,9 +18,6 @@ ExecStart=/opt/tgsaver/venv/bin/python /opt/tgsaver/bot.py
 
 Restart=always
 RestartSec=5
-# 反复崩溃时别把系统拖垮
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 StandardOutput=journal
 StandardError=journal

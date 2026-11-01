@@ -17,9 +17,11 @@ Telegram 服务端拒绝 forward 的消息（频道开了 noforwards），字节
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -331,15 +333,14 @@ async def _via_stream(client, msg, spec: MediaSpec, relay: int, prog) -> Any:
 
 async def _via_disk(client, msg, spec: MediaSpec, relay: int, prog,
                     task_id, register_tmp) -> Any:
-    CFG.tmp_dir.mkdir(parents=True, exist_ok=True)
-    need = int(spec.size * CFG.disk_headroom)
-    free = shutil.disk_usage(CFG.tmp_dir).free
-    if free < need:
-        raise TransferError(
-            f"磁盘空间不足：需要 {_hs(need)}，{CFG.tmp_dir} 只剩 {_hs(free)}。"
-        )
+    async with disk_slot(spec.size):
+        return await _via_disk_locked(client, msg, spec, relay, prog,
+                                      task_id, register_tmp)
 
-    path = CFG.tmp_dir / f"t{task_id or os.getpid()}_{msg.id}_{spec.file_name}"
+
+async def _via_disk_locked(client, msg, spec: MediaSpec, relay: int, prog,
+                           task_id, register_tmp) -> Any:
+    path = tmp_path("t", task_id, msg.id)
     if register_tmp:
         await _maybe_await(register_tmp(str(path)))
     log.info("落盘转存 %s (%s) -> %s", spec.file_name, _hs(spec.size), path)
@@ -581,14 +582,14 @@ async def _upload_one(client: TelegramClient, msg: Message, spec: MediaSpec,
 
 async def _upload_via_disk(client, msg, spec: MediaSpec, prog,
                            task_id, register_tmp) -> Any:
-    CFG.tmp_dir.mkdir(parents=True, exist_ok=True)
-    need = int(spec.size * CFG.disk_headroom)
-    free = shutil.disk_usage(CFG.tmp_dir).free
-    if free < need:
-        raise TransferError(
-            f"磁盘空间不足：需要 {_hs(need)}，{CFG.tmp_dir} 只剩 {_hs(free)}。")
+    async with disk_slot(spec.size):
+        return await _upload_via_disk_locked(client, msg, spec, prog,
+                                             task_id, register_tmp)
 
-    path = CFG.tmp_dir / f"t{task_id or os.getpid()}_{msg.id}_{spec.file_name}"
+
+async def _upload_via_disk_locked(client, msg, spec: MediaSpec, prog,
+                                  task_id, register_tmp) -> Any:
+    path = tmp_path("t", task_id, msg.id)
     if register_tmp:
         await _maybe_await(register_tmp(str(path)))
     log.info("落盘转存 %s (%s)", spec.file_name, _hs(spec.size))
@@ -867,28 +868,33 @@ async def _upload_web(client: TelegramClient, http, item: WebMedia, idx: int,
                     stream, file_size=size, file_name=spec.file_name,
                     progress_callback=prog("上传"))
         else:
-            CFG.tmp_dir.mkdir(parents=True, exist_ok=True)
-            path = CFG.tmp_dir / f"w{task_id or os.getpid()}_{idx}"
-            if register_tmp:
-                await _maybe_await(register_tmp(str(path)))
-            try:
-                got = 0
-                with open(path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(CHUNK):
-                        got += len(chunk)
-                        if got > CFG.max_upload_size:
-                            raise TransferError(
-                                f"第 {idx + 1} 个媒体超过上传上限 "
-                                f"{_hs(CFG.max_upload_size)}。")
-                        f.write(chunk)
-                spec = _web_spec(item, idx, got)
-                handle = await client.upload_file(
-                    str(path), file_name=spec.file_name,
-                    progress_callback=prog("上传"))
-            finally:
-                path.unlink(missing_ok=True)
+            # 大小未知：先拿到落盘名额，边写边看，写到超出剩余空间就停
+            async with disk_slot(0) as free:
+                path = tmp_path("w", task_id, idx)
                 if register_tmp:
-                    await _maybe_await(register_tmp(None))
+                    await _maybe_await(register_tmp(str(path)))
+                try:
+                    got = 0
+                    with open(path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(CHUNK):
+                            got += len(chunk)
+                            if got > CFG.max_upload_size:
+                                raise TransferError(
+                                    f"第 {idx + 1} 个媒体超过上传上限 "
+                                    f"{_hs(CFG.max_upload_size)}。")
+                            if got * CFG.disk_headroom > free:
+                                raise TransferError(
+                                    f"磁盘空间不足：第 {idx + 1} 个媒体已写入 {_hs(got)}，"
+                                    f"{CFG.tmp_dir} 只剩 {_hs(free)}。")
+                            f.write(chunk)
+                    spec = _web_spec(item, idx, got)
+                    handle = await client.upload_file(
+                        str(path), file_name=spec.file_name,
+                        progress_callback=prog("上传"))
+                finally:
+                    path.unlink(missing_ok=True)
+                    if register_tmp:
+                        await _maybe_await(register_tmp(None))
 
     spec.read_part = _http_reader(item.url)
     if not spec.is_photo:
@@ -1112,6 +1118,76 @@ def _hs(n: int) -> str:
 
 
 human_size = _hs
+
+
+_TMP_NAME = re.compile(r"^[tw]\d+_")
+
+# 落盘名额：所有会往 TMP_DIR 写大文件的路径（单条、相册成员、批量组装、
+# 大小未知的网络媒体）共用这一个信号量。以前只有单条消息的路径在调度层拿名额，
+# 而且只看第一条消息的大小，相册和批量组装会绕过它同时落盘。
+_disk_sem: Optional[asyncio.Semaphore] = None
+
+
+def _disk_semaphore() -> asyncio.Semaphore:
+    global _disk_sem
+    if _disk_sem is None:
+        _disk_sem = asyncio.Semaphore(CFG.disk_concurrency)
+    return _disk_sem
+
+
+def disk_busy() -> bool:
+    """落盘名额都被占着（新的落盘任务要排队）。只用来给用户提示。"""
+    return _disk_semaphore().locked()
+
+
+@contextlib.asynccontextmanager
+async def disk_slot(size: int):
+    """占一个落盘名额，并确认剩余空间够 size × DISK_HEADROOM。产出当前剩余字节数。
+
+    余量在拿到名额之后才检查：排队时前一个任务还占着磁盘，那时查没有意义。
+    """
+    async with _disk_semaphore():
+        CFG.tmp_dir.mkdir(parents=True, exist_ok=True)
+        need = int(size * CFG.disk_headroom)
+        free = shutil.disk_usage(CFG.tmp_dir).free
+        if free < need:
+            raise TransferError(
+                f"磁盘空间不足：需要 {_hs(need)}，{CFG.tmp_dir} 只剩 {_hs(free)}。")
+        yield free
+
+
+def tmp_path(prefix: str, task_id: Optional[int], key: Any) -> Path:
+    """落盘用的临时文件路径。
+
+    不能把远端的文件名拼进来：文件名没有扩展名时，Telethon 的 download_media
+    会自己补一个（README 实际写成 README.mp4），这边再按原路径 stat / 删除
+    就对不上 —— 任务失败，每次重试还留下一个没登记的大文件，磁盘越占越满。
+    文件名里带 / 时干脆打不开。固定用 .part 结尾，Telethon 就不会改路径。
+    上传时的文件名另外传（spec.file_name），和这里无关。
+    """
+    return CFG.tmp_dir / f"{prefix}{task_id or os.getpid()}_{key}.part"
+
+
+def clear_tmp_dir() -> int:
+    """启动时清掉临时目录里本服务留下的所有文件。
+
+    没有断点续传：进程重启后，上次没传完的文件一律从头来，留着只占磁盘。
+    只删名字符合本服务格式（t123_… / w123_…）的文件，TMP_DIR 被指到
+    别的目录时也不会误删别人的东西。
+    """
+    d = CFG.tmp_dir
+    if not d.is_dir():
+        return 0
+    n = 0
+    for f in d.iterdir():
+        if not _TMP_NAME.match(f.name) or not f.is_file():
+            continue
+        try:
+            f.unlink()
+            n += 1
+        except OSError as e:
+            log.warning("临时文件删除失败 %s: %s", f, e)
+    return n
 
 
 def cleanup_orphans(paths: list[str]) -> int:

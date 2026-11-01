@@ -48,6 +48,9 @@ FATAL = (fetcher.FetchError, ParseError, NoSession, streamer.TransferError,
 # 这类错误重试 3 次只会把已经搬完的大文件重传 3 遍，必须当场判死。
 DELIVER_FATAL = (TelegramBadRequest, TelegramForbiddenError, TelegramNotFound)
 
+# 同一个任务最多被 Telegram 限流这么多次，再多就判失败，免得无限循环
+FLOOD_MAX = 5
+
 
 def _explain_deliver(err: Exception, relay_chat: int) -> str:
     """把 Telegram 的英文报错翻成能直接照做的说明。
@@ -96,6 +99,7 @@ class Job:
     prefs: Any = field(default_factory=lambda: prefs.defaults())
     last_edit: float = field(default=0.0)
     last_text: str = ""
+    floods: int = 0                # 这个任务被限流过几次（只在进程内计）
 
     @property
     def relayed(self) -> bool:
@@ -107,7 +111,6 @@ class Runner:
         self.bot = bot
         self.fast: asyncio.Queue[Job] = asyncio.Queue()
         self.slow: asyncio.Queue[Job] = asyncio.Queue()
-        self.disk_sem = asyncio.Semaphore(CFG.disk_concurrency)
         self._tasks: list[asyncio.Task] = []
         self._active: dict[int, Job] = {}      # task_id -> Job，正在跑的
         self._started = time.time()
@@ -152,6 +155,41 @@ class Runner:
             log.info("恢复 %d 个未完成任务（其中 %d 个已搬运完，只需重投递）",
                      len(rows), n_relayed)
 
+    # ------------------------------------------------------------ 后台任务
+
+    # 测试里会用 Runner.__new__ 跳过 __init__，所以这两个容器按需创建
+
+    def _waiting(self) -> dict[int, tuple[asyncio.Task, Job, str]]:
+        """等待重试 / 限流结束的任务：task_id -> (定时器, 任务, 通道)。"""
+        if "_wait" not in self.__dict__:
+            self._wait = {}
+        return self._wait
+
+    def _keep(self, coro) -> asyncio.Task:
+        """后台跑一个协程并保留引用：没人引用的 Task 可能被回收，异常也没人看。"""
+        bg = self.__dict__.setdefault("_bg", set())
+        t = asyncio.create_task(coro)
+        bg.add(t)
+        t.add_done_callback(bg.discard)
+        return t
+
+    def _requeue_later(self, job: Job, lane: str, delay: float) -> None:
+        """delay 秒后把任务放回原通道。
+
+        不在 worker 里 sleep：以前限流或重试时 worker 自己睡着，快通道只有
+        4 个 worker，几次长限流就能把它整个停住，后面的秒转请求全部积压。
+        """
+        waiting = self._waiting()
+
+        async def later() -> None:
+            try:
+                await asyncio.sleep(delay)
+            finally:
+                waiting.pop(job.task_id, None)
+            await (self.slow if lane == "slow" else self.fast).put(job)
+
+        waiting[job.task_id] = (self._keep(later()), job, lane)
+
     # ------------------------------------------------------------ 终止全部
 
     async def killall(self, owner_id: Optional[int] = None) -> dict[str, int]:
@@ -183,6 +221,13 @@ class Runner:
                     queued += 1
                 else:
                     spared.append(j)
+        # 等待重试 / 限流结束的：取消定时器，免得它们到点又回到队列里
+        waiting = self._waiting()
+        for tid, (timer, j, _lane) in list(waiting.items()):
+            if mine(j):
+                timer.cancel()
+                waiting.pop(tid, None)
+                queued += 1
 
         # 2. 停掉所有 worker，中断进行中的传输
         active = list(self._active.values())
@@ -245,6 +290,7 @@ class Runner:
             "fast": self.fast.qsize(),
             "slow": self.slow.qsize(),
             "active": len(self._active),
+            "waiting": len(self._waiting()),
             "uptime": int(time.time() - self._started),
         }
 
@@ -353,13 +399,10 @@ class Runner:
                 )
             await self._finish(job, res)
 
-        if need_disk:
-            if self.disk_sem.locked():
-                await self._say(job, "等待磁盘空闲…")
-            async with self.disk_sem:
-                await body()
-        else:
-            await body()
+        # 落盘名额在 streamer 里拿（所有落盘路径共用），这里只给个提示
+        if need_disk and streamer.disk_busy():
+            await self._say(job, "等待磁盘空闲…")
+        await body()
 
     # ------------------------------------------------------------ 收尾
 
@@ -547,14 +590,22 @@ class Runner:
                 raise tweet.TweetError(f"{skipped} 条帖子全部取不到。")
 
             take, rest = tweet.split_batch(pairs)
-            if rest:
-                # 剩下的另起一个任务：多条继续合并，单条走 auto
+            rest_done = bool((job.extra or {}).get("rest_done"))
+            if rest and not rest_done:
+                # 剩下的另起一个任务：多条继续合并，单条走 auto。
+                # 提交过就记进库里：推文数据不落库，重启后会从头取一遍、再切一次，
+                # 不记的话剩下那部分会被重复提交，用户收到两份
                 await self.submit(job.owner_id, " ".join(l for l, _ in rest),
                                   job.request_chat_id, job.request_msg_id,
                                   forward_to=job.forward_to)
+                rest_done = True
+                job.extra = {**(job.extra or {}), "rest_done": True}
+                await db.update_task(job.task_id, extra=json.dumps(job.extra))
 
             job.extra, media = tweet.plan_batch([t for _, t in take], skipped,
                                                 show_name=job.prefs.tw_name)
+            if rest_done:
+                job.extra = {**job.extra, "rest_done": True}
             job.tweet = tweet.Tweet(
                 id=take[0][1].id, name="", screen_name="", text="", media=media)
 
@@ -755,17 +806,20 @@ class Runner:
             return
         delay = min(2 ** job.attempts, 30)
         await self._say(job, f"出错，{delay}s 后第 {job.attempts + 1} 次重试…")
-        await asyncio.sleep(delay)
         await db.update_task(job.task_id, state="pending")
-        await (self.slow if lane == "slow" else self.fast).put(job)
+        self._requeue_later(job, lane, delay)
 
     async def _flood(self, job: Job, lane: str, seconds: int) -> None:
         """Telegram 明确告诉了等多久，就精确等多久，不做盲目退避。"""
-        log.warning("FloodWait %ss task=%s", seconds, job.task_id)
+        job.floods += 1
+        log.warning("FloodWait %ss task=%s（第 %d 次）", seconds, job.task_id, job.floods)
+        if job.floods > FLOOD_MAX:
+            await self._fail(job, f"连续 {FLOOD_MAX} 次触发 Telegram 限流"
+                                  f"（最后一次要求等待 {seconds}s），已放弃，稍后重发链接即可。")
+            return
         await self._say(job, f"触发 Telegram 限流，等待 {seconds}s 后继续…")
-        await asyncio.sleep(seconds + 1)
         await db.update_task(job.task_id, state="pending")
-        await (self.slow if lane == "slow" else self.fast).put(job)
+        self._requeue_later(job, lane, seconds + 1)
 
     # ------------------------------------------------------------ 状态消息
 
@@ -818,7 +872,7 @@ class Runner:
         text = (f"{head}{phase} {pct:.0f}% · "
                 f"{streamer.human_size(done)}/{streamer.human_size(total)} · "
                 f"{streamer.human_size(int(speed))}/s · 剩余 {_dur(eta)}")
-        asyncio.create_task(self._say(job, text))
+        self._keep(self._say(job, text))
 
 
 def _dur(sec: float) -> str:

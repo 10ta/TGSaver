@@ -159,7 +159,7 @@ async def cmd_status(m: Message) -> None:
     p = await db.traffic_by_path()
     up = q["uptime"]
 
-    pending = q["fast"] + q["slow"]
+    pending = q["fast"] + q["slow"] + q.get("waiting", 0)
     lines = [
         f"<b>凭据</b>　{sess.get(row['session_status'] if row else 'none', '未知')}",
         f"<b>运行</b>　{up // 3600}h{(up % 3600) // 60}m",
@@ -173,7 +173,8 @@ async def cmd_status(m: Message) -> None:
         f"<b>直转</b>　{p['direct']} 次零流量 · {p['moved']} 次需搬运",
     ]
     if pending:
-        lines += ["", f"<b>队列</b>　快 {q['fast']} · 慢 {q['slow']}"]
+        lines += ["", f"<b>队列</b>　快 {q['fast']} · 慢 {q['slow']}"
+                  + (f" · 等待重试 {q['waiting']}" if q.get("waiting") else "")]
     await m.reply("\n".join(lines))
 
 
@@ -537,7 +538,7 @@ async def cmd_killall(m: Message) -> None:
         return
 
     q = RUNNER.stats()
-    if q["fast"] + q["slow"] + q["active"] == 0:
+    if q["fast"] + q["slow"] + q["active"] + q.get("waiting", 0) == 0:
         await m.reply("当前没有进行中或排队中的任务。")
         return
 
@@ -791,10 +792,9 @@ async def main() -> None:
     global RUNNER
 
     await db.init()
-    orphans = await db.orphan_tmp_files()
-    if orphans:
-        n = streamer.cleanup_orphans(orphans)
-        log.info("清理崩溃遗留临时文件 %d 个", n)
+    n = streamer.clear_tmp_dir()
+    if n:
+        log.info("清理上次遗留的临时文件 %d 个", n)
 
     bot = Bot(CFG.bot_token,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))

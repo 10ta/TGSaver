@@ -4,3 +4,5 @@ aiogram>=3.7.0,<4
 aiosqlite>=0.20
 cryptography>=42.0
 python-dotenv>=1.0
+# 推文媒体下载直接用到；本来也是 aiogram 的依赖，这里写明
+aiohttp>=3.9
