@@ -62,3 +62,36 @@ def test_init_migrates_old_tmp_setting():
 def test_service_user_matches_init():
     assert _service().get("User") == "tgsaver"
     assert 'APP_USER="tgsaver"' in (ROOT / "init.sh").read_text()
+
+
+# ------------------------------------------------- 运维脚本只有三个
+
+def test_only_three_shell_scripts():
+    assert sorted(p.name for p in ROOT.glob("*.sh")) == ["init.sh", "uninstall.sh", "update.sh"]
+
+
+def test_shell_scripts_parse():
+    import subprocess
+    for name in ("init.sh", "update.sh", "uninstall.sh"):
+        subprocess.run(["bash", "-n", str(ROOT / name)], check=True)
+
+
+def test_update_guards_before_every_push():
+    """隐私检查原来在 git-guard.sh 里，合进 update.sh 后不能丢。"""
+    src = (ROOT / "update.sh").read_text()
+    for needle in ("[0-9]{8,10}:[A-Za-z0-9_-]{35}",   # Bot Token
+                   "[A-Za-z0-9_-]{200,}",              # session 串
+                   "git rm --cached", ".env.example"):
+        assert needle in src, needle
+    tail = src.split("# ==== 公共部分结束 ====")[1]
+    main = tail[tail.index("\nneed_root"):]
+    assert main.index("guard_content") < main.index("push_ahead")
+    assert "guard_content" in tail[tail.index("setup_remote() {"):tail.index("git push -q -u")]
+
+
+def test_uninstall_keeps_credentials():
+    """卸载不能顺手删掉 .env / 数据库：重新部署要靠它们免登录。"""
+    src = (ROOT / "uninstall.sh").read_text()
+    body = src.split('set -euo pipefail', 1)[1]
+    assert "rm -rf \"$APP_DIR\"" not in body and "rm -rf /opt/tgsaver" not in body
+    assert "disable --now" in body

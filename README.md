@@ -603,72 +603,79 @@ genkey.py         生成加密密钥
 tests/            测试
 
 init.sh           一键部署 / 修复（幂等，可反复跑）
-git-init.sh       首次推送到 GitHub
-git-push.sh       日常更新推送
-git-guard.sh      隐私检查（被上面两个引用）
+update.sh         一键更新：提交 / 推送（带隐私检查和测试）→ 部署 → 确认重启
+uninstall.sh      卸载服务，保留代码、配置和登录凭据
 ```
 
 ---
 
-## 推送到 GitHub
+## 更新与推送：update.sh
 
-仓库里带了两个脚本，每次推送前自动跑隐私检查，通不过就不推。
+只有三个脚本：`init.sh` 部署、`update.sh` 更新、`uninstall.sh` 卸载，都以 root 运行。
 
 ```bash
-chmod +x git-*.sh
-
-# 首次：先在 GitHub 建一个空仓库（不要勾 Add README / .gitignore / License）
-./git-init.sh git@github.com:你的用户名/tgsaver.git
-
-# 以后每次改完代码
-./git-push.sh "fix: 修正相册分组"
+/opt/tgsaver/update.sh            # 日常更新
+/opt/tgsaver/update.sh --status   # 只看版本和服务状态
 ```
 
+`update.sh` 按顺序做：
+
+1. **还没有 GitHub 远端**（代码是拷过来的、不是 clone 的）：问你仓库地址，做首次推送。
+   先在 GitHub 建一个空仓库（不要勾 Add README / .gitignore / License）。
+2. **工作区有改动**（在服务器上手改了代码）：列出文件，问你要提交说明；留空就不提交。
+3. 同步 GitHub：落后就快进拉取；本地领先就先过隐私检查、跑 `pytest`，通过了才推送。
+4. 跑 `init.sh`（补依赖、校正权限、更新 systemd 单元、重启服务），确认服务确实重启了。
+
+| 参数 | 作用 |
+|---|---|
+| `--status` | 只看版本和服务状态，不改任何东西 |
+| `--no-pull` | 不碰 git，直接部署磁盘上的代码 |
+| `--no-test` | 推送前不跑测试 |
+
 脚本用了 bash 语法，但开头有自举，用 `sh` / `dash` 调用或可执行位丢失
-都能正常工作，不会报 `Syntax error: "(" unexpected`。
+都能正常工作。
 
 部署后目录属主是 `tgsaver`，而 git 通常用 root 跑，会触发 git 的
 `dubious ownership` 拒绝。脚本会自动加 `safe.directory` 例外，并在
 退出时（包括推送失败、检查中止、Ctrl-C）把属主还原给服务用户，
 保证 `.env` 和数据库始终是 `tgsaver` 所有、权限 600。
 
-`git-push.sh` 会先跑 `pytest`，测试不过不推。可选参数：
-
-| 参数 | 作用 |
-|---|---|
-| `--yes` / `-y` | 跳过确认提示 |
-| `--no-test` / `-n` | 跳过测试 |
-| `--amend` | 追加到上一个提交（尚未 push 时用） |
-
-### 检查了什么
+### 推送前检查了什么
 
 | 检查项 | 拦截的情况 |
 |---|---|
 | `.gitignore` 完整性 | 文件缺失或漏了 `.env` / `*.db` / `*.session` |
 | **已跟踪的机密文件** | 之前误提交过 `.env`——`.gitignore` 对已入库文件无效 |
-| 暂存内容扫描 | 代码里出现 Bot Token、session 串、硬编码凭据 |
+| 新增内容扫描 | 要推上去的改动里出现 Bot Token、session 串、硬编码凭据 |
 | `.env.example` | 必填项被填了真实值 |
-| 提交前复核 | 列出实际要提交的文件，等你确认 |
+| 提交前复核 | 提交本地改动时列出实际要提交的文件 |
 
 第二项最值得留意：`.gitignore` 只对**未被跟踪**的文件生效。如果你在加
 `.gitignore` 之前已经 `git add` 过 `.env`，后面再怎么写 ignore 规则都没用。
 脚本会检测到并给出 `git rm --cached` 的修复命令——但那时 token 已经进过
 commit 历史，等同泄露，必须去 @BotFather 用 `/revoke` 换新的。
 
----
-## 补丁更新
+### 打补丁
 
 ```bash
-scp tweet-auto.patch root@你的服务器:/opt/tgsaver/
-
 cd /opt/tgsaver
-git pull
-git apply --check tweet-auto.patch && git apply tweet-auto.patch
-rm tweet-auto.patch
-./git-push.sh "commit logs"
-
-git pull; systemctl restart tgsaver; journalctl --output cat -fu tgsaver
+git am -3 *.patch && rm *.patch && ./update.sh
 ```
+
+补丁提交后本地领先 GitHub，`update.sh` 会检查、测试、推送，再部署。
+只想先在服务器上试、不提交的话：`git apply x.patch && ./update.sh --no-pull`。
+
+### 卸载
+
+```bash
+/opt/tgsaver/uninstall.sh
+```
+
+停掉并删除 systemd 服务、删除临时目录 `/var/cache/tgsaver`、去掉 git
+`safe.directory` 例外。代码目录 `/opt/tgsaver`（含 `.env` 和 `tgsaver.db`，
+即加密后的登录凭据）和系统用户 `tgsaver` 保留，重新跑 `init.sh` 直接沿用、
+不用重新登录；脚本最后打印彻底删除的命令。删掉 `/opt/tgsaver` 后，记得去
+Telegram「设置 → 设备」终止这台服务器的登录。
 
 ## 测试
 
@@ -677,7 +684,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-641 项，覆盖：
+666 项，覆盖：
 
 - **链接解析**的全部形态，含论坛话题三段式（中间那个数字是话题 id 不是消息 id，
   这是最容易写错的地方）、`?single`、`tg://` 协议、各类非法输入
