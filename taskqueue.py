@@ -32,6 +32,7 @@ import fetcher
 import forward
 import prefs
 import sender
+import stallguard
 import streamer
 import tweet
 from config import CFG
@@ -324,14 +325,13 @@ class Runner:
                 log.info("task=%s 已搬运，跳过传输直接投递", job.task_id)
                 await self._deliver(job)
                 return
-            if not tweet.is_tweet(job.link) and len(batch_links(job.link)) > 1:
-                await self._run_grab_batch(job)
-            elif tweet.is_tweet(job.link):
-                await self._run_tweet(job, lane)
-            elif lane == "fast":
-                await self._run_fast(job)
-            else:
-                await self._run_slow(job)
+            # 看门狗：超过 STALL_TIMEOUT 秒没有任何进展就中断，交给下面的重试
+            await stallguard.guard(self._dispatch(job, lane), CFG.stall_timeout,
+                                   label=f"task={job.task_id}")
+        except stallguard.Stalled as e:
+            # 卡住的往往是一条坏连接，重试前换一条新的
+            await POOL.retire(acl.session_user(job.owner_id))
+            await self._retry_or_fail(job, lane, e)
         except FloodWaitError as e:
             await self._flood(job, lane, e.seconds)
         except TelegramRetryAfter as e:
@@ -345,6 +345,16 @@ class Runner:
         except Exception as e:  # noqa: BLE001
             log.exception("task=%s 失败", job.task_id)
             await self._retry_or_fail(job, lane, e)
+
+    async def _dispatch(self, job: Job, lane: str) -> None:
+        if not tweet.is_tweet(job.link) and len(batch_links(job.link)) > 1:
+            await self._run_grab_batch(job)
+        elif tweet.is_tweet(job.link):
+            await self._run_tweet(job, lane)
+        elif lane == "fast":
+            await self._run_fast(job)
+        else:
+            await self._run_slow(job)
 
     # ------------------------------------------------------------ 快通道
 
@@ -645,6 +655,7 @@ class Runner:
                 skipped += 0 if done[link] else 1
                 continue
             await self._say(job, f"正在搬运 {i}/{len(links)}…")
+            stallguard.touch()                # 新的一条开始了，算一次进展
             try:
                 async with POOL.using(suid):
                     res = await fetcher.relay(
@@ -805,7 +816,8 @@ class Runner:
             await self._fail(job, f"重试 {job.attempts} 次仍失败：{err}")
             return
         delay = min(2 ** job.attempts, 30)
-        await self._say(job, f"出错，{delay}s 后第 {job.attempts + 1} 次重试…")
+        why = f"⚠️ {err}。" if isinstance(err, stallguard.Stalled) else "出错，"
+        await self._say(job, f"{why}{delay}s 后第 {job.attempts + 1} 次重试…")
         await db.update_task(job.task_id, state="pending")
         self._requeue_later(job, lane, delay)
 

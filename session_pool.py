@@ -55,6 +55,7 @@ class SessionPool:
         self._entries: OrderedDict[int, _Entry] = OrderedDict()
         self._guard = asyncio.Lock()
         self._reaper: Optional[asyncio.Task] = None
+        self._retiring: set[asyncio.Task] = set()   # 等着断开的旧连接
 
     async def start(self) -> None:
         self._reaper = asyncio.create_task(self._reap_loop())
@@ -134,6 +135,29 @@ class SessionPool:
         finally:
             entry.busy -= 1
             entry.last_used = time.monotonic()
+
+    async def retire(self, user_id: int) -> None:
+        """换一条新连接：之后的 acquire 拿到全新的客户端。
+
+        旧客户端可能还有别的任务在用（快通道的秒转），不当场断开，
+        等它没人用了再断，免得连累正在进行的其它请求。
+        用在看门狗判定卡死之后 —— 卡住的往往是一条半死不活的连接。
+        """
+        async with self._guard:
+            e = self._entries.pop(user_id, None)
+        if e is None:
+            return
+        log.warning("更换 session 连接 user=%s（旧连接 %d 个任务在用）", user_id, e.busy)
+
+        async def later() -> None:
+            for _ in range(360):            # 最多等 30 分钟
+                if e.busy <= 0:
+                    break
+                await asyncio.sleep(5)
+            await _safe_disconnect(e.client)
+
+        self._retiring.add(asyncio.create_task(later()))
+        self._retiring = {t for t in self._retiring if not t.done()}
 
     async def invalidate(self, user_id: int) -> None:
         async with self._guard:

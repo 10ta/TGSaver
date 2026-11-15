@@ -52,6 +52,7 @@ class Config:
     session_pool_size: int
     progress_interval: int
     max_retries: int
+    stall_timeout: int
     log_level: str
 
 
@@ -74,5 +75,7 @@ CFG = Config(
     session_pool_size=_int("SESSION_POOL_SIZE", 20),
     progress_interval=_int("PROGRESS_INTERVAL", 5),
     max_retries=_int("MAX_RETRIES", 3),
+    # 传输超过这么多秒没有任何进展就判定卡死、中断重试；0 表示不看管
+    stall_timeout=_int("STALL_TIMEOUT", 300),
     log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )

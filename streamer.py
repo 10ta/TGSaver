@@ -59,6 +59,7 @@ from telethon.tl.types import (
 )
 
 from config import CFG
+from stallguard import touch
 
 log = logging.getLogger("stream")
 
@@ -114,6 +115,7 @@ class _DownloadStream:
     async def _produce(self) -> None:
         try:
             async for chunk in self._chunks():
+                touch()                       # 告诉看门狗：还在动
                 await self._q.put(bytes(chunk))
                 self._done += len(chunk)
                 if self._on_progress:
@@ -279,6 +281,7 @@ async def relay_protected(
 
     def _prog(phase: str):
         def cb(done: int, total: int) -> None:
+            touch()
             if on_progress:
                 on_progress(phase, done, total or spec.size,
                             time.monotonic() - started)
@@ -719,6 +722,7 @@ async def relay_protected_album(
     for i, (m, s) in enumerate(zip(msgs, specs)):
         def _prog(phase: str, _i=i):
             def cb(done: int, tot: int) -> None:
+                touch()
                 if on_progress:
                     on_progress(phase, done, tot or s.size,
                                 time.monotonic() - started, _i + 1, len(msgs))
@@ -877,6 +881,7 @@ async def _upload_web(client: TelegramClient, http, item: WebMedia, idx: int,
                     got = 0
                     with open(path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(CHUNK):
+                            touch()
                             got += len(chunk)
                             if got > CFG.max_upload_size:
                                 raise TransferError(
@@ -927,6 +932,7 @@ async def relay_web_media(
         for i, item in enumerate(items):
             def _prog(phase: str, _i=i):
                 def cb(done: int, tot: int) -> None:
+                    touch()
                     if on_progress:
                         on_progress(phase, done, tot or 0,
                                     time.monotonic() - started, _i + 1, len(items))
@@ -1140,13 +1146,24 @@ def disk_busy() -> bool:
     return _disk_semaphore().locked()
 
 
+DISK_WAIT_TICK = 30      # 排队等落盘名额时，每隔这么多秒向看门狗报一次「还在正当等待」
+
+
 @contextlib.asynccontextmanager
 async def disk_slot(size: int):
     """占一个落盘名额，并确认剩余空间够 size × DISK_HEADROOM。产出当前剩余字节数。
 
     余量在拿到名额之后才检查：排队时前一个任务还占着磁盘，那时查没有意义。
     """
-    async with _disk_semaphore():
+    sem = _disk_semaphore()
+    # 排队等名额是正当的等待（前面可能是两小时的大文件），定期告诉看门狗别误判卡死
+    while True:
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=DISK_WAIT_TICK)
+            break
+        except asyncio.TimeoutError:
+            touch()
+    try:
         CFG.tmp_dir.mkdir(parents=True, exist_ok=True)
         need = int(size * CFG.disk_headroom)
         free = shutil.disk_usage(CFG.tmp_dir).free
@@ -1154,6 +1171,8 @@ async def disk_slot(size: int):
             raise TransferError(
                 f"磁盘空间不足：需要 {_hs(need)}，{CFG.tmp_dir} 只剩 {_hs(free)}。")
         yield free
+    finally:
+        sem.release()
 
 
 def tmp_path(prefix: str, task_id: Optional[int], key: Any) -> Path:
